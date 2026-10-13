@@ -173,11 +173,15 @@ pub fn parse_offset(text: &str) -> Result<Duration, ScenarioError> {
                 let n: i64 = number.parse().map_err(|_| invalid())?;
                 number.clear();
                 parts += 1;
-                total += match c {
-                    'd' => Duration::days(n),
-                    'h' => Duration::hours(n),
-                    _ => Duration::minutes(n),
+                let unit = match c {
+                    'd' => 86_400,
+                    'h' => 3_600,
+                    _ => 60,
                 };
+                total = n
+                    .checked_mul(unit)
+                    .and_then(|seconds| total.checked_add(Duration::seconds(seconds)))
+                    .ok_or_else(invalid)?;
             }
             c if c.is_whitespace() && number.is_empty() => {}
             _ => return Err(invalid()),
@@ -201,7 +205,7 @@ mod tests {
             parse_offset("1d 2h30m").unwrap(),
             Duration::days(1) + Duration::hours(2) + Duration::minutes(30)
         );
-        for bad in ["", "5", "2x", "h", "1d 2"] {
+        for bad in ["", "5", "2x", "h", "1d 2", "9223372036854775807d"] {
             assert!(parse_offset(bad).is_err(), "{bad:?}");
         }
     }
