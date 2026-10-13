@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/providers", "crates/tools", "crates/loop"]
+members = [
+    "crates/core",
+    "crates/providers",
+    "crates/tools",
+    "crates/loop",
+    "crates/store",
+]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +16,7 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +28,7 @@ toml = "0.8"
 harness-core = { path = "crates/core" }
 harness-providers = { path = "crates/providers" }
 harness-tools = { path = "crates/tools" }
+harness-store = { path = "crates/store" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

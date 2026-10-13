@@ -43,12 +43,35 @@ pub struct WakeOutcome {
     pub turns: usize,
     pub usage: Usage,
     pub cost_usd: f64,
+    /// The context size of the wake's last model call, in tokens. The
+    /// workday policy ends the day early once this grows too large.
+    pub context_tokens: u64,
+}
+
+impl WakeEnd {
+    /// A short name for records and logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            WakeEnd::Slept { .. } => "slept",
+            WakeEnd::NoSleep => "no_sleep",
+            WakeEnd::Paused { .. } => "paused",
+            WakeEnd::Malformed => "malformed",
+            WakeEnd::TurnLimit => "turn_limit",
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoopError {
-    #[error("model call failed: {0}")]
-    Provider(#[from] ProviderError),
+    /// A model call failed. What the wake spent before it is kept for the
+    /// budget.
+    #[error("model call failed: {source}")]
+    Provider {
+        source: ProviderError,
+        turns: usize,
+        usage: Usage,
+        cost_usd: f64,
+    },
 }
 
 const SLEEP_REMINDER: &str =
@@ -69,6 +92,7 @@ pub async fn run_wake(
     let mut usage = Usage::default();
     let mut reminded = false;
     let mut malformed_last_turn = false;
+    let mut context_tokens = 0;
 
     let mut turns = 0;
     let end = loop {
@@ -78,8 +102,21 @@ pub async fn run_wake(
         turns += 1;
 
         let request = assembler.assemble(executor.specs(), transcript);
-        let response = provider.complete(&request).await?;
+        let response = match provider.complete(&request).await {
+            Ok(response) => response,
+            Err(source) => {
+                return Err(LoopError::Provider {
+                    source,
+                    turns,
+                    cost_usd: profile.cost_usd(&usage),
+                    usage,
+                });
+            }
+        };
         usage.add(response.usage);
+        let u = response.usage;
+        context_tokens =
+            u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
         let calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
         transcript.push(response.message);
 
@@ -157,6 +194,7 @@ pub async fn run_wake(
         turns,
         cost_usd: profile.cost_usd(&usage),
         usage,
+        context_tokens,
     })
 }
 

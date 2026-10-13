@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 harness-core.workspace = true
 harness-providers.workspace = true
+harness-store.workspace = true
 harness-tools.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
