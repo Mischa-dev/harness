@@ -71,6 +71,8 @@ pub enum LoopError {
         turns: usize,
         usage: Usage,
         cost_usd: f64,
+        /// The context size of the wake's last successful call.
+        context_tokens: u64,
     },
 }
 
@@ -110,6 +112,7 @@ pub async fn run_wake(
                     turns,
                     cost_usd: profile.cost_usd(&usage),
                     usage,
+                    context_tokens,
                 });
             }
         };

@@ -145,6 +145,8 @@ async fn a_failed_model_call_keeps_the_transcript_and_the_spend() {
     assert_eq!(wake.turns, 2, "the failed call counts as a turn");
     assert_eq!(wake.usage.input_tokens, 100);
     assert!(wake.cost_usd > 0.0);
+    // The turn that did finish grew the context, and the workday policy sees it.
+    assert_eq!(r.store.current_day().unwrap().unwrap().context_tokens, 120);
 }
 
 #[tokio::test]

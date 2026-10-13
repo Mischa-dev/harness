@@ -70,13 +70,15 @@ impl Workday<'_> {
                 turns,
                 usage,
                 cost_usd,
+                context_tokens,
                 ..
             }) => (
                 "error".to_string(),
                 *turns,
                 *usage,
                 *cost_usd,
-                day.context_tokens,
+                // A failure before any call finished leaves the day's size as it was.
+                (*context_tokens).max(day.context_tokens),
             ),
         };
         self.store.record_wake(
