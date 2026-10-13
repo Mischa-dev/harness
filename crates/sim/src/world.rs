@@ -79,7 +79,7 @@ fn conversation(args: &Value) -> Result<&str, ToolError> {
 }
 
 /// Marks a message the agent is expected to answer.
-pub const TO_YOU: &str = ", to you:";
+pub const TO_YOU: &str = ", to you";
 
 /// Why the agent is awake and what arrived since it last looked. The
 /// stand-in for the state view, which comes in M2.
@@ -96,10 +96,13 @@ pub fn wake_message(now: OffsetDateTime, reason: &WakeReason, new: &[&Event]) ->
     } else {
         text.push_str("New since you last looked:");
         for event in new {
-            let marker = if event.addressed { TO_YOU } else { ":" };
+            let marker = if event.addressed { TO_YOU } else { "" };
+            // One line per message, so a message's text can't pose as
+            // another message.
+            let body = event.text.split_whitespace().collect::<Vec<_>>().join(" ");
             text.push_str(&format!(
-                "\n- [{}] {}{marker} {}",
-                event.conversation, event.from, event.text
+                "\n- [{}] {}{marker}: {body}",
+                event.conversation, event.from
             ));
         }
     }

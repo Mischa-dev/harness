@@ -97,11 +97,26 @@ impl Scenario {
         let file: File = toml::from_str(text).map_err(|e| ScenarioError::Invalid(e.to_string()))?;
         let start = OffsetDateTime::parse(&file.start, &Rfc3339)
             .map_err(|e| ScenarioError::Invalid(format!("start {:?}: {e}", file.start)))?;
-        let end = start + parse_offset(&file.length)?;
+        let length = parse_offset(&file.length)?;
+        if length <= Duration::ZERO {
+            return Err(ScenarioError::Invalid(
+                "length must be more than zero".into(),
+            ));
+        }
+        let end = start + length;
         let mut events = file
             .events
             .into_iter()
             .map(|e| {
+                // Names appear in the wake message's line headers, which the
+                // fake teammate reads.
+                for name in [&e.conversation, &e.from] {
+                    if name.is_empty() || name.contains([':', ']', '\n']) {
+                        return Err(ScenarioError::Invalid(format!(
+                            "{name:?}: names can't be empty or contain ':', ']' or a newline"
+                        )));
+                    }
+                }
                 let at = start + parse_offset(&e.at)?;
                 if at >= end {
                     return Err(ScenarioError::Invalid(format!(
@@ -232,6 +247,21 @@ mod tests {
         assert!(!mentions("@Marathon is on Sunday", "Mara"));
         assert!(!mentions("mail ops@Mara", "Mara"));
         assert!(!mentions("Mara, can you look?", "Mara"));
+    }
+
+    #[test]
+    fn zero_length_scenarios_are_rejected() {
+        let err = Scenario::from_toml(
+            r#"
+            name = "t"
+            summary = "t"
+            agent = "Mara"
+            start = "2026-01-05T09:00:00Z"
+            length = "0m"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("more than zero"));
     }
 
     #[test]
