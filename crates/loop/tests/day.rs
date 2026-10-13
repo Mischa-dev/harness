@@ -8,8 +8,11 @@ use harness_providers::{
     CachingStyle, CapabilityProfile, Message, ModelRequest, ModelResponse, Pricing, Provider,
     ProviderError, ScriptedProvider, ToolCallStyle,
 };
+use harness_providers::{ContentBlock, ToolSpec};
 use harness_store::{Store, WorkdayPolicy};
-use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_tools::{
+    Effect, Policy, PolicyExecutor, SleepTool, Tool, ToolContext, ToolError, ToolOutput,
+};
 use serde_json::json;
 use time::Duration;
 
@@ -53,7 +56,10 @@ fn rig() -> Rig {
     Rig {
         store: Store::open_in_memory().unwrap(),
         executor: PolicyExecutor::new(Policy::conservative(dir.path()), clock.clone())
-            .with_tool(SleepTool),
+            .with_tool(SleepTool)
+            .with_tool(Act)
+            .with_tool(Hang)
+            .with_tool(Big),
         clock,
         _dir: dir,
     }
@@ -145,8 +151,9 @@ async fn a_failed_model_call_keeps_the_transcript_and_the_spend() {
     assert_eq!(wake.turns, 2, "the failed call counts as a turn");
     assert_eq!(wake.usage.input_tokens, 100);
     assert!(wake.cost_usd > 0.0);
-    // The turn that did finish grew the context, and the workday policy sees it.
-    assert_eq!(r.store.current_day().unwrap().unwrap().context_tokens, 120);
+    // The turn that did finish grew the context (120 from the model, plus its
+    // tool result), and the workday policy sees it.
+    assert!(r.store.current_day().unwrap().unwrap().context_tokens > 120);
 }
 
 #[tokio::test]
@@ -154,8 +161,9 @@ async fn the_days_context_size_drives_an_early_evening() {
     let mut r = rig();
     r.wake(&sleeps(), "wake").await.unwrap();
     let day = r.store.current_day().unwrap().unwrap();
-    // The scripted model reports 100 in and 20 out per call.
-    assert_eq!(day.context_tokens, 120);
+    // The scripted model reports 100 in and 20 out per call; the sleep
+    // result adds a little.
+    assert!(day.context_tokens > 120);
     let policy = WorkdayPolicy {
         max_context_tokens: 100,
         ..WorkdayPolicy::default()
@@ -217,5 +225,87 @@ async fn a_wake_cut_off_mid_way_keeps_its_finished_turns() {
     assert_eq!(wake.end, "running");
     assert_eq!(wake.turns, 1);
     assert!(wake.cost_usd > 0.0, "the finished turn's spend is counted");
-    assert_eq!(day.context_tokens, 120);
+    assert!(day.context_tokens > 120);
+}
+
+/// A tool with no arguments and no effects, answering with `run`'s output.
+macro_rules! test_tool {
+    ($name:ident, $tool:literal, $body:expr) => {
+        struct $name;
+
+        #[async_trait::async_trait]
+        impl Tool for $name {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: $tool.into(),
+                    description: String::new(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                }
+            }
+
+            fn effects(&self, _args: &serde_json::Value) -> Result<Vec<Effect>, ToolError> {
+                Ok(vec![])
+            }
+
+            async fn run(
+                &self,
+                _args: &serde_json::Value,
+                _ctx: &ToolContext<'_>,
+            ) -> Result<ToolOutput, ToolError> {
+                $body
+            }
+        }
+    };
+}
+
+test_tool!(Act, "act", Ok(ToolOutput::text("done")));
+test_tool!(Hang, "hang", {
+    std::future::pending::<()>().await;
+    unreachable!()
+});
+test_tool!(Big, "big", Ok(ToolOutput::text("x".repeat(30_000))));
+
+#[tokio::test]
+async fn a_wake_cut_off_mid_batch_keeps_the_calls_that_acted() {
+    let mut r = rig();
+    let provider =
+        ScriptedProvider::new().then_calls("", vec![("act", json!({})), ("hang", json!({}))]);
+    {
+        let wake = r.wake(&provider, "wake");
+        tokio::select! {
+            biased;
+            _ = wake => panic!("the wake should be stuck in its second call"),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+
+    let day = r.store.current_day().unwrap().unwrap();
+    let transcript = r.store.transcript(day.id).unwrap();
+    // wake message, both calls, and their results as they stood
+    assert_eq!(transcript.len(), 3);
+    let results: Vec<_> = transcript[2]
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::ToolResult(result) => result,
+            other => panic!("expected tool results, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(results[0].content, "done");
+    assert!(!results[0].is_error);
+    assert!(results[1].content.starts_with("cut off"));
+    assert!(results[1].is_error);
+}
+
+#[tokio::test]
+async fn a_big_tool_result_counts_toward_the_days_context() {
+    let mut r = rig();
+    let provider = ScriptedProvider::new()
+        .then_calls("", vec![("big", json!({}))])
+        .then_calls("", vec![("sleep", json!({"minutes": 120}))]);
+    r.wake(&provider, "wake").await.unwrap();
+    // 30,000 bytes of result, counted at no more than 3 bytes a token, on top
+    // of the model's own count for the last call.
+    let day = r.store.current_day().unwrap().unwrap();
+    assert!(day.context_tokens >= 10_000 + 120, "{}", day.context_tokens);
 }

@@ -152,6 +152,16 @@ impl Store {
         Ok(())
     }
 
+    /// How many messages the day's transcript holds.
+    pub fn transcript_len(&self, day_id: i64) -> Result<usize> {
+        let len: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM transcript WHERE day_id = ?1",
+            params![day_id],
+            |row| row.get(0),
+        )?;
+        Ok(len as usize)
+    }
+
     pub fn transcript(&self, day_id: i64) -> Result<Vec<Message>> {
         let mut query = self
             .conn
@@ -167,7 +177,8 @@ impl Store {
     /// Records a finished wake, and the context size its last call reached.
     pub fn record_wake(&mut self, wake: &WakeRecord, context_tokens: u64) -> Result<i64> {
         let id = self.begin_wake(wake)?;
-        self.save_wake(id, &[], wake, context_tokens)?;
+        let from = self.transcript_len(wake.day_id)?;
+        self.save_wake(id, from, &[], wake, context_tokens)?;
         Ok(id)
     }
 
@@ -200,20 +211,38 @@ impl Store {
         Ok(id)
     }
 
-    /// Saves a wake's progress: the messages it added since the last save,
-    /// and its record so far. Called after every completed turn and once at
-    /// the end, each time in one transaction, so a crash can't leave a
-    /// conversation whose spend was never counted. The day's context size
-    /// only grows: a call that reports fewer tokens (or none) doesn't hide
-    /// how large the day already is.
+    /// Saves a wake's progress: the day's transcript from position `from` on,
+    /// replacing whatever was saved there before (a batch of tool calls is
+    /// saved as it runs, then saved again once its results are in), and the
+    /// wake's record so far. Each save is one transaction, so a crash can't
+    /// leave a conversation whose spend was never counted. The day's context
+    /// size only grows: a call that reports fewer tokens (or none) doesn't
+    /// hide how large the day already is.
     pub fn save_wake(
         &mut self,
         wake_id: i64,
+        from: usize,
         messages: &[Message],
         wake: &WakeRecord,
         context_tokens: u64,
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
+        append_in(&tx, wake.day_id, &[])?;
+        tx.execute(
+            "DELETE FROM transcript WHERE day_id = ?1 AND seq >= ?2",
+            params![wake.day_id, from as i64],
+        )?;
+        let len: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM transcript WHERE day_id = ?1",
+            params![wake.day_id],
+            |row| row.get(0),
+        )?;
+        if len as usize != from {
+            return Err(StoreError::Corrupt(format!(
+                "day {} has {len} saved messages; can't save from {from}",
+                wake.day_id
+            )));
+        }
         append_in(&tx, wake.day_id, messages)?;
         let changed = tx.execute(
             "UPDATE wakes SET ended_at = ?3, end_state = ?4, turns = ?5, input_tokens = ?6,

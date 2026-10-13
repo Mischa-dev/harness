@@ -73,18 +73,30 @@ pub struct Progress {
 
 pub type CheckpointError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Where a wake is saved after each completed turn, so a crash loses at most
-/// the turn in flight: tools may already have acted, and the agent must see
-/// that after a restart.
+/// Where a wake is saved as it goes: tools may already have acted, and after
+/// a restart the agent must see what it did.
 pub trait Checkpoint {
-    fn save(&mut self, transcript: &[Message], progress: &Progress) -> Result<(), CheckpointError>;
+    /// Saves the wake so far. `pending` is the results message of a batch of
+    /// tool calls still running: calls that finished carry their results, the
+    /// rest say the wake was cut off. The next save replaces it.
+    fn save(
+        &mut self,
+        transcript: &[Message],
+        pending: Option<&Message>,
+        progress: &Progress,
+    ) -> Result<(), CheckpointError>;
 }
 
 /// For callers that keep the wake in memory only.
 pub struct NoCheckpoint;
 
 impl Checkpoint for NoCheckpoint {
-    fn save(&mut self, _: &[Message], _: &Progress) -> Result<(), CheckpointError> {
+    fn save(
+        &mut self,
+        _: &[Message],
+        _: Option<&Message>,
+        _: &Progress,
+    ) -> Result<(), CheckpointError> {
         Ok(())
     }
 }
@@ -120,9 +132,14 @@ impl LoopError {
 const SLEEP_REMINDER: &str =
     "(runtime) End the wake by calling `sleep` with when you want to look again.";
 
+/// What a saved call says until it reports back. If the process dies, this is
+/// what the agent finds after the restart.
+const CUT_OFF: &str = "cut off: the wake stopped before this call reported back. \
+     Check whether it took effect before trying it again.";
+
 /// Runs one wake. `transcript` is the day's conversation; the wake message
-/// and everything that follows are appended to it, and `checkpoint` is handed
-/// the transcript after every completed turn.
+/// and everything that follows are appended to it. `checkpoint` is handed the
+/// transcript after every turn, and before each tool call runs.
 // Each argument is a separate piece of the daemon's wiring; a struct would
 // only rename them.
 #[allow(clippy::too_many_arguments)]
@@ -147,9 +164,12 @@ pub async fn run_wake(
         cost_usd: profile.cost_usd(&usage),
         context_tokens,
     };
-    let save = |checkpoint: &mut dyn Checkpoint, transcript: &[Message], progress: Progress| {
+    let save = |checkpoint: &mut dyn Checkpoint,
+                transcript: &[Message],
+                pending: Option<&Message>,
+                progress: Progress| {
         checkpoint
-            .save(transcript, &progress)
+            .save(transcript, pending, &progress)
             .map_err(|source| LoopError::Checkpoint { source, progress })
     };
 
@@ -186,6 +206,7 @@ pub async fn run_wake(
             save(
                 checkpoint,
                 transcript,
+                None,
                 progress(turns, usage, context_tokens),
             )?;
             continue;
@@ -204,6 +225,20 @@ pub async fn run_wake(
                 results.push(error(call, "not run: make one tool call per turn"));
                 continue;
             }
+            // Save before the call runs, so a crash mid-batch keeps the
+            // results of the calls that already acted.
+            let pending = results_message(
+                results
+                    .iter()
+                    .cloned()
+                    .chain(calls[i..].iter().map(|c| error(c, CUT_OFF))),
+            );
+            save(
+                checkpoint,
+                transcript,
+                Some(&pending),
+                progress(turns, usage, context_tokens),
+            )?;
             match executor.execute(call).await {
                 ExecOutcome::Ran(output) => {
                     if let Some(Control::Sleep { until }) = output.control {
@@ -234,13 +269,17 @@ pub async fn run_wake(
                 }
             }
         }
-        transcript.push(Message {
-            role: Role::User,
-            content: results.into_iter().map(ContentBlock::ToolResult).collect(),
-        });
+        // The next call will send these results, so they count toward the
+        // context the workday policy watches; a big result can't hide.
+        context_tokens += results
+            .iter()
+            .map(|r| r.content.len().div_ceil(BYTES_PER_TOKEN) as u64)
+            .sum::<u64>();
+        transcript.push(results_message(results));
         save(
             checkpoint,
             transcript,
+            None,
             progress(turns, usage, context_tokens),
         )?;
 
@@ -263,6 +302,17 @@ pub async fn run_wake(
         usage,
         context_tokens,
     })
+}
+
+/// A rough size for text the model hasn't counted yet. Overestimating is the
+/// safe side: it only brings the evening forward.
+const BYTES_PER_TOKEN: usize = 3;
+
+fn results_message(results: impl IntoIterator<Item = ToolResult>) -> Message {
+    Message {
+        role: Role::User,
+        content: results.into_iter().map(ContentBlock::ToolResult).collect(),
+    }
 }
 
 fn ok(call: &ToolCall, content: String) -> ToolResult {

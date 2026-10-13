@@ -96,7 +96,7 @@ impl Workday<'_> {
             Err(err) => ("error", *err.progress()),
         };
         saver.record.end = end.into();
-        saver.write(&transcript, &progress)?;
+        saver.write(&transcript, None, &progress)?;
         Ok(result?)
     }
 }
@@ -107,19 +107,29 @@ struct Saver<'a> {
     clock: &'a dyn Clock,
     wake_id: i64,
     record: WakeRecord,
-    /// How much of the transcript is already in the store.
+    /// How much of the transcript is saved for good. A pending results
+    /// message may sit after it.
     saved: usize,
 }
 
 impl Saver<'_> {
-    fn write(&mut self, transcript: &[Message], progress: &Progress) -> Result<(), StoreError> {
+    fn write(
+        &mut self,
+        transcript: &[Message],
+        pending: Option<&Message>,
+        progress: &Progress,
+    ) -> Result<(), StoreError> {
         self.record.ended_at = self.clock.now();
         self.record.turns = progress.turns as u32;
         self.record.usage = progress.usage;
         self.record.cost_usd = progress.cost_usd;
+        let mut messages = transcript[self.saved..].to_vec();
+        messages.extend(pending.cloned());
+        // Starting at `saved` replaces the last pending message, if any.
         self.store.save_wake(
             self.wake_id,
-            &transcript[self.saved..],
+            self.saved,
+            &messages,
             &self.record,
             progress.context_tokens,
         )?;
@@ -129,7 +139,12 @@ impl Saver<'_> {
 }
 
 impl Checkpoint for Saver<'_> {
-    fn save(&mut self, transcript: &[Message], progress: &Progress) -> Result<(), CheckpointError> {
-        Ok(self.write(transcript, progress)?)
+    fn save(
+        &mut self,
+        transcript: &[Message],
+        pending: Option<&Message>,
+        progress: &Progress,
+    ) -> Result<(), CheckpointError> {
+        Ok(self.write(transcript, pending, progress)?)
     }
 }

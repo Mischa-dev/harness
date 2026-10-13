@@ -156,7 +156,7 @@ fn a_wake_is_saved_whole_or_not_at_all() {
     store.end_day(day.id, start, None).unwrap();
     // The day ended underneath the wake: neither the messages nor the update land.
     assert!(matches!(
-        store.save_wake(id, &tool_turn(), &wake(day.id, start, 0.05), 500),
+        store.save_wake(id, 0, &tool_turn(), &wake(day.id, start, 0.05), 500),
         Err(StoreError::DayEnded(_))
     ));
     assert!(store.transcript(day.id).unwrap().is_empty());
@@ -175,7 +175,9 @@ fn a_wake_cut_off_mid_way_keeps_its_saved_turns_and_spend() {
         running.end = "running".into();
         let id = store.begin_wake(&running).unwrap();
         running.cost_usd = 0.03;
-        store.save_wake(id, &tool_turn(), &running, 9_000).unwrap();
+        store
+            .save_wake(id, 0, &tool_turn(), &running, 9_000)
+            .unwrap();
         // The process dies here, before the wake's final save.
     }
     let store = Store::open(&path).unwrap();
@@ -202,4 +204,25 @@ fn two_handles_cannot_both_open_a_day() {
         conn.execute("INSERT INTO days (started_at) VALUES (0)", [])
             .is_err()
     );
+}
+
+#[test]
+fn a_later_save_replaces_a_pending_message() {
+    let mut store = Store::open_in_memory().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let day = store.start_day(start).unwrap();
+    let record = wake(day.id, start, 0.0);
+    let id = store.begin_wake(&record).unwrap();
+    let turn = tool_turn();
+    let pending = Message::user_text("cut off");
+    store
+        .save_wake(id, 0, &[turn[0].clone(), pending], &record, 0)
+        .unwrap();
+    store.save_wake(id, 1, &turn[1..], &record, 0).unwrap();
+    assert_eq!(store.transcript(day.id).unwrap(), turn);
+    // A save can't leave a gap in the transcript.
+    assert!(matches!(
+        store.save_wake(id, 5, &turn, &record, 0),
+        Err(StoreError::Corrupt(_))
+    ));
 }
