@@ -177,3 +177,12 @@ async fn blank_replies_dont_count() {
     assert!(report.sent.is_empty());
     assert_eq!(failed(&report), ["answers what is addressed to it"]);
 }
+
+#[tokio::test]
+async fn blank_sends_dont_charge_the_message_breaker() {
+    let mut calls = vec![("message_send", json!({"conversation": "dm", "text": " "})); 40];
+    calls.push(sleep());
+    let report = run_with(&bundled("quiet-week"), &Always(calls)).await;
+    assert!(report.sent.is_empty());
+    assert_eq!(failed(&report), ["answers what is addressed to it"]);
+}

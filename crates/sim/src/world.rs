@@ -50,19 +50,16 @@ impl Tool for MessageSend {
     }
 
     fn effects(&self, args: &Value) -> Result<Vec<Effect>, ToolError> {
+        // Checked here, before the executor charges the message breaker, so
+        // a call that can't send doesn't count as a message.
+        text(args)?;
         Ok(vec![Effect::SendMessage {
             conversation: conversation(args)?.into(),
         }])
     }
 
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
-        let text = args
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidArguments("text must be a string".into()))?;
-        if text.trim().is_empty() {
-            return Err(ToolError::InvalidArguments("text is empty".into()));
-        }
+        let text = text(args)?;
         self.outbox.lock().expect("outbox poisoned").push(Sent {
             at: ctx.clock.now(),
             conversation: conversation(args)?.into(),
@@ -70,6 +67,17 @@ impl Tool for MessageSend {
         });
         Ok(ToolOutput::text("Sent."))
     }
+}
+
+fn text(args: &Value) -> Result<&str, ToolError> {
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments("text must be a string".into()))?;
+    if text.trim().is_empty() {
+        return Err(ToolError::InvalidArguments("text is empty".into()));
+    }
+    Ok(text)
 }
 
 fn conversation(args: &Value) -> Result<&str, ToolError> {
