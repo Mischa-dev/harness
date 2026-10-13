@@ -29,9 +29,18 @@ pub struct ToolResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// A provider block the runtime doesn't interpret but must send back
+    /// unchanged on later turns, such as an Anthropic `thinking` block. Only
+    /// the adapter named by `provider` reads `data`; the others drop it.
+    Opaque {
+        provider: String,
+        data: Value,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +101,8 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The provider's safety system declined to answer.
+    Refusal,
     Other,
 }
 

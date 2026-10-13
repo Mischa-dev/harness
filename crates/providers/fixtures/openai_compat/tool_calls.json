@@ -1,0 +1,34 @@
+{
+  "id": "chatcmpl-fixture-01",
+  "object": "chat.completion",
+  "created": 1767600000,
+  "model": "fixture-model",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Replying, then sleeping.",
+        "tool_calls": [
+          {
+            "id": "call_fixture_01",
+            "type": "function",
+            "function": {"name": "message_send", "arguments": "{\"to\":\"dm\",\"text\":\"On it.\"}"}
+          },
+          {
+            "id": "call_fixture_02",
+            "type": "function",
+            "function": {"name": "sleep", "arguments": "{\"minutes\": 60"}
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15000,
+    "completion_tokens": 64,
+    "total_tokens": 15064,
+    "prompt_tokens_details": {"cached_tokens": 14080}
+  }
+}

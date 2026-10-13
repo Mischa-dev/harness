@@ -1,0 +1,10 @@
+{
+  "id": "msg_fixture_02",
+  "type": "message",
+  "role": "assistant",
+  "model": "fixture-model",
+  "content": [{"type": "text", "text": "Done."}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {"input_tokens": 20, "output_tokens": 3}
+}

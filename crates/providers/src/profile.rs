@@ -48,6 +48,10 @@ pub struct CapabilityProfile {
     pub caching: CachingStyle,
     #[serde(default)]
     pub structured_output: bool,
+    /// Cache lifetime for explicit breakpoints: `5m` or `1h`. Unset uses the
+    /// provider's default. `pricing.cache_write` must match the choice.
+    #[serde(default)]
+    pub cache_ttl: Option<String>,
     pub pricing: Pricing,
 }
 
@@ -98,6 +102,11 @@ impl Profiles {
             }
             if profile.context_window == 0 {
                 return Err(invalid("context_window must be positive"));
+            }
+            if let Some(ttl) = &profile.cache_ttl {
+                if !matches!(ttl.as_str(), "5m" | "1h") {
+                    return Err(invalid("cache_ttl must be 5m or 1h"));
+                }
             }
             let p = &profile.pricing;
             if [p.input, p.output, p.cache_read, p.cache_write]

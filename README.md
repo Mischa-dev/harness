@@ -11,7 +11,7 @@ The teammate runtime: the always-on mind for model-agnostic agents that work as 
 | Crate | What's in it |
 |---|---|
 | `crates/core` (`harness-core`) | The `Clock` trait with a real and a fake clock; wake reasons and their urgency |
-| `crates/providers` (`harness-providers`) | The internal message format, the `Provider` trait, capability profiles loaded from TOML, and a scripted fake model |
+| `crates/providers` (`harness-providers`) | The internal message format, the `Provider` trait, capability profiles loaded from TOML, a scripted fake model, the HTTP transport, and the Anthropic Messages and OpenAI-compatible adapters with fixture tests |
 | `crates/tools` (`harness-tools`) | The policy executor (walls, approvals, the message breaker and pause), strict flat-schema validation, and the `sleep` tool |
 | `crates/loop` (`harness-loop`) | Cache-friendly context assembly and `run_wake`: model turns and tool calls until the agent sleeps |
 

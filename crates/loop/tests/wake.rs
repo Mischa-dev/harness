@@ -77,6 +77,7 @@ fn profile(tool_calls: ToolCallStyle) -> CapabilityProfile {
         tool_calls,
         caching: CachingStyle::ExplicitBreakpoints,
         structured_output: false,
+        cache_ttl: None,
         pricing: Pricing {
             input: 3.0,
             output: 15.0,
