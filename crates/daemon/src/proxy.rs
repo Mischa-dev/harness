@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -265,14 +265,11 @@ async fn forward(
             response_headers.append(name.clone(), value.clone());
         }
     }
-    match upstream.bytes().await {
-        Ok(body) => (status, response_headers, body).into_response(),
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            format!("{:?} broke off its answer: {err}\n", route.name),
-        )
-            .into_response(),
-    }
+    // Streamed, not buffered: the daemon holds no more of an answer than is
+    // in flight, however large it is, and streamed model output passes
+    // through as it arrives.
+    let body = Body::from_stream(upstream.bytes_stream());
+    (status, response_headers, body).into_response()
 }
 
 /// The upstream URL for a call, or `None` if the path would climb out of the

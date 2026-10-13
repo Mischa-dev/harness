@@ -191,6 +191,45 @@ async fn only_get_and_post_reach_the_provider() {
 }
 
 #[tokio::test]
+async fn answers_stream_through_instead_of_being_held() {
+    // The provider sends one chunk and then never finishes. A proxy that
+    // buffered the whole answer would never pass anything on.
+    let upstream = serve(Router::new().fallback(any(|| async {
+        axum::body::Body::from_stream(FirstChunkThenNothing(false))
+    })))
+    .await;
+    let base = format!("http://127.0.0.1:{}", upstream.port());
+    let routes = vec![Route::new("slow", &base, Auth::Bearer, "k").unwrap()];
+    let proxy = serve(router(routes, Duration::from_secs(30)).unwrap()).await;
+    let mut response = reqwest::Client::new()
+        .post(format!("http://{proxy}/slow/v1/chat/completions"))
+        .send()
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+        .await
+        .expect("the first chunk arrived before the answer finished")
+        .unwrap();
+    assert_eq!(first.as_deref(), Some(&b"data: 1\n\n"[..]));
+}
+
+struct FirstChunkThenNothing(bool);
+
+impl futures_core::Stream for FirstChunkThenNothing {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.0 {
+            return std::task::Poll::Pending;
+        }
+        self.0 = true;
+        std::task::Poll::Ready(Some(Ok(Bytes::from_static(b"data: 1\n\n"))))
+    }
+}
+
+#[tokio::test]
 async fn redirects_go_back_to_the_caller_without_the_key() {
     let (proxy, log) = setup().await;
     let client = reqwest::Client::builder()
