@@ -1,0 +1,43 @@
+name = "quiet-week"
+summary = """
+A quiet week: some chatter in #general that isn't for the agent, and one DM
+from Mischa midweek. It should answer the DM and otherwise stay out of the way
+(PLAN.md, the exam: "Mostly stays quiet, with one or two useful things").
+"""
+agent = "Mara"
+start = "2026-01-05T09:00:00Z"
+length = "7d"
+
+[[event]]
+at = "1h"
+conversation = "#general"
+from = "Sam"
+text = "Morning all. Standup moved to 10:30 today."
+
+[[event]]
+at = "1d 5h"
+conversation = "#general"
+from = "Priya"
+text = "Anyone else seeing slow CI on the docs repo?"
+
+[[event]]
+at = "1d 5h20m"
+conversation = "#general"
+from = "Sam"
+text = "Yeah, the cache got evicted. Should be fine after one run."
+
+[[event]]
+at = "2d 6h"
+conversation = "dm"
+from = "Mischa"
+text = "When you get a chance, can you look at why the nightly export is slow?"
+
+[[event]]
+at = "4d 2h"
+conversation = "#general"
+from = "Priya"
+text = "Friday demo is cancelled, see you next week."
+
+[expect]
+max_messages = 3
+max_wakes = 30

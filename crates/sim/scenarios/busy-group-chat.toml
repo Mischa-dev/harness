@@ -1,0 +1,103 @@
+name = "busy-group-chat"
+summary = """
+A busy afternoon in #general: lots of talk between other people, and two
+messages that mention the agent. It should answer the two mentions and not
+join the rest of the conversation.
+"""
+agent = "Mara"
+start = "2026-01-06T13:00:00Z"
+length = "1d"
+
+[[event]]
+at = "5m"
+conversation = "#general"
+from = "Sam"
+text = "Release branch is cut. Who's on QA?"
+
+[[event]]
+at = "7m"
+conversation = "#general"
+from = "Priya"
+text = "Me for the web app, Jo for mobile."
+
+[[event]]
+at = "12m"
+conversation = "#general"
+from = "Jo"
+text = "Mobile build is green. Starting the smoke tests."
+
+[[event]]
+at = "20m"
+conversation = "#general"
+from = "Sam"
+text = "@Mara can you check whether the changelog covers the export fix?"
+
+[[event]]
+at = "25m"
+conversation = "#general"
+from = "Priya"
+text = "Found a layout bug on the settings page, filing it now."
+
+[[event]]
+at = "31m"
+conversation = "#general"
+from = "Jo"
+text = "Smoke tests pass on Android, iOS still running."
+
+[[event]]
+at = "40m"
+conversation = "#general"
+from = "Sam"
+text = "Is the layout bug a blocker?"
+
+[[event]]
+at = "44m"
+conversation = "#general"
+from = "Priya"
+text = "No, cosmetic. Can ship with it."
+
+[[event]]
+at = "1h10m"
+conversation = "#general"
+from = "Jo"
+text = "iOS passes too."
+
+[[event]]
+at = "1h15m"
+conversation = "#general"
+from = "Sam"
+text = "Great, tagging the release at 4."
+
+[[event]]
+at = "2h"
+conversation = "#general"
+from = "Priya"
+text = "Lunch order is in, it's the usual."
+
+[[event]]
+at = "2h50m"
+conversation = "#general"
+from = "Sam"
+text = "Tagged. Release notes going out in an hour."
+
+[[event]]
+at = "3h05m"
+conversation = "#general"
+from = "Jo"
+text = "@Mara could you draft the release notes from the merged PRs?"
+
+[[event]]
+at = "3h30m"
+conversation = "#general"
+from = "Priya"
+text = "Settings bug filed as a low-priority issue."
+
+[[event]]
+at = "5h"
+conversation = "#general"
+from = "Sam"
+text = "Thanks all, good release."
+
+[expect]
+max_messages = 3
+max_wakes = 8

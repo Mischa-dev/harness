@@ -15,6 +15,7 @@ The teammate runtime: the always-on mind for model-agnostic agents that work as 
 | `crates/tools` (`harness-tools`) | The policy executor (walls, approvals, the message breaker and pause), strict flat-schema validation, and the `sleep` tool |
 | `crates/loop` (`harness-loop`) | Cache-friendly context assembly, `run_wake` (model turns and tool calls until the agent sleeps), and `Workday`, which runs each wake inside the day's saved conversation |
 | `crates/store` (`harness-store`) | SQLite (WAL) state: workdays with handoff notes, each day's transcript, a record of every wake with usage and cost, and the workday policy for the evening turn |
+| `crates/sim` (`sim`) | The scenario simulator: scripted stretches of time in `crates/sim/scenarios/` run on a fake clock through the real loop, store and walls, then scored. `cargo run -p sim -- run quiet-week --provider fake` |
 
 ```
 cargo test --workspace
