@@ -123,3 +123,46 @@ async fn a_spamming_agent_trips_the_breaker_and_the_run_stops() {
     assert_eq!(report.wakes, 1, "a paused agent doesn't wake again");
     assert_eq!(report.sent.len(), 30, "the breaker stops the 31st message");
 }
+
+/// Replies only to the newest wake message's last addressed line, if it
+/// mentions the release notes, then sleeps.
+struct AnswersOnlyTheSecondMention;
+
+#[async_trait]
+impl Provider for AnswersOnlyTheSecondMention {
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        let last = serde_json::to_string(request.messages.last().unwrap()).unwrap();
+        let mut calls = vec![];
+        if last.contains("release notes from the merged PRs") {
+            calls.push((
+                "message_send",
+                json!({"conversation": "#general", "text": "Drafting them now."}),
+            ));
+        }
+        calls.push(sleep());
+        Always(calls).complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_late_reply_doesnt_cover_an_ignored_mention() {
+    let report = run_with(&bundled("busy-group-chat"), &AnswersOnlyTheSecondMention).await;
+    assert_eq!(failed(&report), ["answers what is addressed to it"]);
+    assert_eq!(report.sent.len(), 1);
+}
+
+#[tokio::test]
+async fn a_wake_without_sleep_counts_as_failed() {
+    let report = run_with(&bundled("busy-group-chat"), &Always(vec![])).await;
+    let failed = failed(&report);
+    assert!(failed.contains(&"no failed wakes"), "{report}");
+}
+
+#[tokio::test]
+async fn a_run_cut_short_by_the_wake_cap_fails() {
+    // Five-minute sleeps for a week is far more than the cap allows.
+    let restless = Always(vec![("sleep", json!({"minutes": 5}))]);
+    let report = run_with(&bundled("quiet-week"), &restless).await;
+    let failed = failed(&report);
+    assert!(failed.contains(&"no failed wakes"), "{report}");
+}

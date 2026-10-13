@@ -78,7 +78,13 @@ pub async fn run(
             .find(|e| e.addressed)
             .map(|e| e.at);
         let at = next_addressed.map_or(next_look, |t| t.min(next_look));
-        if at >= scenario.end || wakes == MAX_WAKES {
+        if at >= scenario.end {
+            break;
+        }
+        if wakes == MAX_WAKES {
+            errors.push(format!(
+                "stopped after {MAX_WAKES} wakes at {at}, before the scenario's end"
+            ));
             break;
         }
         clock.set(at);
@@ -136,7 +142,11 @@ pub async fn run(
                     paused = Some(breaker);
                     break;
                 }
-                _ => clock.now() + DEFAULT_NEXT_LOOK,
+                other => {
+                    // The wake didn't end with a chosen next look.
+                    errors.push(format!("wake at {at} ended {}", other.label()));
+                    clock.now() + DEFAULT_NEXT_LOOK
+                }
             },
             Err(err) => {
                 errors.push(err.to_string());

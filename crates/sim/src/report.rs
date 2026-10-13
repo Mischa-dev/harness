@@ -47,14 +47,24 @@ impl Report {
             });
         };
 
-        let unanswered: Vec<String> = scenario
-            .events
+        // A reply answers a message when it comes before the next message
+        // addressed to the agent in the same conversation, so one late reply
+        // can't cover an earlier message it ignored. Messages that arrive at
+        // the same moment share a reply.
+        let addressed: Vec<_> = scenario.events.iter().filter(|e| e.addressed).collect();
+        let unanswered: Vec<String> = addressed
             .iter()
-            .filter(|e| e.addressed)
             .filter(|e| {
-                !sent
+                let next = addressed
                     .iter()
-                    .any(|s| s.conversation == e.conversation && s.at >= e.at)
+                    .filter(|n| n.conversation == e.conversation && n.at > e.at)
+                    .map(|n| n.at)
+                    .min();
+                !sent.iter().any(|s| {
+                    s.conversation == e.conversation
+                        && s.at >= e.at
+                        && next.is_none_or(|next| s.at < next)
+                })
             })
             .map(|e| format!("{} in {} at {}", e.from, e.conversation, stamp(e.at)))
             .collect();
