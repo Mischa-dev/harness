@@ -103,7 +103,9 @@ impl Scenario {
                 "length must be more than zero".into(),
             ));
         }
-        let end = start + length;
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| ScenarioError::Invalid("the scenario ends past the last date".into()))?;
         let mut events = file
             .events
             .into_iter()
@@ -117,13 +119,13 @@ impl Scenario {
                         )));
                     }
                 }
-                let at = start + parse_offset(&e.at)?;
-                if at >= end {
+                let at = start.checked_add(parse_offset(&e.at)?);
+                let Some(at) = at.filter(|at| *at < end) else {
                     return Err(ScenarioError::Invalid(format!(
                         "event at {:?} is after the scenario ends",
                         e.at
                     )));
-                }
+                };
                 Ok(Event {
                     at,
                     addressed: e.conversation == "dm" || mentions(&e.text, &file.agent),
@@ -283,6 +285,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("names can't"));
+    }
+
+    #[test]
+    fn lengths_past_the_last_date_are_rejected() {
+        let err = Scenario::from_toml(
+            r#"
+            name = "t"
+            summary = "t"
+            agent = "Mara"
+            start = "9999-12-31T23:59:59Z"
+            length = "1d"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("past the last date"));
     }
 
     #[test]
