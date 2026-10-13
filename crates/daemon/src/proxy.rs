@@ -222,6 +222,11 @@ async fn forward(
     let Some(route) = proxy.routes.iter().find(|r| r.name == name) else {
         return (StatusCode::NOT_FOUND, format!("no route {name:?}\n")).into_response();
     };
+    // Model APIs need only these. Others, TRACE above all (it echoes the
+    // request back, key included), never reach a provider.
+    if method != Method::GET && method != Method::POST {
+        return (StatusCode::METHOD_NOT_ALLOWED, "only GET and POST\n").into_response();
+    }
     let Some(url) = upstream_url(route, rest, uri.query()) else {
         return (StatusCode::BAD_REQUEST, "that path leaves the route\n").into_response();
     };

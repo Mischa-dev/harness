@@ -173,6 +173,24 @@ async fn unknown_routes_and_dot_dot_go_nowhere() {
 }
 
 #[tokio::test]
+async fn only_get_and_post_reach_the_provider() {
+    let (proxy, log) = setup().await;
+    let client = reqwest::Client::new();
+    for method in ["TRACE", "PUT", "DELETE", "OPTIONS"] {
+        let response = client
+            .request(
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("http://{proxy}/anthropic/v1/messages"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405, "{method}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn redirects_go_back_to_the_caller_without_the_key() {
     let (proxy, log) = setup().await;
     let client = reqwest::Client::builder()
