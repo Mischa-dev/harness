@@ -1,0 +1,19 @@
+# The daemon's config. It names key files and never holds keys; under
+# systemd, point key_file at $CREDENTIALS_DIRECTORY (LoadCredential=).
+
+[proxy]
+# Loopback only: the proxy adds a key to anything it is sent.
+listen = "127.0.0.1:8787"
+
+# Adapters call http://127.0.0.1:8787/anthropic/v1/messages and so on.
+[[proxy.route]]
+name = "anthropic"
+upstream = "https://api.anthropic.com"
+auth = "x-api-key"
+key_file = "/run/credentials/harness-daemon.service/anthropic"
+
+[[proxy.route]]
+name = "openrouter"
+upstream = "https://openrouter.ai/api"
+auth = "bearer"
+key_file = "/run/credentials/harness-daemon.service/openrouter"

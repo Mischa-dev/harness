@@ -1,0 +1,49 @@
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use harness_daemon::config::Config;
+use harness_daemon::proxy;
+
+/// Long enough for a slow model's whole answer.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
+
+const USAGE: &str = "usage: harness-daemon proxy --config <path>";
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let config = match args.as_slice() {
+        [command, flag, path] if command == "proxy" && flag == "--config" => PathBuf::from(path),
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match run_proxy(&config).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("harness-daemon: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_proxy(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load(path)?;
+    let routes = config.proxy.load_routes()?;
+    let names: Vec<_> = routes.iter().map(|r| r.name.clone()).collect();
+    let router = proxy::router(routes, UPSTREAM_TIMEOUT)?;
+    let listener = tokio::net::TcpListener::bind(config.proxy.listen).await?;
+    eprintln!(
+        "forwarding proxy on {} for {}",
+        listener.local_addr()?,
+        names.join(", ")
+    );
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}
