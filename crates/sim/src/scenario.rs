@@ -103,9 +103,14 @@ impl Scenario {
                 "length must be more than zero".into(),
             ));
         }
+        // Far from the edges of the representable range, so the runtime's
+        // own scheduling (a sleep, a default next look) can't overflow.
         let end = start
             .checked_add(length)
-            .ok_or_else(|| ScenarioError::Invalid("the scenario ends past the last date".into()))?;
+            .filter(|end| start.year() >= 1970 && end.year() <= 2999)
+            .ok_or_else(|| {
+                ScenarioError::Invalid("scenarios must fall between 1970 and 2999".into())
+            })?;
         let mut events = file
             .events
             .into_iter()
@@ -292,18 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn lengths_past_the_last_date_are_rejected() {
+    fn scenarios_near_the_last_date_are_rejected() {
         let err = Scenario::from_toml(
             r#"
             name = "t"
             summary = "t"
             agent = "Mara"
-            start = "9999-12-31T23:59:59Z"
-            length = "1d"
+            start = "9999-12-31T20:00:00Z"
+            length = "1h"
             "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("past the last date"));
+        assert!(err.to_string().contains("between 1970 and 2999"));
     }
 
     #[test]
