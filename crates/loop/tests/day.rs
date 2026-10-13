@@ -5,8 +5,8 @@ use std::sync::Arc;
 use harness_core::{Clock, FakeClock, WakeReason};
 use harness_loop::{ContextAssembler, DayError, WakeEnd, WakeLimits, Workday};
 use harness_providers::{
-    CachingStyle, CapabilityProfile, Message, Pricing, ProviderError, ScriptedProvider,
-    ToolCallStyle,
+    CachingStyle, CapabilityProfile, Message, ModelRequest, ModelResponse, Pricing, Provider,
+    ProviderError, ScriptedProvider, ToolCallStyle,
 };
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::{Policy, PolicyExecutor, SleepTool};
@@ -62,7 +62,7 @@ fn rig() -> Rig {
 impl Rig {
     async fn wake(
         &mut self,
-        provider: &ScriptedProvider,
+        provider: &dyn Provider,
         text: &str,
     ) -> Result<harness_loop::WakeOutcome, DayError> {
         let profile = profile();
@@ -178,4 +178,44 @@ async fn sleep_outcome_is_returned() {
             until: r.clock.now() + Duration::hours(2)
         }
     );
+}
+
+/// Answers from the script, then never answers again: the process dies while
+/// it waits.
+struct HangsWhenDone(ScriptedProvider);
+
+#[async_trait::async_trait]
+impl Provider for HangsWhenDone {
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        if self.0.remaining() == 0 {
+            std::future::pending::<()>().await;
+        }
+        self.0.complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_wake_cut_off_mid_way_keeps_its_finished_turns() {
+    let mut r = rig();
+    let provider = HangsWhenDone(
+        ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": "soon"}))]),
+    );
+    {
+        let wake = r.wake(&provider, "wake");
+        tokio::select! {
+            biased;
+            _ = wake => panic!("the wake should be stuck on its second call"),
+            _ = tokio::task::yield_now() => {}
+        }
+        // The wake is dropped here, as if the daemon died.
+    }
+
+    let day = r.store.current_day().unwrap().unwrap();
+    // wake message, the malformed call, its error result
+    assert_eq!(r.store.transcript(day.id).unwrap().len(), 3);
+    let wake = &r.store.wakes_since(day.started_at).unwrap()[0];
+    assert_eq!(wake.end, "running");
+    assert_eq!(wake.turns, 1);
+    assert!(wake.cost_usd > 0.0, "the finished turn's spend is counted");
+    assert_eq!(day.context_tokens, 120);
 }

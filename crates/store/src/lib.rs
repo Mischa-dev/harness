@@ -166,21 +166,16 @@ impl Store {
 
     /// Records a finished wake, and the context size its last call reached.
     pub fn record_wake(&mut self, wake: &WakeRecord, context_tokens: u64) -> Result<i64> {
-        self.finish_wake(&[], wake, context_tokens)
+        let id = self.begin_wake(wake)?;
+        self.save_wake(id, &[], wake, context_tokens)?;
+        Ok(id)
     }
 
-    /// Saves what a wake added to the transcript and its record together, so
-    /// a crash can't leave a conversation whose spend was never counted. The
-    /// day's context size only grows: a call that reports fewer tokens (or
-    /// none) doesn't hide how large the day already is.
-    pub fn finish_wake(
-        &mut self,
-        messages: &[Message],
-        wake: &WakeRecord,
-        context_tokens: u64,
-    ) -> Result<i64> {
+    /// Opens the record for a wake that is starting, before any model call,
+    /// so its spend is counted even if the process dies partway through.
+    pub fn begin_wake(&mut self, wake: &WakeRecord) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        append_in(&tx, wake.day_id, messages)?;
+        append_in(&tx, wake.day_id, &[])?;
         tx.execute(
             "INSERT INTO wakes (day_id, reason, started_at, ended_at, end_state, turns,
                                 input_tokens, output_tokens, cache_read_tokens,
@@ -201,12 +196,55 @@ impl Store {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Saves a wake's progress: the messages it added since the last save,
+    /// and its record so far. Called after every completed turn and once at
+    /// the end, each time in one transaction, so a crash can't leave a
+    /// conversation whose spend was never counted. The day's context size
+    /// only grows: a call that reports fewer tokens (or none) doesn't hide
+    /// how large the day already is.
+    pub fn save_wake(
+        &mut self,
+        wake_id: i64,
+        messages: &[Message],
+        wake: &WakeRecord,
+        context_tokens: u64,
+    ) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        append_in(&tx, wake.day_id, messages)?;
+        let changed = tx.execute(
+            "UPDATE wakes SET ended_at = ?3, end_state = ?4, turns = ?5, input_tokens = ?6,
+                              output_tokens = ?7, cache_read_tokens = ?8,
+                              cache_write_tokens = ?9, cost_usd = ?10
+             WHERE id = ?1 AND day_id = ?2",
+            params![
+                wake_id,
+                wake.day_id,
+                wake.ended_at.unix_timestamp(),
+                wake.end,
+                wake.turns,
+                wake.usage.input_tokens as i64,
+                wake.usage.output_tokens as i64,
+                wake.usage.cache_read_tokens as i64,
+                wake.usage.cache_write_tokens as i64,
+                wake.cost_usd,
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Corrupt(format!(
+                "no wake {wake_id} in day {}",
+                wake.day_id
+            )));
+        }
         tx.execute(
             "UPDATE days SET context_tokens = MAX(context_tokens, ?2) WHERE id = ?1",
             params![wake.day_id, context_tokens as i64],
         )?;
         tx.commit()?;
-        Ok(id)
+        Ok(())
     }
 
     /// Wakes that started at or after `since`, oldest first.

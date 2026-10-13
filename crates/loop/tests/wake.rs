@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_core::{Clock, FakeClock};
-use harness_loop::{ContextAssembler, WakeEnd, WakeLimits, run_wake};
+use harness_loop::{ContextAssembler, NoCheckpoint, WakeEnd, WakeLimits, run_wake};
 use harness_providers::{
     CachingStyle, CapabilityProfile, ContentBlock, Message, Pricing, ProviderError,
     ScriptedProvider, ToolCallStyle, ToolResult, ToolSpec,
@@ -133,6 +133,7 @@ impl World {
             &mut self.transcript,
             Message::user_text("Wake: Mischa sent you a DM."),
             limits,
+            &mut NoCheckpoint,
         )
         .await
         .unwrap()
@@ -357,6 +358,7 @@ async fn provider_errors_surface() {
         &mut w.transcript,
         Message::user_text("wake"),
         WakeLimits::default(),
+        &mut NoCheckpoint,
     )
     .await
     .unwrap_err();

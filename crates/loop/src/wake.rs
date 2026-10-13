@@ -61,6 +61,34 @@ impl WakeEnd {
     }
 }
 
+/// What a wake has done so far.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Progress {
+    pub turns: usize,
+    pub usage: Usage,
+    pub cost_usd: f64,
+    /// The context size of the wake's last successful call.
+    pub context_tokens: u64,
+}
+
+pub type CheckpointError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Where a wake is saved after each completed turn, so a crash loses at most
+/// the turn in flight: tools may already have acted, and the agent must see
+/// that after a restart.
+pub trait Checkpoint {
+    fn save(&mut self, transcript: &[Message], progress: &Progress) -> Result<(), CheckpointError>;
+}
+
+/// For callers that keep the wake in memory only.
+pub struct NoCheckpoint;
+
+impl Checkpoint for NoCheckpoint {
+    fn save(&mut self, _: &[Message], _: &Progress) -> Result<(), CheckpointError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoopError {
     /// A model call failed. What the wake spent before it is kept for the
@@ -68,19 +96,36 @@ pub enum LoopError {
     #[error("model call failed: {source}")]
     Provider {
         source: ProviderError,
-        turns: usize,
-        usage: Usage,
-        cost_usd: f64,
-        /// The context size of the wake's last successful call.
-        context_tokens: u64,
+        progress: Progress,
     },
+    /// A turn couldn't be saved. The wake stops rather than act without a
+    /// record.
+    #[error("couldn't save the wake: {source}")]
+    Checkpoint {
+        source: CheckpointError,
+        progress: Progress,
+    },
+}
+
+impl LoopError {
+    pub fn progress(&self) -> &Progress {
+        match self {
+            LoopError::Provider { progress, .. } | LoopError::Checkpoint { progress, .. } => {
+                progress
+            }
+        }
+    }
 }
 
 const SLEEP_REMINDER: &str =
     "(runtime) End the wake by calling `sleep` with when you want to look again.";
 
 /// Runs one wake. `transcript` is the day's conversation; the wake message
-/// and everything that follows are appended to it.
+/// and everything that follows are appended to it, and `checkpoint` is handed
+/// the transcript after every completed turn.
+// Each argument is a separate piece of the daemon's wiring; a struct would
+// only rename them.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_wake(
     provider: &dyn Provider,
     executor: &mut PolicyExecutor,
@@ -89,12 +134,24 @@ pub async fn run_wake(
     transcript: &mut Vec<Message>,
     wake_message: Message,
     limits: WakeLimits,
+    checkpoint: &mut dyn Checkpoint,
 ) -> Result<WakeOutcome, LoopError> {
     transcript.push(wake_message);
     let mut usage = Usage::default();
     let mut reminded = false;
     let mut malformed_last_turn = false;
     let mut context_tokens = 0;
+    let progress = |turns, usage: Usage, context_tokens| Progress {
+        turns,
+        usage,
+        cost_usd: profile.cost_usd(&usage),
+        context_tokens,
+    };
+    let save = |checkpoint: &mut dyn Checkpoint, transcript: &[Message], progress: Progress| {
+        checkpoint
+            .save(transcript, &progress)
+            .map_err(|source| LoopError::Checkpoint { source, progress })
+    };
 
     let mut turns = 0;
     let end = loop {
@@ -109,10 +166,7 @@ pub async fn run_wake(
             Err(source) => {
                 return Err(LoopError::Provider {
                     source,
-                    turns,
-                    cost_usd: profile.cost_usd(&usage),
-                    usage,
-                    context_tokens,
+                    progress: progress(turns, usage, context_tokens),
                 });
             }
         };
@@ -129,6 +183,11 @@ pub async fn run_wake(
             }
             reminded = true;
             transcript.push(Message::user_text(SLEEP_REMINDER));
+            save(
+                checkpoint,
+                transcript,
+                progress(turns, usage, context_tokens),
+            )?;
             continue;
         }
 
@@ -179,6 +238,11 @@ pub async fn run_wake(
             role: Role::User,
             content: results.into_iter().map(ContentBlock::ToolResult).collect(),
         });
+        save(
+            checkpoint,
+            transcript,
+            progress(turns, usage, context_tokens),
+        )?;
 
         if let Some(breaker) = paused {
             break WakeEnd::Paused { breaker };

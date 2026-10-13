@@ -152,14 +152,39 @@ fn a_wake_is_saved_whole_or_not_at_all() {
     let mut store = Store::open_in_memory().unwrap();
     let start = datetime!(2026-01-05 09:00 UTC);
     let day = store.start_day(start).unwrap();
+    let id = store.begin_wake(&wake(day.id, start, 0.0)).unwrap();
     store.end_day(day.id, start, None).unwrap();
-    // The day ended underneath the wake: neither the messages nor the record land.
+    // The day ended underneath the wake: neither the messages nor the update land.
     assert!(matches!(
-        store.finish_wake(&tool_turn(), &wake(day.id, start, 0.05), 500),
+        store.save_wake(id, &tool_turn(), &wake(day.id, start, 0.05), 500),
         Err(StoreError::DayEnded(_))
     ));
     assert!(store.transcript(day.id).unwrap().is_empty());
-    assert!(store.wakes_since(start).unwrap().is_empty());
+    assert_eq!(store.wakes_since(start).unwrap()[0].cost_usd, 0.0);
+}
+
+#[test]
+fn a_wake_cut_off_mid_way_keeps_its_saved_turns_and_spend() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let start = datetime!(2026-01-05 09:00 UTC);
+    {
+        let mut store = Store::open(&path).unwrap();
+        let day = store.start_day(start).unwrap();
+        let mut running = wake(day.id, start, 0.0);
+        running.end = "running".into();
+        let id = store.begin_wake(&running).unwrap();
+        running.cost_usd = 0.03;
+        store.save_wake(id, &tool_turn(), &running, 9_000).unwrap();
+        // The process dies here, before the wake's final save.
+    }
+    let store = Store::open(&path).unwrap();
+    let day = store.current_day().unwrap().unwrap();
+    assert_eq!(store.transcript(day.id).unwrap(), tool_turn());
+    assert_eq!(day.context_tokens, 9_000);
+    let wakes = store.wakes_since(start).unwrap();
+    assert_eq!(wakes[0].end, "running");
+    assert!((store.spend_since(start).unwrap() - 0.03).abs() < 1e-9);
 }
 
 #[test]

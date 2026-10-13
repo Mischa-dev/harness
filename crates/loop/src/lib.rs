@@ -8,4 +8,7 @@ pub mod wake;
 
 pub use context::ContextAssembler;
 pub use day::{DayError, Workday};
-pub use wake::{LoopError, WakeEnd, WakeLimits, WakeOutcome, run_wake};
+pub use wake::{
+    Checkpoint, CheckpointError, LoopError, NoCheckpoint, Progress, WakeEnd, WakeLimits,
+    WakeOutcome, run_wake,
+};
