@@ -1,0 +1,15 @@
+[package]
+name = "harness-core"
+description = "Agent basics: the Clock trait and wake reasons."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+time.workspace = true
+
+[lints]
+workspace = true

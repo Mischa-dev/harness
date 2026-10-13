@@ -1,0 +1,24 @@
+[package]
+name = "harness-loop"
+description = "The agent loop: context assembly, model calls, tool dispatch."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+harness-core.workspace = true
+harness-providers.workspace = true
+harness-tools.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/providers", "crates/tools", "crates/loop"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "macros"] }
+tokio = { version = "1", features = ["macros", "rt", "sync"] }
+toml = "0.8"
+
+harness-core = { path = "crates/core" }
+harness-providers = { path = "crates/providers" }
+harness-tools = { path = "crates/tools" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
