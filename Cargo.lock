@@ -250,6 +250,7 @@ dependencies = [
  "harness-providers",
  "harness-store",
  "harness-tools",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

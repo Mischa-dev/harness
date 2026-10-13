@@ -309,3 +309,45 @@ async fn a_big_tool_result_counts_toward_the_days_context() {
     let day = r.store.current_day().unwrap().unwrap();
     assert!(day.context_tokens >= 10_000 + 120, "{}", day.context_tokens);
 }
+
+#[tokio::test]
+async fn the_wake_message_is_saved_before_the_first_call() {
+    let mut r = rig();
+    let provider = HangsWhenDone(ScriptedProvider::new());
+    {
+        let wake = r.wake(&provider, "Mischa sent you a DM.");
+        tokio::select! {
+            biased;
+            _ = wake => panic!("the wake should be stuck on its first call"),
+            _ = tokio::task::yield_now() => {}
+        }
+    }
+    let day = r.store.current_day().unwrap().unwrap();
+    assert_eq!(
+        r.store.transcript(day.id).unwrap(),
+        vec![Message::user_text("Mischa sent you a DM.")]
+    );
+}
+
+#[tokio::test]
+async fn a_provider_without_usage_still_grows_the_day() {
+    let mut r = rig();
+    let provider = ScriptedProvider::new().then(ModelResponse {
+        message: Message {
+            role: harness_providers::Role::Assistant,
+            content: vec![ContentBlock::ToolCall(harness_providers::ToolCall {
+                id: "t1".into(),
+                name: "sleep".into(),
+                arguments: json!({"minutes": 120}),
+            })],
+        },
+        stop_reason: harness_providers::StopReason::ToolUse,
+        usage: Default::default(),
+    });
+    r.wake(&provider, &"a long message ".repeat(1_000))
+        .await
+        .unwrap();
+    // 15,000 bytes of wake message, estimated at no more than 3 bytes a token.
+    let day = r.store.current_day().unwrap().unwrap();
+    assert!(day.context_tokens >= 5_000, "{}", day.context_tokens);
+}

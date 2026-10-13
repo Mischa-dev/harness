@@ -173,6 +173,15 @@ pub async fn run_wake(
             .map_err(|source| LoopError::Checkpoint { source, progress })
     };
 
+    // The wake message carries the event that woke the agent; keep it even if
+    // the first call never returns.
+    save(
+        checkpoint,
+        transcript,
+        None,
+        progress(0, usage, context_tokens),
+    )?;
+
     let mut turns = 0;
     let end = loop {
         if turns == limits.max_turns {
@@ -194,6 +203,11 @@ pub async fn run_wake(
         let u = response.usage;
         context_tokens =
             u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
+        if u.input_tokens + u.cache_read_tokens + u.cache_write_tokens == 0 {
+            // The provider didn't report usage. Estimate, so the day's size
+            // still grows toward its evening.
+            context_tokens += estimate_tokens(&request) + estimate_tokens(&response.message);
+        }
         let calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
         transcript.push(response.message);
 
@@ -307,6 +321,10 @@ pub async fn run_wake(
 /// A rough size for text the model hasn't counted yet. Overestimating is the
 /// safe side: it only brings the evening forward.
 const BYTES_PER_TOKEN: usize = 3;
+
+fn estimate_tokens(value: &impl serde::Serialize) -> u64 {
+    serde_json::to_string(value).map_or(0, |json| json.len().div_ceil(BYTES_PER_TOKEN) as u64)
+}
 
 fn results_message(results: impl IntoIterator<Item = ToolResult>) -> Message {
     Message {
