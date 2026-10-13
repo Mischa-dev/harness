@@ -1,0 +1,14 @@
+//! Tools and the policy executor in front of all of them. Every tool call the
+//! agent makes goes through [`PolicyExecutor::execute`]; there is no other
+//! way to run a tool. Walls are checked here, in code, before anything runs.
+
+pub mod executor;
+pub mod policy;
+pub mod schema;
+pub mod sleep;
+pub mod tool;
+
+pub use executor::{ExecOutcome, PolicyExecutor};
+pub use policy::{BreakerLimits, CommandRule, Decision, Policy};
+pub use sleep::SleepTool;
+pub use tool::{Control, Effect, Tool, ToolContext, ToolError, ToolOutput};
