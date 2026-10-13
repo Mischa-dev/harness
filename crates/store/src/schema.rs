@@ -12,6 +12,8 @@ const MIGRATIONS: &[&str] = &[
          handoff TEXT,
          context_tokens INTEGER NOT NULL DEFAULT 0
      );
+     -- At most one open day, even with two handles racing to start one.
+     CREATE UNIQUE INDEX days_one_open ON days((ended_at IS NULL)) WHERE ended_at IS NULL;
      CREATE TABLE transcript (
          day_id INTEGER NOT NULL REFERENCES days(id),
          seq INTEGER NOT NULL,

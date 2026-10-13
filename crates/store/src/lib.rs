@@ -88,16 +88,28 @@ impl Store {
 
     /// Starts a new day. Only one day can be open at a time.
     pub fn start_day(&self, now: OffsetDateTime) -> Result<Day> {
+        let still_open = |id: i64| {
+            StoreError::Corrupt(format!(
+                "day {id} is still open; end it before starting another"
+            ))
+        };
         if let Some(open) = self.current_day()? {
-            return Err(StoreError::Corrupt(format!(
-                "day {} is still open; end it before starting another",
-                open.id
-            )));
+            return Err(still_open(open.id));
         }
-        self.conn.execute(
+        // The days_one_open index catches a second handle that raced past the check.
+        match self.conn.execute(
             "INSERT INTO days (started_at, context_tokens) VALUES (?1, 0)",
             params![now.unix_timestamp()],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                let open = self.current_day()?.map_or(0, |d| d.id);
+                return Err(still_open(open));
+            }
+            Err(e) => return Err(e.into()),
+        }
         Ok(Day {
             id: self.conn.last_insert_rowid(),
             started_at: now,

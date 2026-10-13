@@ -161,3 +161,20 @@ fn a_wake_is_saved_whole_or_not_at_all() {
     assert!(store.transcript(day.id).unwrap().is_empty());
     assert!(store.wakes_since(start).unwrap().is_empty());
 }
+
+#[test]
+fn two_handles_cannot_both_open_a_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let first = Store::open(&path).unwrap();
+    let second = Store::open(&path).unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    first.start_day(start).unwrap();
+    assert!(second.start_day(start).is_err());
+    // A raw insert that skips the check still hits the constraint.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        conn.execute("INSERT INTO days (started_at) VALUES (0)", [])
+            .is_err()
+    );
+}
