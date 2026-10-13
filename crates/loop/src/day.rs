@@ -31,8 +31,9 @@ pub struct Workday<'a> {
 
 impl Workday<'_> {
     /// Runs one wake in today's conversation, starting the day if none is
-    /// open. What the wake added to the transcript is saved even when the
-    /// model call fails partway, so the train of thought isn't lost.
+    /// open. What the wake added to the transcript is saved together with its
+    /// record, even when a model call fails partway, so neither the train of
+    /// thought nor its spend is lost.
     pub async fn wake(
         &mut self,
         reason: &WakeReason,
@@ -57,7 +58,6 @@ impl Workday<'_> {
         )
         .await;
 
-        self.store.append(day.id, &transcript[before..])?;
         let (end, turns, usage, cost_usd, context_tokens) = match &result {
             Ok(outcome) => (
                 outcome.end.label().to_string(),
@@ -77,11 +77,11 @@ impl Workday<'_> {
                 *turns,
                 *usage,
                 *cost_usd,
-                // A failure before any call finished leaves the day's size as it was.
-                (*context_tokens).max(day.context_tokens),
+                *context_tokens,
             ),
         };
-        self.store.record_wake(
+        self.store.finish_wake(
+            &transcript[before..],
             &WakeRecord {
                 day_id: day.id,
                 reason: serde_json::to_string(reason).unwrap_or_default(),

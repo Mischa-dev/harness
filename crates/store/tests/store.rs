@@ -106,7 +106,7 @@ fn one_day_at_a_time_and_handoffs_carry_over() {
 
 #[test]
 fn wakes_record_usage_cost_and_the_days_context_size() {
-    let store = Store::open_in_memory().unwrap();
+    let mut store = Store::open_in_memory().unwrap();
     let start = datetime!(2026-01-05 09:00 UTC);
     let day = store.start_day(start).unwrap();
     store
@@ -132,4 +132,32 @@ fn migrations_are_idempotent() {
     drop(Store::open(&path).unwrap());
     let store = Store::open(&path).unwrap();
     assert_eq!(store.current_day().unwrap(), None);
+}
+
+#[test]
+fn the_days_context_size_never_shrinks() {
+    let mut store = Store::open_in_memory().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let day = store.start_day(start).unwrap();
+    store
+        .record_wake(&wake(day.id, start, 0.05), 70_000)
+        .unwrap();
+    // A provider that reports no usage must not hide how large the day is.
+    store.record_wake(&wake(day.id, start, 0.0), 0).unwrap();
+    assert_eq!(store.current_day().unwrap().unwrap().context_tokens, 70_000);
+}
+
+#[test]
+fn a_wake_is_saved_whole_or_not_at_all() {
+    let mut store = Store::open_in_memory().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let day = store.start_day(start).unwrap();
+    store.end_day(day.id, start, None).unwrap();
+    // The day ended underneath the wake: neither the messages nor the record land.
+    assert!(matches!(
+        store.finish_wake(&tool_turn(), &wake(day.id, start, 0.05), 500),
+        Err(StoreError::DayEnded(_))
+    ));
+    assert!(store.transcript(day.id).unwrap().is_empty());
+    assert!(store.wakes_since(start).unwrap().is_empty());
 }

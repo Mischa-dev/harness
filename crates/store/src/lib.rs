@@ -135,32 +135,7 @@ impl Store {
     /// Appends messages to the day's transcript, in order, in one transaction.
     pub fn append(&mut self, day_id: i64, messages: &[Message]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let ended: Option<Option<i64>> = tx
-            .query_row(
-                "SELECT ended_at FROM days WHERE id = ?1",
-                params![day_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        match ended {
-            None => return Err(StoreError::Corrupt(format!("no day {day_id}"))),
-            Some(Some(_)) => return Err(StoreError::DayEnded(day_id)),
-            Some(None) => {}
-        }
-        let next: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq) + 1, 0) FROM transcript WHERE day_id = ?1",
-            params![day_id],
-            |row| row.get(0),
-        )?;
-        {
-            let mut insert =
-                tx.prepare("INSERT INTO transcript (day_id, seq, message) VALUES (?1, ?2, ?3)")?;
-            for (i, message) in messages.iter().enumerate() {
-                let json = serde_json::to_string(message)
-                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-                insert.execute(params![day_id, next + i as i64, json])?;
-            }
-        }
+        append_in(&tx, day_id, messages)?;
         tx.commit()?;
         Ok(())
     }
@@ -178,8 +153,23 @@ impl Store {
     }
 
     /// Records a finished wake, and the context size its last call reached.
-    pub fn record_wake(&self, wake: &WakeRecord, context_tokens: u64) -> Result<i64> {
-        self.conn.execute(
+    pub fn record_wake(&mut self, wake: &WakeRecord, context_tokens: u64) -> Result<i64> {
+        self.finish_wake(&[], wake, context_tokens)
+    }
+
+    /// Saves what a wake added to the transcript and its record together, so
+    /// a crash can't leave a conversation whose spend was never counted. The
+    /// day's context size only grows: a call that reports fewer tokens (or
+    /// none) doesn't hide how large the day already is.
+    pub fn finish_wake(
+        &mut self,
+        messages: &[Message],
+        wake: &WakeRecord,
+        context_tokens: u64,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        append_in(&tx, wake.day_id, messages)?;
+        tx.execute(
             "INSERT INTO wakes (day_id, reason, started_at, ended_at, end_state, turns,
                                 input_tokens, output_tokens, cache_read_tokens,
                                 cache_write_tokens, cost_usd)
@@ -198,11 +188,12 @@ impl Store {
                 wake.cost_usd,
             ],
         )?;
-        let id = self.conn.last_insert_rowid();
-        self.conn.execute(
-            "UPDATE days SET context_tokens = ?2 WHERE id = ?1",
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE days SET context_tokens = MAX(context_tokens, ?2) WHERE id = ?1",
             params![wake.day_id, context_tokens as i64],
         )?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -259,6 +250,35 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+}
+
+/// Appends to an open day's transcript inside the caller's transaction.
+fn append_in(tx: &rusqlite::Transaction<'_>, day_id: i64, messages: &[Message]) -> Result<()> {
+    let ended: Option<Option<i64>> = tx
+        .query_row(
+            "SELECT ended_at FROM days WHERE id = ?1",
+            params![day_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match ended {
+        None => return Err(StoreError::Corrupt(format!("no day {day_id}"))),
+        Some(Some(_)) => return Err(StoreError::DayEnded(day_id)),
+        Some(None) => {}
+    }
+    let next: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM transcript WHERE day_id = ?1",
+        params![day_id],
+        |row| row.get(0),
+    )?;
+    let mut insert =
+        tx.prepare("INSERT INTO transcript (day_id, seq, message) VALUES (?1, ?2, ?3)")?;
+    for (i, message) in messages.iter().enumerate() {
+        let json =
+            serde_json::to_string(message).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        insert.execute(params![day_id, next + i as i64, json])?;
+    }
+    Ok(())
 }
 
 fn timestamp(seconds: i64) -> Result<OffsetDateTime> {
