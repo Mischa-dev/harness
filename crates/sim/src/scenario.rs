@@ -98,7 +98,6 @@ impl Scenario {
         let start = OffsetDateTime::parse(&file.start, &Rfc3339)
             .map_err(|e| ScenarioError::Invalid(format!("start {:?}: {e}", file.start)))?;
         let end = start + parse_offset(&file.length)?;
-        let mention = format!("@{}", file.agent);
         let mut events = file
             .events
             .into_iter()
@@ -112,7 +111,7 @@ impl Scenario {
                 }
                 Ok(Event {
                     at,
-                    addressed: e.conversation == "dm" || e.text.contains(&mention),
+                    addressed: e.conversation == "dm" || mentions(&e.text, &file.agent),
                     conversation: e.conversation,
                     from: e.from,
                     text: e.text,
@@ -130,6 +129,18 @@ impl Scenario {
             expect: file.expect,
         })
     }
+}
+
+/// Whether `text` mentions `@agent` as a whole handle: `@Mara,` does, and
+/// `@Marathon` or `x@Mara` don't.
+fn mentions(text: &str, agent: &str) -> bool {
+    let handle = format!("@{agent}");
+    let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(&handle).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + handle.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 /// Parses offsets like `2d`, `14h30m` or `1d 2h 5m`.
@@ -212,6 +223,15 @@ mod tests {
         let addressed: Vec<_> = scenario.events.iter().map(|e| e.addressed).collect();
         assert_eq!(addressed, [true, true, false]);
         assert_eq!(scenario.events[0].at, datetime!(2026-01-05 10:00 UTC));
+    }
+
+    #[test]
+    fn mentions_match_whole_handles() {
+        assert!(mentions("@Mara can you look?", "Mara"));
+        assert!(mentions("thanks, @Mara.", "Mara"));
+        assert!(!mentions("@Marathon is on Sunday", "Mara"));
+        assert!(!mentions("mail ops@Mara", "Mara"));
+        assert!(!mentions("Mara, can you look?", "Mara"));
     }
 
     #[test]

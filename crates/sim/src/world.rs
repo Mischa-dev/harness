@@ -60,6 +60,9 @@ impl Tool for MessageSend {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidArguments("text must be a string".into()))?;
+        if text.trim().is_empty() {
+            return Err(ToolError::InvalidArguments("text is empty".into()));
+        }
         self.outbox.lock().expect("outbox poisoned").push(Sent {
             at: ctx.clock.now(),
             conversation: conversation(args)?.into(),

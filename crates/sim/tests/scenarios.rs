@@ -166,3 +166,14 @@ async fn a_run_cut_short_by_the_wake_cap_fails() {
     let failed = failed(&report);
     assert!(failed.contains(&"no failed wakes"), "{report}");
 }
+
+#[tokio::test]
+async fn blank_replies_dont_count() {
+    let blank = Always(vec![
+        ("message_send", json!({"conversation": "dm", "text": "  "})),
+        sleep(),
+    ]);
+    let report = run_with(&bundled("quiet-week"), &blank).await;
+    assert!(report.sent.is_empty());
+    assert_eq!(failed(&report), ["answers what is addressed to it"]);
+}
