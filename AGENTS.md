@@ -34,6 +34,6 @@ Work is tracked in the runtime's Agent Workspace project. Claim the task you're 
 ## Never
 
 - Run tests or scenarios against real projects, real conversations, or Nyx. Use the Lab organization and throwaway repos.
-- Push to main, or merge your own PR.
+- Push to main, or merge your own PR before CI is green and the Codex review has finished with its findings handled. Mischa allowed merging your own PRs once both are done (2026-10-13).
 - Edit a live agent's IDENTITY, SOUL or charter without Mischa asking.
 - Commit `.env` files, keys, tokens or recorded fixtures that contain credentials. Scrub fixtures before committing.
