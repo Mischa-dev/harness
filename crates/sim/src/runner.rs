@@ -39,6 +39,8 @@ pub enum RunError {
     Store(#[from] StoreError),
     #[error("couldn't create the agent's working area: {0}")]
     Workdir(#[from] std::io::Error),
+    #[error("message outbox is unavailable")]
+    OutboxUnavailable,
 }
 
 pub async fn run(
@@ -169,7 +171,10 @@ pub async fn run(
             }
         }
     }
-    let sent = outbox.lock().expect("outbox poisoned").clone();
+    let sent = outbox
+        .lock()
+        .map_err(|_| RunError::OutboxUnavailable)?
+        .clone();
     Ok(Report::new(
         scenario,
         records,
