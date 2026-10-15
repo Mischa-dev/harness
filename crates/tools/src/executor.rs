@@ -92,7 +92,7 @@ impl PolicyExecutor {
                 blocked => return ExecOutcome::Blocked(blocked),
             }
         }
-        if let Some(tripped) = self.charge_breakers(&effects) {
+        if let Some(tripped) = self.check_breakers(&effects) {
             return ExecOutcome::Blocked(tripped);
         }
 
@@ -101,14 +101,18 @@ impl PolicyExecutor {
             clock: self.clock.as_ref(),
         };
         match tool.run(&call.arguments, &ctx).await {
-            Ok(output) => ExecOutcome::Ran(output),
+            Ok(output) => {
+                self.record_breaker_effects(&effects);
+                ExecOutcome::Ran(output)
+            }
             Err(ToolError::InvalidArguments(problem)) => ExecOutcome::Malformed(problem),
             Err(ToolError::Failed(problem)) => ExecOutcome::Failed(problem),
         }
     }
 
-    /// Counts the call against the breakers, or trips one and pauses the agent.
-    fn charge_breakers(&mut self, effects: &[Effect]) -> Option<Decision> {
+    /// Checks whether a call would exceed a breaker, without charging effects
+    /// that may still fail to run.
+    fn check_breakers(&mut self, effects: &[Effect]) -> Option<Decision> {
         let messages = effects
             .iter()
             .filter(|e| matches!(e, Effect::SendMessage { .. }))
@@ -129,8 +133,17 @@ impl PolicyExecutor {
             self.paused = Some(breaker.clone());
             return Some(Decision::Tripped { breaker });
         }
-        self.messages_sent
-            .extend(std::iter::repeat_n(now, messages));
         None
+    }
+
+    /// Only successful effects count. A malformed or failed send did not put a
+    /// message into the world and must not consume the agent's hourly allowance.
+    fn record_breaker_effects(&mut self, effects: &[Effect]) {
+        let messages = effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::SendMessage { .. }))
+            .count();
+        self.messages_sent
+            .extend(std::iter::repeat_n(self.clock.now(), messages));
     }
 }

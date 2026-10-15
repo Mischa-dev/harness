@@ -22,6 +22,29 @@ struct Probe {
     runs: Arc<AtomicUsize>,
 }
 
+struct FailingSend;
+
+#[async_trait]
+impl Tool for FailingSend {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "failing_send".into(),
+            description: String::new(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> Result<Vec<Effect>, ToolError> {
+        Ok(vec![Effect::SendMessage {
+            conversation: "dm".into(),
+        }])
+    }
+
+    async fn run(&self, _args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::Failed("delivery failed".into()))
+    }
+}
+
 #[async_trait]
 impl Tool for Probe {
     fn spec(&self) -> ToolSpec {
@@ -296,6 +319,26 @@ async fn the_message_window_slides() {
     }
     h.clock.advance(Duration::HOUR);
     assert!(matches!(h.exec.execute(&send).await, ExecOutcome::Ran(_)));
+    assert_eq!(h.exec.paused(), None);
+}
+
+#[tokio::test]
+async fn failed_sends_do_not_consume_the_message_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    h.exec.register(Box::new(FailingSend));
+    let failing = call("failing_send", json!({}));
+    for _ in 0..50 {
+        assert!(matches!(
+            h.exec.execute(&failing).await,
+            ExecOutcome::Failed(_)
+        ));
+    }
+
+    let send = call("send", json!({"to": "dm"}));
+    for _ in 0..30 {
+        assert!(matches!(h.exec.execute(&send).await, ExecOutcome::Ran(_)));
+    }
     assert_eq!(h.exec.paused(), None);
 }
 
