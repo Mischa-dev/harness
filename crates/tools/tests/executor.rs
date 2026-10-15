@@ -192,6 +192,7 @@ async fn forbidden_commands_are_denied_by_program_name() {
         ("git", "push --force=true origin main"),
         ("git", "push --force-with-lease=main:deadbeef origin main"),
         ("git", "push -uf origin main"),
+        ("git", "push origin +main:main"),
     ];
     for (program, args) in cases {
         let out = h

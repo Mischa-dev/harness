@@ -166,16 +166,29 @@ fn the_days_context_size_never_shrinks() {
 }
 
 #[test]
-fn provider_counters_cannot_wrap_in_persistent_budget_records() {
+fn oversized_provider_counters_do_not_wrap_negative_in_sqlite() {
     let mut store = Store::open_in_memory().unwrap();
     let start = datetime!(2026-01-05 09:00 UTC);
     let day = store.start_day(start).unwrap();
-    let mut record = wake(day.id, start, 0.05);
-    record.usage.input_tokens = u64::MAX;
-    assert!(matches!(
-        store.begin_wake(&record),
-        Err(StoreError::Corrupt(message)) if message.contains("token count")
-    ));
+    let mut record = wake(day.id, start, 0.0);
+    record.usage = Usage {
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_read_tokens: u64::MAX,
+        cache_write_tokens: u64::MAX,
+    };
+    store.record_wake(&record, u64::MAX).unwrap();
+
+    let largest_sqlite_integer = i64::MAX as u64;
+    let saved = &store.wakes_since(start).unwrap()[0];
+    assert_eq!(saved.usage.input_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.output_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.cache_read_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.cache_write_tokens, largest_sqlite_integer);
+    assert_eq!(
+        store.current_day().unwrap().unwrap().context_tokens,
+        largest_sqlite_integer
+    );
 }
 
 #[test]

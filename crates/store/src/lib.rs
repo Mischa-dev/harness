@@ -192,7 +192,7 @@ impl Store {
     /// Opens the record for a wake that is starting, before any model call,
     /// so its spend is counted even if the process dies partway through.
     pub fn begin_wake(&mut self, wake: &WakeRecord) -> Result<i64> {
-        let usage = usage_to_sql(&wake.usage)?;
+        let usage = usage_to_sql(&wake.usage);
         let tx = self.conn.transaction()?;
         append_in(&tx, wake.day_id, &[])?;
         tx.execute(
@@ -236,9 +236,8 @@ impl Store {
     ) -> Result<()> {
         let from_sql = i64::try_from(from)
             .map_err(|_| StoreError::Corrupt("transcript position is too large".into()))?;
-        let usage = usage_to_sql(&wake.usage)?;
-        let context_tokens = i64::try_from(context_tokens)
-            .map_err(|_| StoreError::Corrupt("context token count is too large".into()))?;
+        let usage = usage_to_sql(&wake.usage);
+        let context_tokens = sqlite_counter(context_tokens);
         let tx = self.conn.transaction()?;
         append_in(&tx, wake.day_id, &[])?;
         tx.execute(
@@ -405,17 +404,20 @@ fn timestamp(seconds: i64) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(seconds).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
-fn usage_to_sql(usage: &Usage) -> Result<[i64; 4]> {
-    let convert = |tokens| {
-        i64::try_from(tokens)
-            .map_err(|_| StoreError::Corrupt("provider token count exceeds database range".into()))
-    };
-    Ok([
-        convert(usage.input_tokens)?,
-        convert(usage.output_tokens)?,
-        convert(usage.cache_read_tokens)?,
-        convert(usage.cache_write_tokens)?,
-    ])
+/// SQLite integers are signed. Provider counters are unsigned and untrusted,
+/// so clamp values that do not fit rather than wrapping them negative and
+/// defeating usage or context accounting.
+fn sqlite_counter(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn usage_to_sql(usage: &Usage) -> [i64; 4] {
+    [
+        sqlite_counter(usage.input_tokens),
+        sqlite_counter(usage.output_tokens),
+        sqlite_counter(usage.cache_read_tokens),
+        sqlite_counter(usage.cache_write_tokens),
+    ]
 }
 
 fn nonnegative(value: i64, field: &str) -> Result<u64> {
