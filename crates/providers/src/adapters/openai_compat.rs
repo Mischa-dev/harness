@@ -83,10 +83,10 @@ impl OpenAiCompatAdapter {
             .ok_or_else(|| ProviderError::Parse("choice has no message".into()))?;
 
         let mut content = Vec::new();
-        if let Some(text) = message.get("content").and_then(Value::as_str) {
-            if !text.is_empty() {
-                content.push(ContentBlock::Text { text: text.into() });
-            }
+        if let Some(text) = message.get("content").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            content.push(ContentBlock::Text { text: text.into() });
         }
         if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
             for call in calls {

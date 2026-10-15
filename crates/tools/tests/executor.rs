@@ -189,6 +189,9 @@ async fn forbidden_commands_are_denied_by_program_name() {
         ("/usr/bin/env", "python"),
         ("git", "push --force origin main"),
         ("/run/current-system/sw/bin/git", "push origin main -f"),
+        ("git", "push --force=true origin main"),
+        ("git", "push --force-with-lease=main:deadbeef origin main"),
+        ("git", "push -uf origin main"),
     ];
     for (program, args) in cases {
         let out = h
@@ -209,6 +212,28 @@ async fn forbidden_commands_are_denied_by_program_name() {
         .await;
     assert!(matches!(ok, ExecOutcome::Ran(_)));
     assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn credential_and_repository_metadata_paths_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    for path in [
+        ".git/config",
+        ".ssh/authorized_keys",
+        ".aws/credentials",
+        ".config/gcloud/credentials.db",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".env.local",
+    ] {
+        for tool in ["read", "write"] {
+            let out = h.exec.execute(&call(tool, json!({"path": path}))).await;
+            assert!(is_deny(&out), "{tool} {path} should be denied, got {out:?}");
+        }
+    }
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
