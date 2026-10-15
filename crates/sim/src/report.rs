@@ -29,6 +29,7 @@ pub struct Report {
 }
 
 impl Report {
+    /// Scores a completed run against its scenario's hard checks.
     pub fn new(
         scenario: &Scenario,
         wakes: Vec<WakeRecord>,
@@ -135,6 +136,7 @@ impl Report {
         }
     }
 
+    /// Returns `true` when every hard check passed.
     pub fn passed(&self) -> bool {
         self.checks.iter().all(|c| c.passed)
     }

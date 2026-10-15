@@ -35,6 +35,7 @@ pub enum WakeReason {
 }
 
 impl WakeReason {
+    /// Returns whether this reason may interrupt a wake already in progress.
     pub fn urgency(&self) -> Urgency {
         match self {
             WakeReason::Workspace { urgent, .. } if *urgent => Urgency::Now,

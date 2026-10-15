@@ -23,6 +23,10 @@ pub enum ExecOutcome {
     Blocked(Decision),
 }
 
+/// The mandatory gateway from model-requested calls to tool execution.
+///
+/// It validates arguments, asks each tool to declare its effects, applies
+/// walls and circuit breakers, and only then invokes the tool.
 pub struct PolicyExecutor {
     policy: Policy,
     tools: BTreeMap<String, RegisteredTool>,
@@ -39,6 +43,7 @@ struct RegisteredTool {
 }
 
 impl PolicyExecutor {
+    /// Creates an executor with no registered tools.
     pub fn new(policy: Policy, clock: Arc<dyn Clock>) -> Self {
         Self {
             policy,
@@ -49,17 +54,20 @@ impl PolicyExecutor {
         }
     }
 
+    /// Registers or replaces a tool by its specification name.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
         let spec = tool.spec();
         self.tools
             .insert(spec.name.clone(), RegisteredTool { spec, tool });
     }
 
+    /// Registers a tool and returns the executor for builder-style wiring.
     pub fn with_tool(mut self, tool: impl Tool + 'static) -> Self {
         self.register(Box::new(tool));
         self
     }
 
+    /// Returns model-facing specifications for all registered tools.
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|tool| tool.spec.clone()).collect()
     }
@@ -74,6 +82,7 @@ impl PolicyExecutor {
         self.paused = None;
     }
 
+    /// Validates, authorizes, charges, and executes one model-requested call.
     pub async fn execute(&mut self, call: &ToolCall) -> ExecOutcome {
         let effects = match self.tools.get(&call.name) {
             None => {

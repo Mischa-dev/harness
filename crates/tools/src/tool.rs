@@ -61,16 +61,20 @@ pub enum ToolError {
 }
 
 pub struct ToolContext<'a> {
+    /// The runtime clock for time-dependent tool behavior.
     pub clock: &'a dyn Clock,
 }
 
+/// A model-callable operation whose effects can be authorized before it runs.
 #[async_trait]
 pub trait Tool: Send + Sync {
+    /// Describes the tool and its argument schema to the model.
     fn spec(&self) -> ToolSpec;
 
     /// The effects this call would have. Called before the policy check, so
     /// it must not touch the world.
     fn effects(&self, args: &Value) -> Result<Vec<Effect>, ToolError>;
 
+    /// Performs an already validated and authorized call.
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError>;
 }

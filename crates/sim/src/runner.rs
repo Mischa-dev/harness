@@ -43,6 +43,8 @@ pub enum RunError {
     OutboxUnavailable,
 }
 
+/// Runs `scenario` through the real workday, wake loop, store, and policy
+/// executor, then returns its scored report.
 pub async fn run(
     scenario: &Scenario,
     provider: &dyn Provider,

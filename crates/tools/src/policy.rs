@@ -51,6 +51,7 @@ impl Default for BreakerLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Static safety boundaries and circuit-breaker thresholds for one agent.
 pub struct Policy {
     /// The agent's working area. Paths outside it can't be read or written.
     pub root: PathBuf,
@@ -107,6 +108,7 @@ impl Policy {
         }
     }
 
+    /// Decides whether one declared effect is allowed to proceed.
     pub fn check(&self, effect: &Effect) -> Decision {
         match effect {
             Effect::ReadPath(path) => match self.resolve(path) {

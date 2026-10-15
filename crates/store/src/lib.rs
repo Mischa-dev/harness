@@ -54,11 +54,13 @@ pub struct WakeRecord {
     pub cost_usd: f64,
 }
 
+/// Durable SQLite storage for workdays, transcripts, and wake accounting.
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
+    /// Opens or creates a store at `path` and applies schema migrations.
     pub fn open(path: &Path) -> Result<Self> {
         secure_state_file(path)?;
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -70,6 +72,7 @@ impl Store {
         Self::init(conn)
     }
 
+    /// Creates an in-memory store, primarily for tests and simulations.
     pub fn open_in_memory() -> Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -169,6 +172,7 @@ impl Store {
         Ok(len as usize)
     }
 
+    /// Loads a day's transcript in conversation order.
     pub fn transcript(&self, day_id: i64) -> Result<Vec<Message>> {
         let mut query = self
             .conn
