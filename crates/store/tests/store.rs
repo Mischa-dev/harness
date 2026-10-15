@@ -260,8 +260,12 @@ fn a_later_save_replaces_a_pending_message() {
     let turn = tool_turn();
     let pending = Message::user_text("cut off");
     store
-        .save_wake(id, 0, &[turn[0].clone(), pending], &record, 0)
+        .save_wake_with_pending(id, 0, &turn[..1], Some(&pending), &record, 0)
         .unwrap();
+    assert_eq!(
+        store.transcript(day.id).unwrap(),
+        [&turn[..1], &[pending]].concat()
+    );
     store.save_wake(id, 1, &turn[1..], &record, 0).unwrap();
     assert_eq!(store.transcript(day.id).unwrap(), turn);
     // A save can't leave a gap in the transcript.
