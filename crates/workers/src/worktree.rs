@@ -168,6 +168,46 @@ pub fn outside_locks<'a>(changes: &'a [Change], locks: &[LockPath]) -> Vec<&'a C
         .collect()
 }
 
+/// The changes to protected paths: CI, review rules, agent instructions,
+/// anything a worker mustn't change to get its work through.
+pub fn protected_changes<'a>(changes: &'a [Change], protected: &[LockPath]) -> Vec<&'a Change> {
+    changes
+        .iter()
+        .filter(|change| {
+            LockPath::parse(&change.path)
+                .is_none_or(|path| protected.iter().any(|p| p.contains(&path)))
+        })
+        .collect()
+}
+
+/// Tests the worker deleted. Weakening a test to pass is a wall
+/// (ARCHITECTURE.md, "Walls"); deleting one is the plainest way.
+pub fn deleted_tests(changes: &[Change]) -> Vec<&Change> {
+    changes
+        .iter()
+        .filter(|change| change.status == 'D' && is_test(&change.path))
+        .collect()
+}
+
+/// Whether a path looks like a test by the usual conventions.
+pub fn is_test(path: &str) -> bool {
+    let mut parts = path.split('/');
+    let file = parts.next_back().unwrap_or_default();
+    let in_test_dir = path.split('/').rev().skip(1).any(|dir| {
+        matches!(
+            dir,
+            "test" | "tests" | "__tests__" | "spec" | "specs" | "testdata"
+        )
+    });
+    let stem = file.split('.').next().unwrap_or_default();
+    in_test_dir
+        || stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || stem.ends_with("_spec")
+        || file.contains(".test.")
+        || file.contains(".spec.")
+}
+
 fn check_ref(repo: &Path, branch: &str) -> Result<(), GitError> {
     let plain = branch
         .bytes()
@@ -348,5 +388,44 @@ mod tests {
             .collect();
         assert_eq!(outside, ["docs/b.md", "src2/x.rs", "Cargo.toml"]);
         assert!(outside_locks(&changes, &[LockPath::whole_repo()]).is_empty());
+    }
+
+    #[test]
+    fn protected_paths_and_deleted_tests_are_found() {
+        let protected = [
+            LockPath::parse(".github").unwrap(),
+            LockPath::parse("AGENTS.md").unwrap(),
+        ];
+        let changes = [
+            change('M', ".github/workflows/ci.yml"),
+            change('M', "AGENTS.md"),
+            change('M', "docs/AGENTS.md"),
+            change('M', ".githubx"),
+            change('D', "crates/store/tests/run.rs"),
+            change('D', "src/lib_test.go"),
+            change('D', "web/app.spec.ts"),
+            change('M', "tests/run.rs"),
+            change('D', "src/testing.rs"),
+            change('D', "src/latest.rs"),
+        ];
+        let touched: Vec<_> = protected_changes(&changes, &protected)
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        assert_eq!(touched, [".github/workflows/ci.yml", "AGENTS.md"]);
+        let deleted: Vec<_> = deleted_tests(&changes)
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            [
+                "crates/store/tests/run.rs",
+                "src/lib_test.go",
+                "web/app.spec.ts"
+            ]
+        );
+        assert!(is_test("test_api.py"));
+        assert!(!is_test("contest.rs"));
     }
 }

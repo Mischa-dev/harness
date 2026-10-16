@@ -44,6 +44,8 @@ fn setup(script: &str, max_running: usize) -> Setup {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/lib.rs"), "pub fn one() -> u8 { 1 }\n").unwrap();
     std::fs::write(repo.join("README.md"), "# demo\n").unwrap();
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(repo.join("tests/it.rs"), "#[test]\nfn works() {}\n").unwrap();
     git(&repo, &["init", "--quiet", "--initial-branch=main"]);
     git(&repo, &["add", "--all"]);
     git(&repo, &["commit", "--quiet", "-m", "first"]);
@@ -60,6 +62,7 @@ fn setup(script: &str, max_running: usize) -> Setup {
         repos: BTreeMap::from([("demo".to_string(), repo)]),
         worktrees_dir: None,
         max_running,
+        protected: vec![".github".into(), "AGENTS.md".into()],
         claude_code: Some(KindConfig {
             program,
             model: None,
@@ -183,6 +186,33 @@ async fn a_worker_gets_its_brief_and_no_credentials_and_its_end_is_recorded() {
     // The repository's own checkout is untouched.
     let main = std::fs::read_to_string(s.root.join("demo/src/lib.rs")).unwrap();
     assert!(main.contains("{ 1 }"));
+}
+
+#[tokio::test]
+async fn a_worker_that_changes_ci_or_deletes_tests_fails_whatever_it_says() {
+    let script = r#"cat > /dev/null
+mkdir -p .github
+echo 'on: push' > .github/ci.yml
+rm tests/it.rs
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"All green now."}'"#;
+    let mut s = setup(script, 4);
+    let started = s
+        .workers
+        .spawn(request(&["."], "Make CI pass."))
+        .await
+        .unwrap();
+    let finished = s.done.recv().await.unwrap();
+    assert_eq!(
+        finished.line,
+        format!(
+            "Worker #{} (claude_code in demo) failed: It changed protected files: .github/ci.yml. \
+             It deleted tests: tests/it.rs. Don't accept this as it is.",
+            started.id
+        )
+    );
+    let record = s.workers.book.get(started.id).unwrap().unwrap();
+    assert_eq!(record.state, WorkerState::Failed);
+    assert!(record.summary.unwrap().contains("All green now."));
 }
 
 #[tokio::test]

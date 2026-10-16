@@ -120,6 +120,9 @@ spend_per_day_usd = 15.0
 # max_running = 4
 # # Where worktrees go; defaults to `worktrees` in state_dir.
 # # worktrees_dir = "/var/lib/harness/worktrees"
+# # Paths no worker may change; a worker that changes one, or deletes a test,
+# # fails. Defaults to CI config, agent instructions and review rules.
+# # protected = [".github", ".gitlab-ci.yml", ".claude", ".codex", "AGENTS.md", "CLAUDE.md", "CODEOWNERS", "REVIEW.md"]
 #
 # [agent.workers.repos]
 # harness = "/home/agent/src/harness"

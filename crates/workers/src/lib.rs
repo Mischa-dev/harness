@@ -11,4 +11,6 @@ pub mod worktree;
 
 pub use kind::{Kind, KindConfig};
 pub use runner::{Finished, Request, Workers, WorkersConfig};
-pub use worktree::{Change, GitError, Worktree, outside_locks};
+pub use worktree::{
+    Change, GitError, Worktree, deleted_tests, is_test, outside_locks, protected_changes,
+};
