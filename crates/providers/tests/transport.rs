@@ -71,3 +71,33 @@ async fn loopback_calls_skip_the_system_proxy_inner() {
         .unwrap();
     assert_eq!(response.status, 200);
 }
+
+#[tokio::test]
+async fn redirects_come_back_instead_of_being_followed() {
+    // Where the redirect points: nothing may connect here.
+    let elsewhere = TcpListener::bind("127.0.0.1:0").unwrap();
+    elsewhere.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/stolen", elsewhere.local_addr().unwrap());
+    let server = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = server.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let _ = write!(
+            stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+    });
+    let transport = ReqwestTransport::new(Duration::from_secs(5)).unwrap();
+    let response = transport
+        .post_json(
+            &format!("http://{addr}/anthropic/v1/messages"),
+            &[],
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status, 307);
+    assert!(elsewhere.accept().is_err(), "the redirect was followed");
+}

@@ -40,7 +40,14 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// `timeout` bounds one whole request, including a slow model's full answer.
     pub fn new(timeout: std::time::Duration) -> Result<Self, TransportError> {
-        let builder = || reqwest::Client::builder().timeout(timeout);
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(timeout)
+                // A redirect would replay the request, conversation and all,
+                // to wherever it points, possibly another proxy route that
+                // adds a different key. The caller sees the 3xx instead.
+                .redirect(reqwest::redirect::Policy::none())
+        };
         let build =
             |b: reqwest::ClientBuilder| b.build().map_err(|e| TransportError(e.to_string()));
         Ok(Self {
