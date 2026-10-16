@@ -22,6 +22,8 @@ url = "2"
 
 [dev-dependencies]
 futures-core = "0.3"
+harness-providers.workspace = true
+serde_json.workspace = true
 tempfile = "3"
 
 [lints]

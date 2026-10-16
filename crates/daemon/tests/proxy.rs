@@ -208,6 +208,32 @@ async fn callers_without_the_token_cannot_spend_the_key() {
     assert!(header(&seen, CALLER_TOKEN_HEADER).is_empty());
 }
 
+#[tokio::test]
+async fn the_runtimes_transport_gets_through_and_a_bare_one_does_not() {
+    use harness_providers::{ReqwestTransport, Transport};
+    assert_eq!(CALLER_TOKEN_HEADER, harness_providers::CALLER_TOKEN_HEADER);
+    let (proxy, log) = setup().await;
+    let url = format!("http://{proxy}/anthropic/v1/messages");
+    let body = serde_json::json!({"model": "m"});
+
+    let bare = ReqwestTransport::new(Duration::from_secs(5)).unwrap();
+    let refused = bare.post_json(&url, &[], &body).await.unwrap();
+    assert_eq!(refused.status, 401);
+    assert!(log.lock().unwrap().is_empty());
+
+    let dir = tempfile::tempdir().unwrap();
+    let token_file = dir.path().join("caller-token");
+    std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
+    let runtime =
+        ReqwestTransport::with_caller_token_file(Duration::from_secs(5), &token_file).unwrap();
+    assert!(!format!("{runtime:?}").contains(TOKEN));
+    let answered = runtime.post_json(&url, &[], &body).await.unwrap();
+    assert_eq!(answered.status, 201);
+    let seen = log.lock().unwrap()[0].clone();
+    assert_eq!(header(&seen, "x-api-key"), ["sk-ant-secret"]);
+    assert!(header(&seen, CALLER_TOKEN_HEADER).is_empty());
+}
+
 #[test]
 fn caller_tokens_must_be_long() {
     assert!(CallerToken::new("short").is_err());

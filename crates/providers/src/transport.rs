@@ -9,6 +9,10 @@ use serde_json::Value;
 /// them prevents a broken or hostile proxy from exhausting the daemon's RAM.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
+/// The header that proves to the daemon's forwarding proxy that a call
+/// comes from the runtime. The proxy refuses calls without it.
+pub const CALLER_TOKEN_HEADER: &str = "x-harness-proxy-token";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -40,7 +44,42 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     /// `timeout` bounds one whole request, including a slow model's full answer.
     pub fn new(timeout: std::time::Duration) -> Result<Self, TransportError> {
+        Self::build(timeout, reqwest::header::HeaderMap::new())
+    }
+
+    /// For the runtime's calls through the daemon's forwarding proxy: every
+    /// request carries `token` in [`CALLER_TOKEN_HEADER`]. Only the runtime
+    /// is built this way; workers never get the token.
+    pub fn with_caller_token(
+        timeout: std::time::Duration,
+        token: &str,
+    ) -> Result<Self, TransportError> {
+        let mut value = reqwest::header::HeaderValue::from_str(token.trim())
+            .map_err(|_| TransportError("the caller token is not a valid header value".into()))?;
+        // Kept out of any debug output of the client.
+        value.set_sensitive(true);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(CALLER_TOKEN_HEADER, value);
+        Self::build(timeout, headers)
+    }
+
+    /// [`Self::with_caller_token`], reading the token from the file the
+    /// daemon also reads. The error never quotes the path.
+    pub fn with_caller_token_file(
+        timeout: std::time::Duration,
+        path: &std::path::Path,
+    ) -> Result<Self, TransportError> {
+        let token = std::fs::read_to_string(path)
+            .map_err(|e| TransportError(format!("couldn't read the caller token file: {e}")))?;
+        Self::with_caller_token(timeout, &token)
+    }
+
+    fn build(
+        timeout: std::time::Duration,
+        headers: reqwest::header::HeaderMap,
+    ) -> Result<Self, TransportError> {
         let client = reqwest::Client::builder()
+            .default_headers(headers)
             .timeout(timeout)
             // Never route private agent context through ambient HTTP proxy
             // environment variables. The explicit broker URL is the only
