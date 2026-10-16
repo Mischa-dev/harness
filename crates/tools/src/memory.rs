@@ -113,7 +113,7 @@ impl MemoryFiles {
                 let present: Vec<&str> = FILES
                     .iter()
                     .map(|(_, name, _)| *name)
-                    .filter(|name| real.join(name).exists())
+                    .filter(|name| plain_file(&real.join(name)))
                     .chain(journal.iter().map(String::as_str))
                     .collect();
                 commit(git_dir, &real, &present, "Start the history", now, false);
@@ -304,7 +304,33 @@ fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::other("the file is a symlink"));
     }
-    options.open(path)
+    let file = options.open(path)?;
+    // A hard link is another name for some other file, which could be one
+    // the walls keep the agent from.
+    if !lone_file(&file.metadata()?) {
+        return Err(std::io::Error::other("the file has other names"));
+    }
+    Ok(file)
+}
+
+/// Whether `meta` is a regular file with no other names, or anything other
+/// than a regular file (which opening or reading refuses on its own).
+fn lone_file(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        !meta.is_file() || meta.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
+}
+
+/// Whether `path` is a regular file of its own: no link, no other names.
+fn plain_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && lone_file(&m))
 }
 
 /// The file's text within `limit` characters, saying so if it was cut, or
@@ -456,7 +482,7 @@ fn journal_files(root: &Path) -> Vec<String> {
     };
     let mut files: Vec<String> = entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|entry| plain_file(&entry.path()))
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| name.strip_suffix(".md").is_some_and(is_date))
         .map(|name| format!("journal/{name}"))
@@ -512,7 +538,7 @@ impl Tool for MemoryRead {
         let text = if journal {
             read_tail(&path, MAX_READ_CHARS)
         } else {
-            read_capped(&path, MAX_READ_CHARS)
+            read_capped(&path, file(args)?.1)
         }
         .map_err(|e| ToolError::Failed(format!("couldn't read it: {}", e.kind())))?;
         if text.trim().is_empty() {
@@ -1083,13 +1109,67 @@ mod tests {
         assert!(!snapshot.contains("[cut at"));
     }
 
-    #[test]
-    fn the_snapshot_keeps_to_the_caps() {
+    #[tokio::test]
+    async fn the_snapshot_and_reads_keep_to_the_caps() {
         let (_tmp, files) = open();
         std::fs::write(files.dir().join("MEMORY.md"), "x".repeat(50_000)).unwrap();
         let snapshot = files.snapshot().unwrap();
         assert!(snapshot.contains("[cut at 6000 characters]"));
         assert!(snapshot.chars().count() < 6_200);
+
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let [read, _, _] = <[Box<dyn Tool>; 3]>::try_from(tools(files.clone()))
+            .ok()
+            .unwrap();
+        let shown = run(read.as_ref(), json!({"file": "memory"}), &clock)
+            .await
+            .unwrap()
+            .content;
+        assert!(shown.contains("[cut at 6000 characters]"));
+        assert!(shown.chars().count() < 6_200);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_names_for_a_file_lead_nowhere() {
+        let (tmp, files) = open();
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let [read, _, journal] = <[Box<dyn Tool>; 3]>::try_from(tools(files.clone()))
+            .ok()
+            .unwrap();
+        let secret = tmp.path().join(".env");
+        std::fs::write(&secret, "TOKEN=outside").unwrap();
+        std::fs::hard_link(&secret, files.dir().join("MEMORY.md")).unwrap();
+        std::fs::hard_link(&secret, files.dir().join("journal/2026-01-05.md")).unwrap();
+
+        assert!(files.snapshot().is_err());
+        assert!(
+            run(read.as_ref(), json!({"file": "memory"}), &clock)
+                .await
+                .is_err()
+        );
+        assert!(
+            run(read.as_ref(), json!({"file": "journal"}), &clock)
+                .await
+                .is_err()
+        );
+        assert!(
+            run(journal.as_ref(), json!({"entry": "hello"}), &clock)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "TOKEN=outside");
+
+        // Nor does a new history take them in.
+        let history = tmp.path().join("fresh.git");
+        MemoryFiles::open(
+            files.dir(),
+            Some(history.clone()),
+            offset!(-7),
+            datetime!(2026-01-05 19:00 UTC),
+        )
+        .unwrap();
+        assert_eq!(commits(&history), 0);
     }
 
     #[test]
