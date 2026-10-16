@@ -28,6 +28,7 @@ pub enum CachingStyle {
 
 /// List prices in US dollars per million tokens.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pricing {
     pub input: f64,
     pub output: f64,
@@ -38,6 +39,7 @@ pub struct Pricing {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityProfile {
     /// Which adapter talks to it: `openai_compat`, `anthropic` or `openai_responses`.
     pub adapter: String,
@@ -80,6 +82,7 @@ const ADAPTERS: &[&str] = &["openai_compat", "anthropic", "openai_responses"];
 
 /// The set of profiles from config, keyed by the name roles refer to.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profiles {
     #[serde(rename = "profile")]
     by_name: BTreeMap<String, CapabilityProfile>,
@@ -103,10 +106,10 @@ impl Profiles {
             if profile.context_window == 0 {
                 return Err(invalid("context_window must be positive"));
             }
-            if let Some(ttl) = &profile.cache_ttl {
-                if !matches!(ttl.as_str(), "5m" | "1h") {
-                    return Err(invalid("cache_ttl must be 5m or 1h"));
-                }
+            if let Some(ttl) = &profile.cache_ttl
+                && !matches!(ttl.as_str(), "5m" | "1h")
+            {
+                return Err(invalid("cache_ttl must be 5m or 1h"));
             }
             let p = &profile.pricing;
             if [p.input, p.output, p.cache_read, p.cache_write]
@@ -186,6 +189,20 @@ mod tests {
         assert!(matches!(
             Profiles::from_toml(&negative),
             Err(ProfileError::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_misspelled_settings_instead_of_using_unsafe_defaults() {
+        let misspelled = SAMPLE.replace("structured_output = true", "structured_ouput = true");
+        assert!(matches!(
+            Profiles::from_toml(&misspelled),
+            Err(ProfileError::Parse(_))
+        ));
+        let misspelled_price = SAMPLE.replace("cache_read = 0.3", "cache_raed = 0.3");
+        assert!(matches!(
+            Profiles::from_toml(&misspelled_price),
+            Err(ProfileError::Parse(_))
         ));
     }
 }

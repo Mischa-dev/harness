@@ -95,10 +95,10 @@ impl AnthropicAdapter {
                 if blocks.is_empty() {
                     return None;
                 }
-                if let (Some(cc), true) = (&cache_control, breakpoints.contains(&i)) {
-                    if let Some(last) = blocks.iter_mut().rev().find(|b| is_cacheable(b)) {
-                        last["cache_control"] = cc.clone();
-                    }
+                if let (Some(cc), true) = (&cache_control, breakpoints.contains(&i))
+                    && let Some(last) = blocks.iter_mut().rev().find(|b| is_cacheable(b))
+                {
+                    last["cache_control"] = cc.clone();
                 }
                 Some(json!({"role": role(message.role), "content": blocks}))
             })

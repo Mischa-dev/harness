@@ -14,6 +14,8 @@ pub use workday::{EveningReason, WorkdayPolicy};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("state file error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("stored data is corrupt: {0}")]
@@ -58,7 +60,12 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        secure_state_file(path)?;
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let conn = Connection::open_with_flags(path, flags)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         Self::init(conn)
     }
@@ -185,6 +192,7 @@ impl Store {
     /// Opens the record for a wake that is starting, before any model call,
     /// so its spend is counted even if the process dies partway through.
     pub fn begin_wake(&mut self, wake: &WakeRecord) -> Result<i64> {
+        let usage = usage_to_sql(&wake.usage)?;
         let tx = self.conn.transaction()?;
         append_in(&tx, wake.day_id, &[])?;
         tx.execute(
@@ -199,10 +207,10 @@ impl Store {
                 wake.ended_at.unix_timestamp(),
                 wake.end,
                 wake.turns,
-                wake.usage.input_tokens as i64,
-                wake.usage.output_tokens as i64,
-                wake.usage.cache_read_tokens as i64,
-                wake.usage.cache_write_tokens as i64,
+                usage[0],
+                usage[1],
+                usage[2],
+                usage[3],
                 wake.cost_usd,
             ],
         )?;
@@ -226,11 +234,16 @@ impl Store {
         wake: &WakeRecord,
         context_tokens: u64,
     ) -> Result<()> {
+        let from_sql = i64::try_from(from)
+            .map_err(|_| StoreError::Corrupt("transcript position is too large".into()))?;
+        let usage = usage_to_sql(&wake.usage)?;
+        let context_tokens = i64::try_from(context_tokens)
+            .map_err(|_| StoreError::Corrupt("context token count is too large".into()))?;
         let tx = self.conn.transaction()?;
         append_in(&tx, wake.day_id, &[])?;
         tx.execute(
             "DELETE FROM transcript WHERE day_id = ?1 AND seq >= ?2",
-            params![wake.day_id, from as i64],
+            params![wake.day_id, from_sql],
         )?;
         let len: i64 = tx.query_row(
             "SELECT COUNT(*) FROM transcript WHERE day_id = ?1",
@@ -255,10 +268,10 @@ impl Store {
                 wake.ended_at.unix_timestamp(),
                 wake.end,
                 wake.turns,
-                wake.usage.input_tokens as i64,
-                wake.usage.output_tokens as i64,
-                wake.usage.cache_read_tokens as i64,
-                wake.usage.cache_write_tokens as i64,
+                usage[0],
+                usage[1],
+                usage[2],
+                usage[3],
                 wake.cost_usd,
             ],
         )?;
@@ -270,7 +283,7 @@ impl Store {
         }
         tx.execute(
             "UPDATE days SET context_tokens = MAX(context_tokens, ?2) WHERE id = ?1",
-            params![wake.day_id, context_tokens as i64],
+            params![wake.day_id, context_tokens],
         )?;
         tx.commit()?;
         Ok(())
@@ -310,10 +323,10 @@ impl Store {
                 end,
                 turns,
                 usage: Usage {
-                    input_tokens: tokens[0] as u64,
-                    output_tokens: tokens[1] as u64,
-                    cache_read_tokens: tokens[2] as u64,
-                    cache_write_tokens: tokens[3] as u64,
+                    input_tokens: nonnegative(tokens[0], "input_tokens")?,
+                    output_tokens: nonnegative(tokens[1], "output_tokens")?,
+                    cache_read_tokens: nonnegative(tokens[2], "cache_read_tokens")?,
+                    cache_write_tokens: nonnegative(tokens[3], "cache_write_tokens")?,
                 },
                 cost_usd,
             })
@@ -329,6 +342,34 @@ impl Store {
             |row| row.get(0),
         )?)
     }
+}
+
+/// Transcripts can contain private conversation and tool output. Ensure the
+/// database isn't created using a permissive process umask, and refuse a
+/// final-component symlink so an attacker cannot redirect state writes.
+fn secure_state_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+                    return Err(error.into());
+                }
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 /// Appends to an open day's transcript inside the caller's transaction.
@@ -364,6 +405,23 @@ fn timestamp(seconds: i64) -> Result<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp(seconds).map_err(|e| StoreError::Corrupt(e.to_string()))
 }
 
+fn usage_to_sql(usage: &Usage) -> Result<[i64; 4]> {
+    let convert = |tokens| {
+        i64::try_from(tokens)
+            .map_err(|_| StoreError::Corrupt("provider token count exceeds database range".into()))
+    };
+    Ok([
+        convert(usage.input_tokens)?,
+        convert(usage.output_tokens)?,
+        convert(usage.cache_read_tokens)?,
+        convert(usage.cache_write_tokens)?,
+    ])
+}
+
+fn nonnegative(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| StoreError::Corrupt(format!("negative {field}")))
+}
+
 fn day_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Day>> {
     let id: i64 = row.get(0)?;
     let started: i64 = row.get(1)?;
@@ -376,7 +434,7 @@ fn day_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Day>> {
             started_at: timestamp(started)?,
             ended_at: ended.map(timestamp).transpose()?,
             handoff,
-            context_tokens: context_tokens as u64,
+            context_tokens: nonnegative(context_tokens, "context_tokens")?,
         })
     })())
 }

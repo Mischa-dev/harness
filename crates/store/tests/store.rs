@@ -134,6 +134,24 @@ fn migrations_are_idempotent() {
     assert_eq!(store.current_day().unwrap(), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn state_database_is_private_and_symlinks_are_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    drop(Store::open(&path).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let link = dir.path().join("linked.sqlite");
+    symlink(&path, &link).unwrap();
+    assert!(matches!(Store::open(&link), Err(StoreError::Io(_))));
+}
+
 #[test]
 fn the_days_context_size_never_shrinks() {
     let mut store = Store::open_in_memory().unwrap();
@@ -145,6 +163,19 @@ fn the_days_context_size_never_shrinks() {
     // A provider that reports no usage must not hide how large the day is.
     store.record_wake(&wake(day.id, start, 0.0), 0).unwrap();
     assert_eq!(store.current_day().unwrap().unwrap().context_tokens, 70_000);
+}
+
+#[test]
+fn provider_counters_cannot_wrap_in_persistent_budget_records() {
+    let mut store = Store::open_in_memory().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let day = store.start_day(start).unwrap();
+    let mut record = wake(day.id, start, 0.05);
+    record.usage.input_tokens = u64::MAX;
+    assert!(matches!(
+        store.begin_wake(&record),
+        Err(StoreError::Corrupt(message)) if message.contains("token count")
+    ));
 }
 
 #[test]

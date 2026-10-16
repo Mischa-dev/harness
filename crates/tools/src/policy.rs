@@ -56,6 +56,8 @@ pub struct Policy {
     pub root: PathBuf,
     /// Paths under `root` that can be read but never written.
     pub protected_paths: Vec<PathBuf>,
+    /// Credential-bearing paths that the agent can neither read nor write.
+    pub secret_paths: Vec<PathBuf>,
     pub forbidden_commands: Vec<CommandRule>,
     /// Actions that need the owner's yes before they run.
     pub approval_required: Vec<String>,
@@ -69,10 +71,20 @@ impl Policy {
     pub fn conservative(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            protected_paths: [".github", "tests", ".env"]
-                .iter()
-                .map(PathBuf::from)
-                .collect(),
+            protected_paths: [".github", "tests"].iter().map(PathBuf::from).collect(),
+            secret_paths: [
+                ".env",
+                ".git",
+                ".ssh",
+                ".aws",
+                ".config/gcloud",
+                ".npmrc",
+                ".pypirc",
+                ".netrc",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
             forbidden_commands: vec![
                 CommandRule::program("sh"),
                 CommandRule::program("bash"),
@@ -98,17 +110,28 @@ impl Policy {
     pub fn check(&self, effect: &Effect) -> Decision {
         match effect {
             Effect::ReadPath(path) => match self.resolve(path) {
+                Some(rel) if self.secret_path(&rel).is_some() => {
+                    Decision::deny(format!("{} contains credentials", path.display()))
+                }
                 Some(_) => Decision::Allow,
                 None => Decision::deny(format!("{} is outside the work area", path.display())),
             },
             Effect::WritePath(path) => match self.resolve(path) {
                 None => Decision::deny(format!("{} is outside the work area", path.display())),
-                Some(rel) => match self.protected_paths.iter().find(|p| rel.starts_with(p)) {
+                Some(rel) => match self
+                    .protected_paths
+                    .iter()
+                    .chain(self.secret_paths.iter())
+                    .find(|p| rel.starts_with(p) || env_variant(&rel, p))
+                {
                     Some(p) => Decision::deny(format!("{} is protected", p.display())),
                     None => Decision::Allow,
                 },
             },
             Effect::RunCommand { program, args } => {
+                if is_dangerous_git_push(program, args) {
+                    return Decision::deny("git force push is not allowed".into());
+                }
                 match self
                     .forbidden_commands
                     .iter()
@@ -138,6 +161,12 @@ impl Policy {
         }
     }
 
+    fn secret_path<'a>(&'a self, path: &Path) -> Option<&'a PathBuf> {
+        self.secret_paths
+            .iter()
+            .find(|protected| path.starts_with(protected) || env_variant(path, protected))
+    }
+
     /// Resolves `path` to a path relative to `root`, or `None` if it falls
     /// outside. Checked lexically first, then again after following symlinks
     /// through the deepest part of the path that exists.
@@ -162,6 +191,35 @@ impl Policy {
         }
         Some(rel)
     }
+}
+
+fn env_variant(path: &Path, protected: &Path) -> bool {
+    protected == Path::new(".env")
+        && path
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .is_some_and(|name| name.starts_with(".env."))
+}
+
+/// Git accepts long options with `=`, combined short flags, and options before
+/// the subcommand. Match those forms rather than relying on exact argv items.
+fn is_dangerous_git_push(program: &str, args: &[String]) -> bool {
+    if program_name(program) != "git" {
+        return false;
+    }
+    let Some(push_at) = args.iter().position(|arg| arg == "push") else {
+        return false;
+    };
+    args[push_at + 1..].iter().any(|arg| {
+        arg == "--force"
+            || arg.starts_with("--force=")
+            || arg == "--force-with-lease"
+            || arg.starts_with("--force-with-lease=")
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'f'))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
