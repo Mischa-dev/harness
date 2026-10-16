@@ -186,15 +186,9 @@ fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
     {
         return Err(invalid());
     }
-    let local = matches!(
-        url.host(),
-        Some(url::Host::Domain("localhost"))
-            | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
-            | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
-    );
     match url.scheme() {
         "https" => Ok(()),
-        "http" if local => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
         _ => Err(invalid()),
     }
 }
@@ -421,12 +415,15 @@ mod tests {
             "http://127.0.0.1:9000",
             "http://localhost:9000/v1",
             "http://[::1]:9000",
+            "http://127.0.0.2:9000",
+            "http://[::ffff:127.0.0.1]:9000",
         ] {
             assert!(validate_upstream(ok).is_ok(), "{ok}");
         }
         for bad in [
             "http://api.anthropic.com",
-            "http://127.0.0.2",
+            "http://localhost.example.com",
+            "http://10.0.0.1",
             "ftp://example.com",
             "https://user@example.com",
             "https://:secret@example.com",
