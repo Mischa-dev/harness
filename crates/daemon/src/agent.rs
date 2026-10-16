@@ -213,22 +213,24 @@ impl Agent {
                 field: "state_dir",
                 source,
             })?;
-        if state_dir.starts_with(&real_workdir) || state_dir.starts_with(&workdir) {
+        // The history can't hold the work area either: workdir at or under
+        // it would put the repository's own files within reach.
+        let history = state_dir.join(MEMORY_HISTORY);
+        let reachable = [&real_workdir, &workdir].iter().any(|work| {
+            state_dir.starts_with(work) || history.starts_with(work) || work.starts_with(&history)
+        });
+        if reachable {
             return Err(AgentError::Invalid(
                 "state_dir must be outside workdir, where the agent's tools can't reach it".into(),
             ));
         }
         let memory = Arc::new(
-            MemoryFiles::open(
-                memory_dir.clone(),
-                Some(state_dir.join(MEMORY_HISTORY)),
-                offset,
-                clock.now(),
-            )
-            .map_err(|source| AgentError::Read {
-                field: "memory_dir",
-                source,
-            })?,
+            MemoryFiles::open(memory_dir.clone(), Some(history), offset, clock.now()).map_err(
+                |source| AgentError::Read {
+                    field: "memory_dir",
+                    source,
+                },
+            )?,
         );
         // Where it really is, now that it exists.
         if !inside(&real_workdir, memory.location()) {

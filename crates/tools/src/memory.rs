@@ -91,6 +91,11 @@ impl MemoryFiles {
             if private_dir(git_dir).is_err() {
                 return false;
             }
+            // Git makes no links of its own, so one inside could only send
+            // its writes somewhere else.
+            if has_links(git_dir).unwrap_or(true) {
+                return false;
+            }
             // Safe on an existing repository; makes an empty folder one.
             if !git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok) {
                 return false;
@@ -98,10 +103,14 @@ impl MemoryFiles {
             // The repository's own attributes come before the folder's, so
             // nothing there can re-encode or filter what's saved.
             let info = git_dir.join("info");
-            if std::fs::create_dir_all(&info)
-                .and_then(|()| std::fs::write(info.join("attributes"), PLAIN_ATTRIBUTES))
-                .is_err()
-            {
+            let written = private_dir(&info).and_then(|()| {
+                open_file(
+                    &info.join("attributes"),
+                    OpenOptions::new().write(true).create(true).truncate(true),
+                )?
+                .write_all(PLAIN_ATTRIBUTES.as_bytes())
+            });
+            if written.is_err() {
                 return false;
             }
             let started = git(
@@ -474,6 +483,18 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     std::fs::create_dir_all(dir)
+}
+
+/// Whether anything under `dir` is a symlink, looking without following.
+fn has_links(dir: &Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_symlink() || (kind.is_dir() && has_links(&entry.path())?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `text` is `YYYY-MM-DD`.
@@ -1048,6 +1069,26 @@ mod tests {
         drop(files);
         MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
         assert_eq!(commits(&history), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_inside_the_history_turn_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let history = tmp.path().join("memory.git");
+        std::fs::create_dir(&history).unwrap();
+        std::os::unix::fs::symlink(&outside, history.join("info")).unwrap();
+        let files = MemoryFiles::open(
+            tmp.path().join("memory"),
+            Some(history),
+            offset!(-7),
+            datetime!(2026-01-05 00:00 UTC),
+        )
+        .unwrap();
+        assert!(!files.has_history());
+        assert!(!outside.join("attributes").exists());
     }
 
     #[cfg(unix)]

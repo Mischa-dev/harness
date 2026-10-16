@@ -706,6 +706,19 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
     };
     assert!(err.to_string().contains("outside workdir"), "{err}");
     assert!(!dir.path().join("work/.state/memory.git").exists());
+
+    // Nor can the work area be where the history would go.
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("state/memory.git"),
+        ..config
+    };
+    std::fs::create_dir_all(&config.state_dir).unwrap();
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a workdir at the history's place was accepted");
+    };
+    assert!(err.to_string().contains("outside workdir"), "{err}");
 }
 
 #[cfg(unix)]
