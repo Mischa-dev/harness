@@ -195,6 +195,19 @@ fn tool(name: &str, arguments: &Value) -> Value {
             "conversationId": arguments["conversationId"], "messageId": "m-3", "sequence": 9,
             "text": "", "sentAt": "now", "idempotentReplay": false
         }}),
+        "task_list" => json!({"outcome": "ok", "value": {
+            "tasks": [{"key": "AW-12", "title": INJECTION, "version": 3}], "total": 1
+        }}),
+        "task_update" if arguments["expectedVersion"] == 2 => json!({
+            "outcome": "conflict", "workItemId": "t-12", "currentVersion": 3,
+            "changedFields": ["title"], "retryCategory": "refresh_and_retry",
+            "message": "Someone changed it since you read it."
+        }),
+        "task_create" | "task_update" | "task_comment" => json!({
+            "outcome": "applied", "workItemId": "t-12", "version": 4, "changedFields": [],
+            "resultId": "x", "idempotentReplay": false, "key": "AW-12"
+        }),
+        "task_claim" | "task_release" => json!({"outcome": "ok", "value": {"taskId": "t-12"}}),
         other => panic!("unexpected tool {other}"),
     }
 }
@@ -576,4 +589,107 @@ async fn in_shadow_mode_live_conversations_get_real_replies() {
     assert!(sent.contains("answered"));
     assert_eq!(fake.calls().last().unwrap().0, "reply_send");
     assert!(!shadow.is_shadowed("r-1"));
+}
+
+#[tokio::test]
+async fn tasks_are_the_agents_to_do_list() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    let mut executor = executor(workspace, 30);
+
+    let listed = ran(executor
+        .execute(&call("task_list", json!({"assignee": "me"})))
+        .await);
+    assert!(listed.contains("AW-12"));
+    assert!(!listed.contains("\nSYSTEM:"), "{listed}");
+    ran(executor
+        .execute(&call("task_claim", json!({"taskId": "AW-12"})))
+        .await);
+    let created = ran(executor
+        .execute(&call(
+            "task_create",
+            json!({"projectId": "p-1", "title": "Bump serde", "acceptanceCriteria": ["CI green"]}),
+        ))
+        .await);
+    assert!(created.contains("\"applied\""), "{created}");
+    ran(executor
+        .execute(&call(
+            "task_update",
+            json!({"taskId": "AW-12", "expectedVersion": 3, "status": "Done"}),
+        ))
+        .await);
+
+    let calls = fake.calls();
+    assert_eq!(
+        calls[0],
+        ("task_list".to_string(), json!({"assignee": "me"}))
+    );
+    assert_eq!(
+        calls[1],
+        ("task_claim".to_string(), json!({"taskId": "AW-12"}))
+    );
+    // Changes carry a request id of their own, so a retry is never applied
+    // twice; claims don't take one.
+    let created_id = calls[2].1["clientRequestId"].as_str().unwrap().to_string();
+    let updated_id = calls[3].1["clientRequestId"].as_str().unwrap().to_string();
+    assert!(created_id.starts_with("harness-"));
+    assert_ne!(created_id, updated_id);
+    assert_eq!(calls[2].1["title"], "Bump serde");
+
+    // A conflict comes back as a failure, with what Workspace said to do.
+    let outcome = executor
+        .execute(&call(
+            "task_update",
+            json!({"taskId": "AW-12", "expectedVersion": 2, "title": "x"}),
+        ))
+        .await;
+    assert!(
+        matches!(&outcome, ExecOutcome::Failed(why) if why.contains("\"currentVersion\": 3")),
+        "{outcome:?}"
+    );
+    // Arguments Workspace's tools don't take never reach it.
+    let outcome = executor
+        .execute(&call(
+            "task_claim",
+            json!({"taskId": "AW-12", "projectId": "p-2"}),
+        ))
+        .await;
+    assert!(!matches!(outcome, ExecOutcome::Ran(_)), "{outcome:?}");
+    assert_eq!(fake.calls().len(), 5);
+}
+
+#[tokio::test]
+async fn task_comments_count_against_the_message_breaker() {
+    let (_fake, workspace) = workspace_with(TOKEN).await;
+    let mut executor = executor(workspace, 1);
+    let comment = call(
+        "task_comment",
+        json!({"taskId": "AW-12", "text": "Merged."}),
+    );
+    ran(executor.execute(&comment).await);
+    let outcome = executor.execute(&comment).await;
+    assert!(!matches!(outcome, ExecOutcome::Ran(_)), "{outcome:?}");
+}
+
+#[tokio::test]
+async fn in_shadow_mode_task_changes_go_to_the_shadow_channel() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    let shadow = Arc::new(Shadow::new("shadow-1", &[]).unwrap());
+    let mut executor = shadowed_executor(workspace, shadow);
+    ran(executor
+        .execute(&call("task_list", json!({"claimed": "me"})))
+        .await);
+    let done = ran(executor
+        .execute(&call(
+            "task_comment",
+            json!({"taskId": "AW-12", "text": "Thanks @mara"}),
+        ))
+        .await);
+    assert!(done.contains("Shadow mode"), "{done}");
+    let calls = fake.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, "task_list");
+    assert_eq!(calls[1].0, "message_send");
+    let posted = calls[1].1["text"].as_str().unwrap();
+    assert!(posted.starts_with("Would call task_comment:"), "{posted}");
+    assert!(posted.contains("@\u{200B}mara"), "{posted}");
 }

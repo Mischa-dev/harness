@@ -31,9 +31,10 @@ pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
     tools_with(workspace, None)
 }
 
-/// The tools, with replies routed through `shadow` when it's set.
+/// The tools, with replies and task changes routed through `shadow` when
+/// it's set.
 pub fn tools_with(workspace: Arc<Workspace>, shadow: Option<Arc<Shadow>>) -> Vec<Box<dyn Tool>> {
-    [
+    let mut tools: Vec<Box<dyn Tool>> = [
         Kind::Briefing,
         Kind::Claim,
         Kind::Send,
@@ -48,7 +49,9 @@ pub fn tools_with(workspace: Arc<Workspace>, shadow: Option<Arc<Shadow>>) -> Vec
             shadow: shadow.clone(),
         }) as Box<dyn Tool>
     })
-    .collect()
+    .collect();
+    tools.extend(crate::tasks::tools(workspace, shadow));
+    tools
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +331,7 @@ const SHORTENED: &str =
 
 /// The result as JSON within [`MAX_RESULT_CHARS`]. A long result is shrunk
 /// value by value, so what the model sees is always whole, valid JSON.
-fn render(value: &Value) -> String {
+pub(crate) fn render(value: &Value) -> String {
     let fits = |text: &String| text.chars().count() <= MAX_RESULT_CHARS;
     let text = serde_json::to_string_pretty(value).unwrap_or_default();
     if fits(&text) {
