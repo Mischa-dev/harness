@@ -30,17 +30,37 @@ pub trait Transport: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
+    /// For the daemon's forwarding proxy and anything else on this machine:
+    /// never through a system proxy, which would see the whole request in
+    /// the clear.
+    direct: reqwest::Client,
 }
 
 #[cfg(feature = "http")]
 impl ReqwestTransport {
     /// `timeout` bounds one whole request, including a slow model's full answer.
     pub fn new(timeout: std::time::Duration) -> Result<Self, TransportError> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| TransportError(e.to_string()))?;
-        Ok(Self { client })
+        let builder = || reqwest::Client::builder().timeout(timeout);
+        let build =
+            |b: reqwest::ClientBuilder| b.build().map_err(|e| TransportError(e.to_string()));
+        Ok(Self {
+            client: build(builder())?,
+            direct: build(builder().no_proxy())?,
+        })
+    }
+}
+
+/// Whether `url` names this machine: `localhost`, `127.0.0.0/8` or `::1`.
+#[cfg(feature = "http")]
+pub fn is_loopback(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -54,8 +74,12 @@ impl Transport for ReqwestTransport {
         body: &Value,
     ) -> Result<HttpResponse, TransportError> {
         let bytes = serde_json::to_vec(body).map_err(|e| TransportError(e.to_string()))?;
-        let mut request = self
-            .client
+        let client = if is_loopback(url) {
+            &self.direct
+        } else {
+            &self.client
+        };
+        let mut request = client
             .post(url)
             .header("content-type", "application/json")
             .body(bytes);
@@ -72,5 +96,31 @@ impl Transport for ReqwestTransport {
             .await
             .map_err(|e| TransportError(e.to_string()))?;
         Ok(HttpResponse { status, body })
+    }
+}
+
+#[cfg(all(test, feature = "http"))]
+mod tests {
+    use super::is_loopback;
+
+    #[test]
+    fn loopback_urls_are_recognised() {
+        for yes in [
+            "http://127.0.0.1:8787/anthropic/v1/messages",
+            "http://localhost:8787/x",
+            "http://LOCALHOST/x",
+            "http://127.1.2.3/x",
+            "http://[::1]:8787/x",
+        ] {
+            assert!(is_loopback(yes), "{yes}");
+        }
+        for no in [
+            "https://api.anthropic.com/v1/messages",
+            "http://localhost.evil.com/x",
+            "http://10.0.0.1/x",
+            "not a url",
+        ] {
+            assert!(!is_loopback(no), "{no}");
+        }
     }
 }

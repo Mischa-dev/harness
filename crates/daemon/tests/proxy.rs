@@ -94,7 +94,7 @@ fn header<'a>(seen: &'a Seen, name: &str) -> Vec<&'a str> {
 #[tokio::test]
 async fn adds_the_routes_key_and_passes_the_call_through() {
     let (proxy, log) = setup().await;
-    let response = reqwest::Client::new()
+    let response = local_client()
         .post(format!("http://{proxy}/anthropic/v1/messages?beta=true"))
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -121,7 +121,7 @@ async fn adds_the_routes_key_and_passes_the_call_through() {
 #[tokio::test]
 async fn replaces_any_key_the_caller_sends() {
     let (proxy, log) = setup().await;
-    reqwest::Client::new()
+    local_client()
         .post(format!("http://{proxy}/openrouter/v1/chat/completions"))
         .header("authorization", "Bearer stolen")
         .header("x-api-key", "stolen")
@@ -152,7 +152,7 @@ async fn raw_get(proxy: SocketAddr, path: &str) -> String {
 #[tokio::test]
 async fn unknown_routes_and_dot_dot_go_nowhere() {
     let (proxy, log) = setup().await;
-    let unknown = reqwest::Client::new()
+    let unknown = local_client()
         .post(format!("http://{proxy}/openai/v1/chat/completions"))
         .send()
         .await
@@ -175,7 +175,7 @@ async fn unknown_routes_and_dot_dot_go_nowhere() {
 #[tokio::test]
 async fn only_get_and_post_reach_the_provider() {
     let (proxy, log) = setup().await;
-    let client = reqwest::Client::new();
+    let client = local_client();
     for method in ["TRACE", "PUT", "DELETE", "OPTIONS"] {
         let response = client
             .request(
@@ -201,7 +201,7 @@ async fn answers_stream_through_instead_of_being_held() {
     let base = format!("http://127.0.0.1:{}", upstream.port());
     let routes = vec![Route::new("slow", &base, Auth::Bearer, "k").unwrap()];
     let proxy = serve(router(routes, Duration::from_secs(30)).unwrap()).await;
-    let mut response = reqwest::Client::new()
+    let mut response = local_client()
         .post(format!("http://{proxy}/slow/v1/chat/completions"))
         .send()
         .await
@@ -286,6 +286,7 @@ async fn local_upstreams_skip_the_system_proxy_inner() {
 async fn redirects_go_back_to_the_caller_without_the_key() {
     let (proxy, log) = setup().await;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
@@ -302,7 +303,7 @@ async fn redirects_go_back_to_the_caller_without_the_key() {
 async fn an_unreachable_provider_is_a_bad_gateway() {
     let routes = vec![Route::new("dead", "http://127.0.0.1:1", Auth::Bearer, "k").unwrap()];
     let proxy = serve(router(routes, Duration::from_secs(5)).unwrap()).await;
-    let response = reqwest::Client::new()
+    let response = local_client()
         .post(format!("http://{proxy}/dead/v1/x"))
         .send()
         .await
@@ -344,4 +345,10 @@ fn config_names_key_files_and_never_holds_keys() {
         config.proxy.load_routes().is_err(),
         "a missing key file stops startup"
     );
+}
+
+/// A client for calling the proxy under test directly, whatever system proxy
+/// the environment names.
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
