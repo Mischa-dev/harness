@@ -68,6 +68,9 @@ pub async fn run(
     for tool in harness_tools::memory::tools(memory.clone()) {
         executor.register(tool);
     }
+    for tool in harness_tools::files::tools(Policy::conservative(workdir.path())) {
+        executor.register(tool);
+    }
     let mut store = Store::open_in_memory()?;
     let mut assembler = ContextAssembler {
         profile: profile_name.into(),
