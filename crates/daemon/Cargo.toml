@@ -19,6 +19,7 @@ harness-providers = { workspace = true, features = ["http"] }
 harness-store.workspace = true
 harness-tools.workspace = true
 harness-workspace.workspace = true
+harness-workers.workspace = true
 hmac = "0.12"
 reqwest = { workspace = true, features = ["stream"] }
 serde.workspace = true

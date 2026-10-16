@@ -124,6 +124,7 @@ fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
         workspace: Some(WorkspaceConfig {
             url: format!("http://{workspace}/api/v1/mcp"),
             token_file: write(dir, "workspace-token", &format!("{WORKSPACE_TOKEN}\n")),
@@ -449,4 +450,33 @@ async fn the_owner_hears_when_a_breaker_pauses_the_agent() {
         panic!("a bad notify conversation was accepted");
     };
     assert!(err.to_string().contains("breakers.notify"), "{err}");
+}
+
+#[tokio::test]
+async fn workers_from_the_config_bring_their_tools() {
+    let (_fake, addr) = workspace().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut config = config(dir.path(), addr);
+    let workers: harness_workers::WorkersConfig = toml::from_str(&format!(
+        "[repos]\ndemo = {:?}\n[claude_code]\nprogram = \"claude\"\n",
+        dir.path().join("demo")
+    ))
+    .unwrap();
+    config.workers = Some(workers.clone());
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    let names: Vec<String> = agent.executor.specs().into_iter().map(|s| s.name).collect();
+    for tool in ["spawn_worker", "worker_status", "stop_worker"] {
+        assert!(names.contains(&tool.to_string()), "{names:?}");
+    }
+    assert!(agent.worker_reports.take().is_some());
+    assert_eq!(agent.workers.as_ref().unwrap().recover().unwrap(), 0);
+
+    let mut no_kinds = workers.clone();
+    no_kinds.claude_code = None;
+    config.workers = Some(no_kinds);
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("workers without a kind were accepted");
+    };
+    assert!(err.to_string().contains("claude_code"), "{err}");
 }

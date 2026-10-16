@@ -100,6 +100,10 @@ pub struct AgentConfig {
     /// The circuit breakers' limits, and where to say when one trips.
     #[serde(default)]
     pub breakers: crate::breakers::BreakerConfig,
+    /// Coding workers the agent can hand tasks to, and the repositories
+    /// they may work in.
+    #[serde(default)]
+    pub workers: Option<harness_workers::WorkersConfig>,
 }
 
 /// Who the agent is and who it works for, for the charter.
@@ -203,6 +207,11 @@ pub struct Agent {
     /// Whether something in `waiting` arrived since the filter last looked.
     pub unjudged: bool,
     pub breakers: crate::breakers::BreakerConfig,
+    /// Its workers, if it has any, shared with the worker tools.
+    pub workers: Option<Arc<harness_workers::Workers>>,
+    /// Where finished workers are reported, until the daemon wires it to
+    /// the wake events.
+    pub worker_reports: Option<tokio::sync::mpsc::UnboundedReceiver<harness_workers::Finished>>,
 }
 
 impl Agent {
@@ -416,6 +425,35 @@ impl Agent {
             }
             None => (None, None),
         };
+        let (workers, worker_reports) = match &config.workers {
+            Some(settings) => {
+                let (done, reports) = tokio::sync::mpsc::unbounded_channel();
+                let book = Arc::new(harness_store::WorkerBook::open(
+                    &config.state_dir.join(STORE_FILE),
+                )?);
+                let worktrees = settings
+                    .worktrees_dir
+                    .clone()
+                    .unwrap_or_else(|| config.state_dir.join("worktrees"));
+                let name = config.identity.name.as_deref().unwrap_or("the agent");
+                let workers = Arc::new(
+                    harness_workers::Workers::new(
+                        book,
+                        clock.clone(),
+                        settings.clone(),
+                        worktrees,
+                        name,
+                        done,
+                    )
+                    .map_err(AgentError::Invalid)?,
+                );
+                for tool in harness_workers::tools::tools(workers.clone()) {
+                    executor.register(tool);
+                }
+                (Some(workers), Some(reports))
+            }
+            None => (None, None),
+        };
         let policy = WorkdayPolicy {
             offset,
             quiet_hour: config.quiet_hour,
@@ -454,6 +492,8 @@ impl Agent {
             filter,
             unjudged: false,
             breakers: config.breakers.clone(),
+            workers,
+            worker_reports,
         })
     }
 
@@ -694,6 +734,17 @@ impl Agent {
                 .iter()
                 .map(|entry| harness_tools::schedule::describe(entry, self.offset))
                 .collect(),
+            workers: match &self.workers {
+                None => None,
+                Some(workers) => Some(
+                    workers
+                        .book
+                        .running()?
+                        .iter()
+                        .map(harness_workers::tools::describe)
+                        .collect(),
+                ),
+            },
             shadow: self.shadow.is_some(),
         })
     }

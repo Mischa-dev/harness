@@ -43,6 +43,8 @@ pub struct StateFacts {
     pub budget: Budget,
     /// Its follow-ups and routines, soonest first, one line each.
     pub schedule: Vec<String>,
+    /// Its running workers, one line each; `None` when it has none set up.
+    pub workers: Option<Vec<String>>,
     pub shadow: bool,
 }
 
@@ -148,6 +150,18 @@ impl StateFacts {
                 }
             }
         }
+        match &self.workers {
+            None => {}
+            Some(running) if running.is_empty() => {
+                lines.push("- Workers: none running".into());
+            }
+            Some(running) => {
+                lines.push(format!("- Workers running ({}):", running.len()));
+                for worker in running {
+                    lines.push(format!("  - {worker}"));
+                }
+            }
+        }
         if self.shadow {
             lines.push(
                 "- Shadow mode is on: what you say outside your live conversations goes to \
@@ -227,6 +241,7 @@ mod tests {
                 }],
             },
             schedule: vec![],
+            workers: None,
             shadow: false,
         }
     }
@@ -293,6 +308,25 @@ mod tests {
         assert!(shown.contains("- Your schedule (7):\n  - #1 at some time: check 1\n"));
         assert!(shown.contains("  - #5 at some time: check 5\n  - and 2 more"));
         assert!(!shown.contains("#6"));
+    }
+
+    #[test]
+    fn the_view_lists_running_workers_once_there_are_workers() {
+        assert!(!facts().render().contains("Workers"));
+        let idle = StateFacts {
+            workers: Some(vec![]),
+            ..facts()
+        };
+        assert!(idle.render().ends_with("- Workers: none running"));
+        let busy = StateFacts {
+            workers: Some(vec![
+                "#3 claude_code in harness, running since …: fix CI".into(),
+            ]),
+            ..facts()
+        };
+        assert!(busy.render().ends_with(
+            "- Workers running (1):\n  - #3 claude_code in harness, running since …: fix CI"
+        ));
     }
 
     #[test]

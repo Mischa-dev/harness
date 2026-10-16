@@ -264,6 +264,7 @@ pub async fn run(
                 .iter()
                 .map(|entry| harness_tools::schedule::describe(entry, schedule.offset))
                 .collect(),
+            workers: None,
             shadow: false,
         };
         message.push_str("\n\n");

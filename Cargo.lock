@@ -377,6 +377,7 @@ dependencies = [
  "harness-providers",
  "harness-store",
  "harness-tools",
+ "harness-workers",
  "harness-workspace",
  "hmac",
  "reqwest",
@@ -454,9 +455,18 @@ dependencies = [
 name = "harness-workers"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "harness-core",
+ "harness-loop",
+ "harness-providers",
  "harness-store",
+ "harness-tools",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "time",
+ "tokio",
 ]
 
 [[package]]

@@ -8,11 +8,21 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+harness-core.workspace = true
+harness-loop.workspace = true
+harness-providers.workspace = true
 harness-store.workspace = true
+harness-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+time = { workspace = true, features = ["formatting"] }
+tokio = { workspace = true, features = ["io-util", "process", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
