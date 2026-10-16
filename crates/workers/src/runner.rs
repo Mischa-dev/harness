@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::kind::{self, Kind, KindConfig};
-use crate::worktree::{Worktree, outside_locks};
+use crate::worktree::{Worktree, deleted_tests, outside_locks, protected_changes};
 
 /// The brief around the agent's words; product code, like the charter.
 const PROMPT: &str = include_str!("../../../prompts/worker.md");
@@ -55,6 +55,11 @@ pub struct WorkersConfig {
     pub worktrees_dir: Option<PathBuf>,
     #[serde(default = "default_max_running")]
     pub max_running: usize,
+    /// Paths no worker may change, in any repository: CI, review rules,
+    /// agent instructions. A worker that changes one fails, whatever else
+    /// it did.
+    #[serde(default = "default_protected")]
+    pub protected: Vec<String>,
     #[serde(default)]
     pub claude_code: Option<KindConfig>,
     #[serde(default)]
@@ -63,6 +68,21 @@ pub struct WorkersConfig {
 
 fn default_max_running() -> usize {
     DEFAULT_MAX_RUNNING
+}
+
+fn default_protected() -> Vec<String> {
+    [
+        ".github",
+        ".gitlab-ci.yml",
+        ".claude",
+        ".codex",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "CODEOWNERS",
+        "REVIEW.md",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 impl WorkersConfig {
@@ -84,6 +104,13 @@ impl WorkersConfig {
                 return Err(format!("workers.repos.{name} must be an absolute path"));
             }
         }
+        for path in &self.protected {
+            if LockPath::parse(path).is_none_or(|p| p.as_str().is_empty()) {
+                return Err(format!(
+                    "workers.protected: {path:?} isn't a path inside a repository"
+                ));
+            }
+        }
         if self.claude_code.is_none() && self.codex.is_none() {
             return Err("workers needs a [claude_code] or [codex] section".into());
         }
@@ -93,6 +120,14 @@ impl WorkersConfig {
             }
         }
         Ok(())
+    }
+
+    /// The protected paths, as lock paths.
+    pub fn protected_paths(&self) -> Vec<LockPath> {
+        self.protected
+            .iter()
+            .filter_map(|p| LockPath::parse(p))
+            .collect()
     }
 
     fn kind(&self, kind: Kind) -> Option<&KindConfig> {
@@ -145,7 +180,7 @@ impl Workers {
         done: mpsc::UnboundedSender<Finished>,
     ) -> Result<Self, String> {
         config.check()?;
-        harness_loop::charter::render(PROMPT, &prompt_values(agent_name, "x", "x"))
+        harness_loop::charter::render(PROMPT, &prompt_values(agent_name, "x", "x", "x"))
             .map_err(|e| format!("prompts/worker.md: {e}"))?;
         Ok(Self {
             book,
@@ -287,9 +322,18 @@ impl Workers {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let text =
-            harness_loop::charter::render(PROMPT, &prompt_values(&self.agent_name, &paths, brief))
-                .map_err(|e| format!("prompts/worker.md: {e}"))?;
+        let protected = self
+            .config
+            .protected
+            .iter()
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = harness_loop::charter::render(
+            PROMPT,
+            &prompt_values(&self.agent_name, &paths, &protected, brief),
+        )
+        .map_err(|e| format!("prompts/worker.md: {e}"))?;
         let (stop_tx, stop_rx) = oneshot::channel();
         self.stops
             .lock()
@@ -342,7 +386,7 @@ impl Workers {
         let last_message = self
             .worktrees
             .join(format!("{}.last-message.txt", worker.id));
-        let (state, summary) = match self
+        let (mut state, summary) = match self
             .supervise(kind, &config, &worker, &tree, &brief, &last_message, stop)
             .await
         {
@@ -370,6 +414,25 @@ impl Workers {
                         " Outside its locked paths: {}.",
                         outside.join(", ")
                     ));
+                }
+                // Walls first, so the wake's one line says so.
+                let mut walls = vec![];
+                let protected = protected_changes(&changes, &self.config.protected_paths());
+                if !protected.is_empty() {
+                    let names: Vec<_> = protected.iter().map(|c| c.path.as_str()).collect();
+                    walls.push(format!("It changed protected files: {}.", names.join(", ")));
+                }
+                let deleted = deleted_tests(&changes);
+                if !deleted.is_empty() {
+                    let names: Vec<_> = deleted.iter().map(|c| c.path.as_str()).collect();
+                    walls.push(format!("It deleted tests: {}.", names.join(", ")));
+                }
+                if !walls.is_empty() {
+                    state = WorkerState::Failed;
+                    summary = format!(
+                        "{} Don't accept this as it is.\n\n{summary}",
+                        walls.join(" ")
+                    );
                 }
             }
             Ok(Err(e)) => summary.push_str(&format!("\n\nIts changes couldn't be read: {e}")),
@@ -409,7 +472,13 @@ impl Workers {
     ) -> Result<(WorkerState, String), String> {
         let mut command = tokio::process::Command::new(&config.program);
         command
-            .args(kind::args(kind, config, &tree.dir, last_message))
+            .args(kind::args(
+                kind,
+                config,
+                &tree.dir,
+                last_message,
+                &self.config.protected_paths(),
+            ))
             .current_dir(&tree.dir)
             .env_clear()
             .stdin(Stdio::piped())
@@ -505,9 +574,15 @@ impl Workers {
 fn prompt_values<'a>(
     agent: &'a str,
     paths: &'a str,
+    protected: &'a str,
     brief: &'a str,
-) -> [(&'static str, &'a str); 3] {
-    [("agent_name", agent), ("paths", paths), ("brief", brief)]
+) -> [(&'static str, &'a str); 4] {
+    [
+        ("agent_name", agent),
+        ("paths", paths),
+        ("protected", protected),
+        ("brief", brief),
+    ]
 }
 
 /// Kills the worker's whole process group: the CLI and anything it ran.

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use harness_store::LockPath;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -101,8 +102,15 @@ impl KindConfig {
 const CLAUDE_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep"];
 
 /// The command line for a worker of `kind` in `dir`. `last_message` is a
-/// file the worker may write its final answer to.
-pub fn args(kind: Kind, config: &KindConfig, dir: &Path, last_message: &Path) -> Vec<String> {
+/// file the worker may write its final answer to. Claude Code is told not
+/// to edit `protected` paths; for every kind the runtime checks afterwards.
+pub fn args(
+    kind: Kind,
+    config: &KindConfig,
+    dir: &Path,
+    last_message: &Path,
+    protected: &[LockPath],
+) -> Vec<String> {
     let mut args: Vec<String> = match kind {
         Kind::ClaudeCode => {
             let mut args = vec![
@@ -116,6 +124,18 @@ pub fn args(kind: Kind, config: &KindConfig, dir: &Path, last_message: &Path) ->
                 "--allowedTools".into(),
                 CLAUDE_TOOLS.join(","),
             ];
+            if !protected.is_empty() {
+                let rules: Vec<String> = protected
+                    .iter()
+                    .flat_map(|p| {
+                        let p = p.as_str();
+                        ["Edit", "Write"].into_iter().flat_map(move |tool| {
+                            [format!("{tool}({p})"), format!("{tool}({p}/**)")]
+                        })
+                    })
+                    .collect();
+                args.extend(["--disallowedTools".into(), rules.join(",")]);
+            }
             if let Some(usd) = config.max_budget_usd {
                 args.extend(["--max-budget-usd".into(), format!("{usd}")]);
             }
@@ -207,16 +227,21 @@ mod tests {
 
     #[test]
     fn claude_code_runs_headless_without_mcp_or_a_shell() {
+        let protected = [LockPath::parse(".github").unwrap()];
         let args = args(
             Kind::ClaudeCode,
             &config(),
             Path::new("/w"),
             Path::new("/x"),
+            &protected,
         );
         let joined = args.join(" ");
         assert!(joined.starts_with("-p --output-format json --permission-mode dontAsk"));
         assert!(joined.contains("--strict-mcp-config"));
         assert!(joined.contains("--allowedTools Read,Edit,Write,Glob,Grep"));
+        assert!(joined.contains(
+            "--disallowedTools Edit(.github),Edit(.github/**),Write(.github),Write(.github/**)"
+        ));
         assert!(joined.ends_with("--max-budget-usd 2.5"));
         assert!(!joined.contains("Bash"));
     }
@@ -234,6 +259,7 @@ mod tests {
             &config,
             Path::new("/w/1"),
             Path::new("/s/1.txt"),
+            &[LockPath::parse(".github").unwrap()],
         );
         assert_eq!(
             args,
