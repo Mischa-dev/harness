@@ -85,6 +85,7 @@ struct FileEvent {
 }
 
 impl Scenario {
+    /// Reads and validates a scenario from a TOML file.
     pub fn load(path: &Path) -> Result<Self, ScenarioError> {
         let text = std::fs::read_to_string(path).map_err(|source| ScenarioError::Read {
             path: path.display().to_string(),
@@ -93,6 +94,7 @@ impl Scenario {
         Self::from_toml(&text)
     }
 
+    /// Parses and validates a scenario from TOML text.
     pub fn from_toml(text: &str) -> Result<Self, ScenarioError> {
         let file: File = toml::from_str(text).map_err(|e| ScenarioError::Invalid(e.to_string()))?;
         for (field, value) in [

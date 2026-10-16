@@ -14,9 +14,13 @@ pub enum ProviderError {
     Rejected(String),
 }
 
-/// One model endpoint. Adapters (OpenAI-compatible, Anthropic Messages,
-/// OpenAI Responses) implement this; so does the scripted fake.
+/// Completes provider-independent model requests.
+///
+/// Adapters for model endpoints own all provider wire-format conversion; the
+/// scripted fake implements the same interface. Callers elsewhere in the
+/// runtime deal only in the internal message types.
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// Sends one model request and returns its normalized response.
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError>;
 }

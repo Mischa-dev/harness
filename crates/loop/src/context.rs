@@ -6,6 +6,7 @@
 use harness_providers::{Message, ModelRequest, ToolSpec};
 
 #[derive(Debug, Clone)]
+/// Builds provider-independent requests in a cache-friendly, stable order.
 pub struct ContextAssembler {
     /// The capability profile the request is for.
     pub profile: String,
@@ -17,6 +18,8 @@ pub struct ContextAssembler {
 }
 
 impl ContextAssembler {
+    /// Combines the fixed prefix, memory snapshot, tools, and transcript into
+    /// one model request.
     pub fn assemble(&self, tools: Vec<ToolSpec>, transcript: &[Message]) -> ModelRequest {
         let mut messages = Vec::with_capacity(transcript.len() + 1);
         messages.push(Message::user_text(format!(

@@ -50,6 +50,7 @@ pub struct Message {
 }
 
 impl Message {
+    /// Creates a user message containing one text block.
     pub fn user_text(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
@@ -57,6 +58,7 @@ impl Message {
         }
     }
 
+    /// Creates an assistant message containing one text block.
     pub fn assistant_text(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
@@ -64,6 +66,7 @@ impl Message {
         }
     }
 
+    /// Iterates over tool calls in this message, ignoring other blocks.
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.content.iter().filter_map(|block| match block {
             ContentBlock::ToolCall(call) => Some(call),
@@ -116,6 +119,7 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// Adds another response's token counts to this total.
     pub fn add(&mut self, other: Usage) {
         // Usage is provider-controlled data. Saturate instead of allowing a
         // bogus counter to panic debug builds or wrap release builds.
