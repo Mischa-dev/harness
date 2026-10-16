@@ -224,8 +224,12 @@ async fn the_runtimes_transport_gets_through_and_a_bare_one_does_not() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("caller-token");
     std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
-    let runtime =
-        ReqwestTransport::with_caller_token_file(Duration::from_secs(5), &token_file).unwrap();
+    let runtime = ReqwestTransport::with_caller_token_file(
+        Duration::from_secs(5),
+        &format!("http://{proxy}"),
+        &token_file,
+    )
+    .unwrap();
     assert!(!format!("{runtime:?}").contains(TOKEN));
     let answered = runtime.post_json(&url, &[], &body).await.unwrap();
     assert_eq!(answered.status, 201);
