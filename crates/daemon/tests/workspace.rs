@@ -102,7 +102,7 @@ fn write(dir: &Path, name: &str, text: &str) -> std::path::PathBuf {
 fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
     AgentConfig {
         state_dir: dir.join("state"),
-        workdir: dir.to_path_buf(),
+        workdir: dir.join("work"),
         profiles_file: write(dir, "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: "http://127.0.0.1:8787/anthropic".into(),

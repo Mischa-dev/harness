@@ -89,7 +89,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig {
         state_dir: dir.path().join("state"),
-        workdir: dir.path().to_path_buf(),
+        workdir: dir.path().join("work"),
         profiles_file: write(dir.path(), "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: format!("http://{proxy}/anthropic"),
@@ -106,7 +106,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
     let clock = Arc::new(FakeClock::new(start));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
     std::fs::write(
-        dir.path().join("memory/MEMORY.md"),
+        dir.path().join("work/memory/MEMORY.md"),
         "- Mischa reviews PRs in the morning.",
     )
     .unwrap();
@@ -139,7 +139,7 @@ fn a_missing_charter_is_named_without_its_path() {
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig {
         state_dir: dir.path().join("state"),
-        workdir: dir.path().to_path_buf(),
+        workdir: dir.path().join("work"),
         profiles_file: write(dir.path(), "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: "http://127.0.0.1:8787/anthropic".into(),
@@ -494,7 +494,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig {
         state_dir: dir.path().join("state"),
-        workdir: dir.path().to_path_buf(),
+        workdir: dir.path().join("work"),
         profiles_file: write(dir.path(), "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: "http://127.0.0.1:8787/anthropic".into(),
@@ -505,7 +505,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         max_output_tokens: 1024,
         wakeups: None,
         workspace: None,
-        memory_dir: Some(dir.path().join("mind")),
+        memory_dir: Some(dir.path().join("work/mind")),
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -533,7 +533,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
             .contains("## MEMORY.md\n(empty)")
     );
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("mind/MEMORY.md")).unwrap(),
+        std::fs::read_to_string(dir.path().join("work/mind/MEMORY.md")).unwrap(),
         "- Ship the memory tools.\n"
     );
 
@@ -625,4 +625,30 @@ fn a_linked_workdir_still_holds_the_memory() {
         panic!("{err}");
     }
     assert!(real.join("memory/journal").is_dir());
+}
+
+#[test]
+fn the_state_folder_stays_out_of_the_agents_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("work/.state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a state folder inside workdir was accepted");
+    };
+    assert!(err.to_string().contains("outside workdir"), "{err}");
+    assert!(!dir.path().join("work/.state/memory.git").exists());
 }

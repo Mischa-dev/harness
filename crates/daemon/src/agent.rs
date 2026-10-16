@@ -194,10 +194,26 @@ impl Agent {
         if !inside(&workdir, &memory_dir) {
             return Err(outside());
         }
+        // Only the runtime may write the history's git config, or a filter
+        // set there would run on the next save: it can't be where the
+        // agent's tools reach.
+        let real_workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
+        let state_dir = config
+            .state_dir
+            .canonicalize()
+            .map_err(|source| AgentError::Read {
+                field: "state_dir",
+                source,
+            })?;
+        if state_dir.starts_with(&real_workdir) || state_dir.starts_with(&workdir) {
+            return Err(AgentError::Invalid(
+                "state_dir must be outside workdir, where the agent's tools can't reach it".into(),
+            ));
+        }
         let memory = Arc::new(
             MemoryFiles::open(
                 memory_dir.clone(),
-                Some(config.state_dir.join(MEMORY_HISTORY)),
+                Some(state_dir.join(MEMORY_HISTORY)),
                 offset,
                 clock.now(),
             )
@@ -208,7 +224,6 @@ impl Agent {
         );
         // Where it really is, against where workdir really is, in case
         // workdir is reached through a link.
-        let real_workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
         if !inside(&real_workdir, memory.location()) {
             return Err(outside());
         }

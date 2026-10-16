@@ -74,22 +74,31 @@ impl MemoryFiles {
         }
         std::fs::create_dir_all(dir.join("journal"))?;
         let real = dir.canonicalize()?;
-        let history = history.filter(|git_dir| match std::fs::symlink_metadata(git_dir) {
-            Ok(meta) => meta.is_dir(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let created = git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok);
-                if created {
-                    let present: Vec<&str> = FILES
-                        .iter()
-                        .map(|(_, name, _)| *name)
-                        .chain(["journal"])
-                        .filter(|name| real.join(name).exists())
-                        .collect();
-                    commit(git_dir, &real, &present, "Start the history", now, false);
-                }
-                created
+        let history = history.filter(|git_dir| {
+            // A link or a file where the repository belongs isn't one.
+            if std::fs::symlink_metadata(git_dir).is_ok_and(|m| !m.is_dir()) {
+                return false;
             }
-            Err(_) => false,
+            // Safe on an existing repository; makes an empty folder one.
+            if !git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok) {
+                return false;
+            }
+            let started = git(
+                git_dir,
+                &real,
+                &["rev-parse", "--verify", "--quiet", "HEAD"],
+            )
+            .is_ok_and(|ok| ok);
+            if !started {
+                let present: Vec<&str> = FILES
+                    .iter()
+                    .map(|(_, name, _)| *name)
+                    .chain(["journal"])
+                    .filter(|name| real.join(name).exists())
+                    .collect();
+                commit(git_dir, &real, &present, "Start the history", now, false);
+            }
+            true
         });
         Ok(Self {
             dir,
@@ -117,6 +126,11 @@ impl MemoryFiles {
     /// Where the folder really is, with any links resolved.
     pub fn location(&self) -> &Path {
         &self.real
+    }
+
+    /// The git repository that keeps the history, if there is one.
+    pub fn history(&self) -> Option<&Path> {
+        self.history.as_deref()
     }
 
     /// Whether changes are kept in git.
@@ -171,8 +185,7 @@ impl MemoryFiles {
         let root = self.root().map_err(failed)?;
         let path = root.join(relative);
         if append {
-            open_file(&path, OpenOptions::new().create(true).append(true))
-                .and_then(|mut file| file.write_all(text.as_bytes()))
+            append_whole(&path, text.as_bytes())
         } else {
             replace(&path, text.as_bytes())
         }
@@ -184,6 +197,18 @@ impl MemoryFiles {
         }
         Ok(())
     }
+}
+
+/// Adds `text` to the end of the file at `path`, all or nothing: a failed
+/// write is cut back off, so a retry doesn't follow half an entry.
+fn append_whole(path: &Path, text: &[u8]) -> std::io::Result<()> {
+    let mut file = open_file(path, OpenOptions::new().create(true).append(true))?;
+    let before = file.metadata()?.len();
+    let written = file.write_all(text).and_then(|()| file.sync_data());
+    if written.is_err() {
+        let _ = file.set_len(before);
+    }
+    written
 }
 
 /// Replaces the file at `path` whole: the new text goes to a file beside it,
@@ -877,6 +902,24 @@ mod tests {
             "the other repo is untouched"
         );
         assert!(!ran.exists(), "the planted filter never ran");
+    }
+
+    #[test]
+    fn an_empty_history_folder_becomes_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("memory");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("USER.md"), "Mischa\n").unwrap();
+        let history = tmp.path().join("memory.git");
+        std::fs::create_dir(&history).unwrap();
+        let at = datetime!(2026-01-05 00:00 UTC);
+        let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
+        assert!(files.has_history());
+        assert_eq!(commits(&history), 1);
+        // Opening it again adds nothing.
+        drop(files);
+        MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
+        assert_eq!(commits(&history), 1);
     }
 
     #[cfg(unix)]
