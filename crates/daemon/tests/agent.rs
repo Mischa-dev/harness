@@ -16,8 +16,9 @@ use harness_daemon::agent::{Agent, AgentConfig, ShellConfig, WakeEvent};
 use harness_daemon::proxy::{Auth, CALLER_TOKEN_HEADER, CallerToken, Route, router};
 use harness_loop::{ContextAssembler, Rhythm, WakeLimits};
 use harness_providers::{ContentBlock, Profiles, ScriptedProvider};
+use harness_store::ScheduleBook;
 use harness_store::{Store, WorkdayPolicy};
-use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_tools::{Policy, PolicyExecutor, Schedule, SleepTool};
 use serde_json::json;
 use time::macros::datetime;
 
@@ -178,11 +179,19 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         .get("main")
         .unwrap()
         .clone();
+    let schedule = Arc::new(Schedule {
+        book: Arc::new(ScheduleBook::open_in_memory().unwrap()),
+        offset: time::UtcOffset::UTC,
+    });
+    let mut executor =
+        PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
+    for tool in harness_tools::schedule::tools(schedule.clone()) {
+        executor.register(tool);
+    }
     Agent {
         store: Store::open_in_memory().unwrap(),
         provider: Box::new(model),
-        executor: PolicyExecutor::new(Policy::conservative(&workdir), clock.clone())
-            .with_tool(SleepTool),
+        executor,
         assembler: ContextAssembler {
             profile: "main".into(),
             static_prefix: CHARTER.into(),
@@ -201,6 +210,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         owner: None,
         offset: time::UtcOffset::UTC,
         memory: None,
+        schedule,
         memory_settled: false,
         waiting: Vec::new(),
     }
@@ -269,6 +279,51 @@ async fn the_agent_wakes_when_its_look_comes_due() {
     let wakes = agent.store.wakes_since(start).unwrap();
     assert_eq!(wakes.len(), 1);
     assert!(wakes[0].reason.contains("next_look"), "{}", wakes[0].reason);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_follow_up_wakes_the_agent_before_its_next_look() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let model = ScriptedProvider::new()
+        .then_calls(
+            "",
+            vec![(
+                "schedule",
+                json!({"note": "did Mischa read the proxy PR?", "in_minutes": 30}),
+            )],
+        )
+        .then_calls("", vec![("sleep", json!({"minutes": 240}))])
+        .then_calls("", vec![("sleep", json!({"minutes": 240}))]);
+    let mut agent = scripted(clock.clone(), model);
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(dm("[dm] Mischa: please review the proxy PR later"))
+        .await
+        .unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.schedule.book.list().unwrap().len(), 1);
+    assert_eq!(agent.rhythm.next_look(), start + time::Duration::hours(4));
+
+    // Half an hour on, the follow-up is due, though the look isn't.
+    clock.advance(time::Duration::minutes(30));
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 2);
+    assert!(wakes[1].reason.contains("follow_up"), "{}", wakes[1].reason);
+    let day = agent.store.current_day().unwrap().unwrap();
+    let opening = format!("{:?}", agent.store.transcript(day.id).unwrap());
+    assert!(
+        opening.contains("Why: #1 on your schedule came due: did Mischa read the proxy PR?"),
+        "{opening}"
+    );
+    // A follow-up fires once.
+    assert!(agent.schedule.book.list().unwrap().is_empty());
 }
 
 /// A model that, on its first call, has `event` arrive from outside, then

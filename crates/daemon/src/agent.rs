@@ -20,9 +20,9 @@ use harness_loop::{
 use harness_providers::{
     CapabilityProfile, Message, Profiles, Provider, ReqwestTransport, adapters,
 };
-use harness_store::{Store, WorkdayPolicy};
+use harness_store::{ScheduleBook, Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
-use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, SleepTool};
+use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, Schedule, SleepTool};
 use harness_workspace::{Shadow, Workspace};
 
 use crate::state::StateFacts;
@@ -183,6 +183,8 @@ pub struct Agent {
     pub offset: UtcOffset,
     /// The memory files; the snapshot of them starts each day.
     pub memory: Option<Arc<MemoryFiles>>,
+    /// Its follow-ups and routines, shared with the schedule tools.
+    pub schedule: Arc<Schedule>,
     /// Whether today's memory snapshot is in the prompt. Until it is, each
     /// wake tries again.
     pub memory_settled: bool,
@@ -226,6 +228,10 @@ impl Agent {
             source,
         })?;
         let store = Store::open(&config.state_dir.join(STORE_FILE))?;
+        let schedule = Arc::new(Schedule {
+            book: Arc::new(ScheduleBook::open(&config.state_dir.join(STORE_FILE))?),
+            offset,
+        });
         // Absolute, so the walls compare like with like.
         let workdir = std::path::absolute(&config.workdir).map_err(|source| AgentError::Read {
             field: "workdir",
@@ -335,6 +341,9 @@ impl Agent {
         for tool in harness_tools::memory::tools(memory.clone()) {
             executor.register(tool);
         }
+        for tool in harness_tools::schedule::tools(schedule.clone()) {
+            executor.register(tool);
+        }
         if let Some(shell) = &config.shell {
             if !shell.bwrap.is_absolute() || !shell.bwrap.is_file() {
                 return Err(AgentError::Invalid(
@@ -418,6 +427,7 @@ impl Agent {
             owner: config.identity.owner.clone(),
             offset,
             memory: Some(memory),
+            schedule,
             memory_settled: false,
             waiting: Vec::new(),
         })
@@ -451,13 +461,18 @@ impl Agent {
                 }
                 continue;
             }
+            self.collect_due()?;
             // Optional news waits for the look the agent chose; anything
             // else wakes it now.
             let due = self
                 .waiting
                 .iter()
                 .any(|e| !e.reason.can_wait_for_next_look());
-            let wait = self.rhythm.next_look() - self.clock.now();
+            let next_due = self.schedule.book.next_due()?;
+            let wake_at = next_due.map_or(self.rhythm.next_look(), |at| {
+                at.min(self.rhythm.next_look())
+            });
+            let wait = wake_at - self.clock.now();
             if !due && wait.is_positive() {
                 let nap = wait.unsigned_abs().min(TICK);
                 tokio::select! {
@@ -578,6 +593,22 @@ impl Agent {
 }
 
 impl Agent {
+    /// Moves what has come due on the agent's schedule into the waiting
+    /// events. Each fires once: a follow-up is gone, a routine moves on.
+    pub fn collect_due(&mut self) -> Result<(), harness_store::StoreError> {
+        let now = self.clock.now();
+        for entry in self.schedule.book.take_due(now, self.schedule.offset)? {
+            self.waiting.push(WakeEvent {
+                text: harness_tools::schedule::describe(&entry, self.schedule.offset),
+                reason: WakeReason::FollowUp {
+                    schedule_id: entry.id.to_string(),
+                    note: entry.note,
+                },
+            });
+        }
+        Ok(())
+    }
+
     /// What the state view shows at the start of a wake at `at`.
     async fn state_view(
         &self,
@@ -612,6 +643,13 @@ impl Agent {
             workspace,
             wakes_today,
             spend_today,
+            schedule: self
+                .schedule
+                .book
+                .list()?
+                .iter()
+                .map(|entry| harness_tools::schedule::describe(entry, self.offset))
+                .collect(),
             shadow: self.shadow.is_some(),
         })
     }
