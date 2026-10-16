@@ -4,7 +4,8 @@
 //! provider key.
 //!
 //! Events reach the loop on a channel, fed by the signed webhook receiver
-//! (`wakeup`). Agent OS triggers will feed it too.
+//! (`wakeup`) and the Workspace inbox poller (`polling`). Agent OS triggers
+//! will feed it too.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use harness_providers::{
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
 use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_workspace::Workspace;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -66,6 +68,10 @@ pub struct AgentConfig {
     /// looks it chooses.
     #[serde(default)]
     pub wakeups: Option<crate::wakeup::WakeupConfig>,
+    /// The agent's Workspace connection: its reply tools and briefing, and
+    /// the inbox polling fallback.
+    #[serde(default)]
+    pub workspace: Option<crate::polling::WorkspaceConfig>,
 }
 
 fn default_quiet_hour() -> u8 {
@@ -107,6 +113,11 @@ pub struct Agent {
     pub clock: Arc<dyn Clock>,
     pub rhythm: Rhythm,
     pub limits: WakeLimits,
+    /// Shared by the agent's Workspace tools and the inbox poller.
+    pub workspace: Option<Arc<Workspace>>,
+    /// Events not yet in a wake: optional news held for the next look, and
+    /// whatever arrived too late to join the last wake.
+    pub waiting: Vec<WakeEvent>,
 }
 
 impl Agent {
@@ -141,8 +152,20 @@ impl Agent {
             source,
         })?;
         let store = Store::open(&config.state_dir.join(STORE_FILE))?;
-        let executor = PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
-            .with_tool(SleepTool);
+        let mut executor =
+            PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
+                .with_tool(SleepTool);
+        let workspace = match &config.workspace {
+            Some(settings) => {
+                settings.poll_every()?;
+                let workspace = settings.connect()?;
+                for tool in harness_workspace::tools(workspace.clone()) {
+                    executor.register(tool);
+                }
+                Some(workspace)
+            }
+            None => None,
+        };
         let policy = WorkdayPolicy {
             offset,
             quiet_hour: config.quiet_hour,
@@ -163,12 +186,14 @@ impl Agent {
             clock,
             rhythm,
             limits: WakeLimits::default(),
+            workspace,
+            waiting: Vec::new(),
         })
     }
 
     /// Wakes at each chosen look and on each event, until `shutdown`
-    /// resolves. Urgent events that arrive mid-wake join it at its next safe
-    /// point; the rest wait for it to end. A wake in progress finishes
+    /// resolves, except optional news, which is held for the next look.
+    /// Urgent events that arrive mid-wake join it at its next safe point. A wake in progress finishes
     /// before shutdown; it saves as it goes, so a hard stop loses at most the
     /// turn in flight.
     pub async fn run(
@@ -178,7 +203,6 @@ impl Agent {
     ) -> Result<(), harness_store::StoreError> {
         let mut shutdown = std::pin::pin!(shutdown);
         let mut events_open = true;
-        let mut held = Vec::new();
         loop {
             if let Some(breaker) = self.rhythm.paused() {
                 eprintln!(
@@ -195,26 +219,30 @@ impl Agent {
                 }
                 continue;
             }
-            let mut batch = std::mem::take(&mut held);
+            // Optional news waits for the look the agent chose; anything
+            // else wakes it now.
+            let due = self
+                .waiting
+                .iter()
+                .any(|e| !e.reason.can_wait_for_next_look());
             let wait = self.rhythm.next_look() - self.clock.now();
-            if batch.is_empty() && wait.is_positive() {
+            if !due && wait.is_positive() {
                 let nap = wait.unsigned_abs().min(TICK);
                 tokio::select! {
                     () = &mut shutdown => return Ok(()),
                     event = events.recv(), if events_open => match event {
-                        Some(event) => batch.push(event),
+                        Some(event) => self.waiting.push(event),
                         None => events_open = false,
                     },
                     () = tokio::time::sleep(nap) => {}
                 }
-                if batch.is_empty() {
-                    // A tick, or the channel closed: check the clock again.
-                    continue;
-                }
+                // An event, a tick, or the channel closed: look again.
+                continue;
             }
             while let Ok(event) = events.try_recv() {
-                batch.push(event);
+                self.waiting.push(event);
             }
+            let batch = std::mem::take(&mut self.waiting);
             let mut inbox = Inbox {
                 events,
                 clock: self.clock.clone(),
@@ -224,8 +252,8 @@ impl Agent {
             self.wake_with(batch, &mut inbox).await?;
             // What arrived during the wake and wasn't taken in: urgent news
             // after its last safe point, and everything that could wait.
-            held = inbox.urgent;
-            held.append(&mut inbox.queued);
+            self.waiting = inbox.urgent;
+            self.waiting.append(&mut inbox.queued);
         }
     }
 

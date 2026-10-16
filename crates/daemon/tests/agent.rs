@@ -99,6 +99,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         utc_offset_hours: 0,
         max_output_tokens: 1024,
         wakeups: None,
+        workspace: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -140,6 +141,7 @@ fn a_missing_charter_is_named_without_its_path() {
         utc_offset_hours: 0,
         max_output_tokens: 1024,
         wakeups: None,
+        workspace: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -181,6 +183,8 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         ),
         clock,
         limits: WakeLimits::default(),
+        workspace: None,
+        waiting: Vec::new(),
     }
 }
 
@@ -314,9 +318,7 @@ async fn an_urgent_event_interrupts_a_slow_model_call() {
     });
     let mut agent = scripted(clock.clone(), ScriptedProvider::new());
     agent.provider = Box::new(Shared(model.clone()));
-    send.send(mention("[#general] Ari: @Tamsin standup notes?"))
-        .await
-        .unwrap();
+    send.send(dm("[dm] Mischa: standup notes?")).await.unwrap();
 
     agent
         .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
@@ -353,16 +355,32 @@ async fn events_that_can_wait_get_the_next_wake() {
         .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
         .await
         .unwrap();
+    // The mention that came in during the DM's wake doesn't start a wake
+    // of its own.
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+    assert_eq!(agent.waiting.len(), 1);
 
+    // An optional request found by the poller waits too.
+    send.send(mention("[#general] Bo: @Tamsin anyone?"))
+        .await
+        .unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+
+    // At the look it chose, it reads both.
+    clock.advance(time::Duration::hours(1));
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
     let wakes = agent.store.wakes_since(start).unwrap();
     assert_eq!(wakes.len(), 2);
-    assert!(
-        wakes[1].reason.contains("an @mention"),
-        "{}",
-        wakes[1].reason
-    );
     let seen = model.seen.lock().unwrap();
     assert!(seen[1].contains("- [#general] Ari: @Tamsin lunch?"));
+    assert!(seen[1].contains("- [#general] Bo: @Tamsin anyone?"));
 }
 
 /// Lets a test keep a handle on the model it gives the agent.
@@ -432,4 +450,31 @@ async fn a_paused_agent_waits_for_its_owner() {
         .await
         .unwrap();
     assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_that_need_a_look_wake_an_idle_agent() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let model = ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 60}))]);
+    let mut agent = scripted(clock.clone(), model);
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    // A trigger doesn't interrupt a running wake, but it doesn't wait
+    // three hours for the next look either.
+    send.send(WakeEvent {
+        reason: WakeReason::Trigger {
+            name: "ci-failed".into(),
+        },
+        text: "Agent OS: CI failed on main.".into(),
+    })
+    .await
+    .unwrap();
+
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert!(wakes[0].reason.contains("ci-failed"), "{}", wakes[0].reason);
 }
