@@ -123,13 +123,12 @@ impl Saver<'_> {
         self.record.turns = progress.turns as u32;
         self.record.usage = progress.usage;
         self.record.cost_usd = progress.cost_usd;
-        let mut messages = transcript[self.saved..].to_vec();
-        messages.extend(pending.cloned());
         // Starting at `saved` replaces the last pending message, if any.
-        self.store.save_wake(
+        self.store.save_wake_with_pending(
             self.wake_id,
             self.saved,
-            &messages,
+            &transcript[self.saved..],
+            pending,
             &self.record,
             progress.context_tokens,
         )?;

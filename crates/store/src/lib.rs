@@ -234,28 +234,46 @@ impl Store {
         wake: &WakeRecord,
         context_tokens: u64,
     ) -> Result<()> {
+        self.save_wake_with_pending(wake_id, from, messages, None, wake, context_tokens)
+    }
+
+    /// Like [`Store::save_wake`], with one provisional message appended after
+    /// `messages`. Keeping it separate lets checkpoints persist a synthesized
+    /// tool-results message without cloning the transcript slice first.
+    pub fn save_wake_with_pending(
+        &mut self,
+        wake_id: i64,
+        from: usize,
+        messages: &[Message],
+        pending: Option<&Message>,
+        wake: &WakeRecord,
+        context_tokens: u64,
+    ) -> Result<()> {
         let from_sql = i64::try_from(from)
             .map_err(|_| StoreError::Corrupt("transcript position is too large".into()))?;
         let usage = usage_to_sql(&wake.usage);
         let context_tokens = sqlite_counter(context_tokens);
         let tx = self.conn.transaction()?;
-        append_in(&tx, wake.day_id, &[])?;
         tx.execute(
             "DELETE FROM transcript WHERE day_id = ?1 AND seq >= ?2",
             params![wake.day_id, from_sql],
         )?;
-        let len: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM transcript WHERE day_id = ?1",
-            params![wake.day_id],
-            |row| row.get(0),
-        )?;
-        if len as usize != from {
+        let next = transcript_position(&tx, wake.day_id)?;
+        if next as usize != from {
             return Err(StoreError::Corrupt(format!(
-                "day {} has {len} saved messages; can't save from {from}",
+                "day {} has saved messages ending at {next}; can't save from {from}",
                 wake.day_id
             )));
         }
-        append_in(&tx, wake.day_id, messages)?;
+        append_at(&tx, wake.day_id, from_sql, messages)?;
+        if let Some(message) = pending {
+            append_at(
+                &tx,
+                wake.day_id,
+                from_sql + messages.len() as i64,
+                std::slice::from_ref(message),
+            )?;
+        }
         let changed = tx.execute(
             "UPDATE wakes SET ended_at = ?3, end_state = ?4, turns = ?5, input_tokens = ?6,
                               output_tokens = ?7, cache_read_tokens = ?8,
@@ -373,23 +391,36 @@ fn secure_state_file(path: &Path) -> Result<()> {
 
 /// Appends to an open day's transcript inside the caller's transaction.
 fn append_in(tx: &rusqlite::Transaction<'_>, day_id: i64, messages: &[Message]) -> Result<()> {
-    let ended: Option<Option<i64>> = tx
+    let next = transcript_position(tx, day_id)?;
+    append_at(tx, day_id, next, messages)
+}
+
+/// Returns the sequence number after the last transcript row, while also
+/// verifying that the day exists and is still open. `MAX` uses the transcript
+/// primary-key index instead of scanning every message as `COUNT` would.
+fn transcript_position(tx: &rusqlite::Transaction<'_>, day_id: i64) -> Result<i64> {
+    let position: Option<(Option<i64>, i64)> = tx
         .query_row(
-            "SELECT ended_at FROM days WHERE id = ?1",
+            "SELECT ended_at,
+                    (SELECT COALESCE(MAX(seq) + 1, 0) FROM transcript WHERE day_id = ?1)
+             FROM days WHERE id = ?1",
             params![day_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    match ended {
-        None => return Err(StoreError::Corrupt(format!("no day {day_id}"))),
-        Some(Some(_)) => return Err(StoreError::DayEnded(day_id)),
-        Some(None) => {}
+    match position {
+        None => Err(StoreError::Corrupt(format!("no day {day_id}"))),
+        Some((Some(_), _)) => Err(StoreError::DayEnded(day_id)),
+        Some((None, next)) => Ok(next),
     }
-    let next: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq) + 1, 0) FROM transcript WHERE day_id = ?1",
-        params![day_id],
-        |row| row.get(0),
-    )?;
+}
+
+fn append_at(
+    tx: &rusqlite::Transaction<'_>,
+    day_id: i64,
+    next: i64,
+    messages: &[Message],
+) -> Result<()> {
     let mut insert =
         tx.prepare("INSERT INTO transcript (day_id, seq, message) VALUES (?1, ?2, ?3)")?;
     for (i, message) in messages.iter().enumerate() {

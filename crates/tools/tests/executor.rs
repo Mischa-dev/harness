@@ -103,6 +103,43 @@ fn is_deny(outcome: &ExecOutcome) -> bool {
     matches!(outcome, ExecOutcome::Blocked(Decision::Deny { .. }))
 }
 
+struct CountingSpec(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for CountingSpec {
+    fn spec(&self) -> ToolSpec {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolSpec {
+            name: "counting".into(),
+            description: String::new(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> Result<Vec<Effect>, ToolError> {
+        Ok(vec![])
+    }
+
+    async fn run(&self, _args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ran"))
+    }
+}
+
+#[tokio::test]
+async fn tool_schema_is_built_only_when_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(FakeClock::at_default_start());
+    let mut executor = PolicyExecutor::new(Policy::conservative(dir.path()), clock)
+        .with_tool(CountingSpec(calls.clone()));
+
+    executor.specs();
+    executor.specs();
+    executor.execute(&call("counting", json!({}))).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn allowed_calls_run() {
     let dir = tempfile::tempdir().unwrap();
