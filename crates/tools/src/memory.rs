@@ -91,9 +91,9 @@ impl MemoryFiles {
             if private_dir(git_dir).is_err() {
                 return false;
             }
-            // Git makes no links of its own, so one inside could only send
-            // its writes somewhere else.
-            if has_links(git_dir).unwrap_or(true) {
+            // Git makes only files and folders. A link inside could send
+            // its writes somewhere else, and a FIFO could hang it.
+            if has_odd_entries(git_dir).unwrap_or(true) {
                 return false;
             }
             // Safe on an existing repository; makes an empty folder one.
@@ -485,12 +485,18 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Whether anything under `dir` is a symlink, looking without following.
-fn has_links(dir: &Path) -> std::io::Result<bool> {
+/// Whether anything under `dir` is other than a regular file or a real
+/// folder (a link, a FIFO, a device), looking without following.
+fn has_odd_entries(dir: &Path) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let kind = entry.file_type()?;
-        if kind.is_symlink() || (kind.is_dir() && has_links(&entry.path())?) {
+        let odd = if kind.is_dir() {
+            has_odd_entries(&entry.path())?
+        } else {
+            !kind.is_file()
+        };
+        if odd {
             return Ok(true);
         }
     }
@@ -1073,7 +1079,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn links_inside_the_history_turn_it_off() {
+    fn links_or_fifos_in_the_history_turn_it_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
@@ -1089,6 +1095,23 @@ mod tests {
         .unwrap();
         assert!(!files.has_history());
         assert!(!outside.join("attributes").exists());
+
+        // Nor does a FIFO where git would read.
+        let history = tmp.path().join("fifo.git");
+        std::fs::create_dir(&history).unwrap();
+        let made = Command::new("mkfifo")
+            .arg(history.join("HEAD"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let files = MemoryFiles::open(
+            tmp.path().join("memory"),
+            Some(history),
+            offset!(-7),
+            datetime!(2026-01-05 00:00 UTC),
+        )
+        .unwrap();
+        assert!(!files.has_history());
     }
 
     #[cfg(unix)]
