@@ -7,10 +7,21 @@ use harness_providers::{
     ToolCall, Usage,
 };
 use serde_json::{Value, json};
-use sim::{FakeTeammate, Report, Scenario, fake_profile, find_scenario, run, scenarios_dir};
+use sim::{
+    FakeFilter, FakeTeammate, Helper, Report, Scenario, fake_profile, find_scenario, run,
+    scenarios_dir,
+};
+use std::sync::Mutex;
 
+/// Runs with the fake wake filter, as `sim run --provider fake` does.
 async fn run_with(scenario: &Scenario, provider: &dyn Provider) -> Report {
-    run(scenario, provider, &fake_profile(), "fake")
+    let profile = fake_profile();
+    let filter = Helper {
+        provider: &FakeFilter,
+        profile: &profile,
+        profile_name: "fake",
+    };
+    run(scenario, provider, &profile, "fake", Some(filter))
         .await
         .unwrap()
 }
@@ -70,7 +81,72 @@ async fn every_bundled_scenario_passes_with_the_fake_teammate() {
         assert!(report.passed(), "{report}");
         names += 1;
     }
-    assert!(names >= 2);
+    assert!(names >= 3);
+}
+
+#[tokio::test]
+async fn the_filter_wakes_the_agent_for_an_outage_nobody_mentioned_it_in() {
+    let scenario = bundled("outage-in-channel");
+    let report = run_with(&scenario, &FakeTeammate::default()).await;
+    assert!(report.passed(), "{report}");
+    let filter = report.filter.as_ref().unwrap();
+    assert_eq!(filter.early_wakes, 1, "{report}");
+    assert!(filter.dropped >= 2, "the chatter is dropped: {report}");
+
+    // Without a filter the outage waits for the agent's next look.
+    let alone = run(
+        &scenario,
+        &FakeTeammate::default(),
+        &fake_profile(),
+        "fake",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed(&alone), ["wakes for what can't wait"]);
+    assert!(alone.filter.is_none());
+}
+
+/// Records each wake's opening message, then sleeps.
+#[derive(Default)]
+struct Recorder(Mutex<Vec<String>>);
+
+#[async_trait]
+impl Provider for Recorder {
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        if let Some(ContentBlock::Text { text }) =
+            request.messages.last().and_then(|m| m.content.first())
+        {
+            self.0.lock().unwrap().push(text.clone());
+        }
+        Always(vec![sleep()]).complete(request).await
+    }
+}
+
+#[tokio::test]
+async fn wakes_open_with_the_state_view_and_without_dropped_chatter() {
+    let recorder = Recorder::default();
+    run_with(&bundled("outage-in-channel"), &recorder).await;
+    let wakes = recorder.0.into_inner().unwrap();
+    let early = wakes
+        .iter()
+        .find(|w| w.contains("Why: the wake filter thought this worth a look now"))
+        .expect("the filter woke the agent");
+    assert!(
+        early.contains("[#ops] Jo: The public API is down"),
+        "{early}"
+    );
+    assert!(!early.contains("Coffee machine"), "{early}");
+    assert!(early.contains("\n\nState, Wed 2026-01-07 10:1"), "{early}");
+    assert!(
+        early.contains("- Workspace: 2 conversations with unread messages"),
+        "{early}"
+    );
+    assert!(
+        early.contains("- Budget: $0.00 of today's $15.00 model spend"),
+        "{early}"
+    );
+    assert!(early.contains("- Your schedule: nothing set"), "{early}");
 }
 
 #[tokio::test]

@@ -6,10 +6,24 @@
 //! what teammates wrote, so nothing in it can pose as an instruction.
 
 use harness_store::RoleSpend;
-use harness_workspace::BriefingCounts;
 use time::format_description::FormatItem;
 use time::macros::format_description;
 use time::{OffsetDateTime, UtcOffset};
+
+/// What's waiting in Workspace, counted from the agent's briefing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorkspaceCounts {
+    pub reply_requests: usize,
+    /// Of those, the ones that need an answer rather than allow a pass.
+    pub required: usize,
+    pub mentions: usize,
+    /// Conversations with unread messages.
+    pub unread: usize,
+    pub tasks: usize,
+    pub claims: usize,
+    /// Threads whose status or outcome changed lately.
+    pub thread_updates: usize,
+}
 
 const LOCAL_TIME: &[FormatItem<'static>] =
     format_description!("[weekday repr:short] [year]-[month]-[day] [hour]:[minute]");
@@ -23,7 +37,7 @@ pub struct StateFacts {
     pub owner: Option<String>,
     /// `None` without a Workspace connection; an error says why the
     /// briefing couldn't be read.
-    pub workspace: Option<Result<BriefingCounts, String>>,
+    pub workspace: Option<Result<WorkspaceCounts, String>>,
     /// Earlier wakes in today's workday.
     pub wakes_today: usize,
     pub budget: Budget,
@@ -145,7 +159,7 @@ impl StateFacts {
     }
 }
 
-fn workspace_line(counts: &BriefingCounts) -> String {
+fn workspace_line(counts: &WorkspaceCounts) -> String {
     let mut parts = vec![];
     if counts.reply_requests > 0 {
         let mut part = plural(counts.reply_requests, "reply request", "reply requests");
@@ -194,7 +208,7 @@ mod tests {
             at: datetime!(2026-10-16 22:24 UTC),
             offset: offset!(+2),
             owner: Some("Mischa".into()),
-            workspace: Some(Ok(BriefingCounts {
+            workspace: Some(Ok(WorkspaceCounts {
                 reply_requests: 2,
                 required: 1,
                 mentions: 1,
@@ -284,7 +298,7 @@ mod tests {
     #[test]
     fn quiet_broken_and_shadowed_views() {
         let quiet = StateFacts {
-            workspace: Some(Ok(BriefingCounts::default())),
+            workspace: Some(Ok(WorkspaceCounts::default())),
             wakes_today: 1,
             budget: Budget {
                 limit_usd: 15.0,

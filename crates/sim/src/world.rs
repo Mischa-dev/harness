@@ -97,8 +97,8 @@ fn conversation(args: &Value) -> Result<&str, ToolError> {
 /// Marks a message the agent is expected to answer.
 pub const TO_YOU: &str = ", to you";
 
-/// Why the agent is awake and what arrived since it last looked. The
-/// stand-in for the state view, which comes in M2.
+/// Why the agent is awake and what arrived since it last looked. The runner
+/// adds the state view after it, as the daemon does.
 pub fn wake_message(now: OffsetDateTime, reason: &WakeReason, new: &[&Event]) -> String {
     let when = now.format(&Rfc3339).unwrap_or_else(|_| now.to_string());
     let why = reason.describe();
@@ -135,6 +135,7 @@ mod tests {
             from: "Ari".into(),
             text: text.into(),
             addressed,
+            wake_within: None,
         }
     }
 

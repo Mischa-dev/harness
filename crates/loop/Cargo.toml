@@ -15,7 +15,7 @@ harness-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-time = { workspace = true, features = ["formatting"] }
+time = { workspace = true, features = ["formatting", "macros"] }
 tokio.workspace = true
 
 [dev-dependencies]

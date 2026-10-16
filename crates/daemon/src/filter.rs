@@ -8,10 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness_core::WakeReason;
 use harness_loop::filter::{self, FilterAgent, FilterDecision, FilterInput, OptionalReply};
 use harness_providers::{
-    CapabilityProfile, ContentBlock, Profiles, Provider, ReqwestTransport, ToolCall, adapters,
+    CapabilityProfile, Profiles, Provider, ReqwestTransport, ToolCall, adapters,
 };
 use harness_tools::ExecOutcome;
 use serde::Deserialize;
@@ -22,8 +21,7 @@ use crate::agent::{Agent, AgentConfig, AgentError, WakeEvent};
 /// The filter's instructions; product code, like the charter.
 const PROMPT: &str = include_str!("../../../prompts/peripheral.md");
 
-/// Batches news: the filter looks at most this often.
-pub const FILTER_GAP: time::Duration = time::Duration::minutes(2);
+pub use filter::FILTER_GAP;
 
 /// A helper model answers fast; a slow one shouldn't hold up the loop.
 const FILTER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -129,7 +127,7 @@ impl Agent {
                 .as_ref()
                 .map(|f| f.agent.clone())
                 .unwrap_or_default(),
-            watching_for: self.watching_for()?,
+            watching_for: filter::watching_for(&self.store)?,
             next_look: self.rhythm.next_look(),
             events: self.waiting.iter().map(|e| one_line(&e.text)).collect(),
             replies,
@@ -180,12 +178,7 @@ impl Agent {
                 }
             }
         }
-        let mut index = 0;
-        self.waiting.retain(|_| {
-            let kept = decision.keep.contains(&index);
-            index += 1;
-            kept
-        });
+        decision.keep_only(&mut self.waiting);
         eprintln!(
             "wake filter: {}; kept {}, passed {}",
             if decision.wake_now {
@@ -197,17 +190,9 @@ impl Agent {
             decision.pass.len()
         );
         if decision.wake_now {
-            let reason = if decision.reason.is_empty() {
-                "the wake filter thought what's waiting is worth a look now".to_string()
-            } else {
-                format!(
-                    "the wake filter thought this worth a look now: {}",
-                    decision.reason
-                )
-            };
             self.waiting.push(WakeEvent {
                 text: "The wake filter woke you early for what's above.".into(),
-                reason: WakeReason::Filter { reason },
+                reason: decision.wake_reason(),
             });
         }
     }
@@ -243,29 +228,6 @@ impl Agent {
                 excerpt: e.message_excerpt.unwrap_or_default(),
             })
             .collect()
-    }
-
-    /// What the agent said it's watching for when it last went to sleep
-    /// today.
-    fn watching_for(&self) -> Result<Option<String>, harness_store::StoreError> {
-        let Some(day) = self.store.current_day()? else {
-            return Ok(None);
-        };
-        let transcript = self.store.transcript(day.id)?;
-        Ok(transcript
-            .iter()
-            .rev()
-            .flat_map(|m| m.content.iter().rev())
-            .find_map(|block| match block {
-                ContentBlock::ToolCall(call) if call.name == "sleep" => Some(
-                    call.arguments
-                        .get("watching_for")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                ),
-                _ => None,
-            })
-            .flatten())
     }
 }
 

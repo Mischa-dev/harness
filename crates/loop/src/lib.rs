@@ -7,12 +7,14 @@ pub mod context;
 pub mod day;
 pub mod filter;
 pub mod rhythm;
+pub mod state;
 pub mod wake;
 
 pub use charter::CharterValues;
 pub use context::ContextAssembler;
 pub use day::{DayError, Workday};
 pub use rhythm::{AfterWake, FALLBACK_NEXT_LOOK, Rhythm};
+pub use state::{Budget, StateFacts, WorkspaceCounts, spend_report};
 pub use wake::{
     Checkpoint, CheckpointError, Interrupts, LoopError, NoCheckpoint, NoInterrupts, Progress,
     WakeEnd, WakeLimits, WakeOutcome, run_wake, run_wake_interruptible,

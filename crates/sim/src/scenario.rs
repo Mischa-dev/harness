@@ -45,6 +45,9 @@ pub struct Event {
     /// Direct messages and mentions are addressed to the agent and wake it.
     /// Everything else waits for its next look.
     pub addressed: bool,
+    /// For news that can't wait: the agent should be awake within this
+    /// long of it arriving, whether or not it's addressed.
+    pub wake_within: Option<Duration>,
 }
 
 /// Bounds a passing run stays within. Every scenario also checks that the
@@ -82,6 +85,8 @@ struct FileEvent {
     conversation: String,
     from: String,
     text: String,
+    /// e.g. `30m`: the agent should be awake within this long.
+    wake_within: Option<String>,
 }
 
 impl Scenario {
@@ -147,8 +152,20 @@ impl Scenario {
                         e.at
                     )));
                 };
+                let wake_within = match &e.wake_within {
+                    None => None,
+                    Some(text) => match parse_offset(text)? {
+                        d if d > Duration::ZERO => Some(d),
+                        _ => {
+                            return Err(ScenarioError::Invalid(format!(
+                                "wake_within {text:?} must be more than zero"
+                            )));
+                        }
+                    },
+                };
                 Ok(Event {
                     at,
+                    wake_within,
                     addressed: e.conversation == "dm" || mentions(&e.text, &file.agent),
                     conversation: e.conversation,
                     from: e.from,
