@@ -713,12 +713,17 @@ fn search_file(
         return;
     }
     // Only what's actually read counts against the budget: the start of
-    // a binary file, or all of a text one.
+    // a binary file, or all of a text one. The start is read either way.
+    let sniffed = size.min(SNIFF_BYTES as u64);
+    if found.bytes + sniffed > MAX_SEARCH_BYTES {
+        found.stopped = Some("too much to read");
+        return;
+    }
     let reader = match text_reader(file) {
         Ok(Some(reader)) => reader,
         // Binary, so not searched, by design.
         Ok(None) => {
-            found.bytes += size.min(SNIFF_BYTES as u64);
+            found.bytes += sniffed;
             return;
         }
         Err(_) => {
@@ -1194,6 +1199,15 @@ mod tests {
         walk(&policy, root.clone(), "needle", false, &mut found);
         assert_eq!(found.stopped, None);
         assert_eq!(found.matches, ["z.rs:1: needle\n"]);
+        // But even the looking stops when the budget runs out.
+        let mut found = Search {
+            bytes: MAX_SEARCH_BYTES - SNIFF_BYTES as u64 * 2,
+            ..Search::default()
+        };
+        walk(&policy, root.clone(), "needle", false, &mut found);
+        assert_eq!(found.stopped, Some("too much to read"));
+        assert!(found.bytes <= MAX_SEARCH_BYTES);
+        assert!(found.matches.is_empty());
     }
 
     #[tokio::test]
