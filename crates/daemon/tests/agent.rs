@@ -648,6 +648,8 @@ fn memory_must_live_inside_the_work_area() {
         panic!("a memory folder outside workdir was accepted");
     };
     assert!(err.to_string().contains("inside workdir"), "{err}");
+    // The error names the setting, not the path.
+    assert!(!err.to_string().contains("/"), "{err}");
 }
 
 #[cfg(unix)]

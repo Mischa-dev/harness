@@ -77,7 +77,9 @@ impl MemoryFiles {
         if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(std::io::Error::other("the memory folder is a symlink"));
         }
-        std::fs::create_dir_all(dir.join("journal"))?;
+        // What the agent remembers is for the daemon's own user alone.
+        private_dir(&dir)?;
+        private_dir(&dir.join("journal"))?;
         let real = dir.canonicalize()?;
         let history = history.filter(|git_dir| {
             // A link or a file where the repository belongs isn't one.
@@ -298,6 +300,8 @@ fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        // A file made here is private, like the folder it's in.
+        options.mode(0o600);
         // Non-blocking, so a FIFO planted under a memory name can't hang
         // the open; it's refused below. Regular files ignore the flag.
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
@@ -1129,6 +1133,38 @@ mod tests {
             .content;
         assert!(shown.contains("[cut at 6000 characters]"));
         assert!(shown.chars().count() < 6_200);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_is_private_to_the_daemon() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("memory");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let files = Arc::new(
+            MemoryFiles::open(&dir, None, offset!(-7), datetime!(2026-01-05 00:00 UTC)).unwrap(),
+        );
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let [_, write, journal] = <[Box<dyn Tool>; 3]>::try_from(tools(files.clone()))
+            .ok()
+            .unwrap();
+        run(
+            write.as_ref(),
+            json!({"file": "user", "content": "Mischa"}),
+            &clock,
+        )
+        .await
+        .unwrap();
+        run(journal.as_ref(), json!({"entry": "hello"}), &clock)
+            .await
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("journal")), 0o700);
+        assert_eq!(mode(&dir.join("USER.md")), 0o600);
+        assert_eq!(mode(&dir.join("journal/2026-01-05.md")), 0o600);
     }
 
     #[cfg(unix)]

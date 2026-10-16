@@ -189,10 +189,9 @@ impl Agent {
             )
         };
         let outside = || {
-            AgentError::Invalid(format!(
-                "memory_dir {} must be inside workdir, where the agent's walls allow it",
-                memory_dir.display()
-            ))
+            AgentError::Invalid(
+                "memory_dir must be inside workdir, where the agent's walls allow it".into(),
+            )
         };
         // Where workdir really is, in case it's reached through a link.
         let real_workdir = std::fs::create_dir_all(&workdir)
