@@ -4,7 +4,8 @@
 //! provider key.
 //!
 //! Events reach the loop on a channel, fed by the signed webhook receiver
-//! (`wakeup`). Agent OS triggers will feed it too.
+//! (`wakeup`) and the Workspace inbox poller (`polling`). Agent OS triggers
+//! will feed it too.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use harness_providers::{
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
 use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_workspace::Workspace;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -66,6 +68,10 @@ pub struct AgentConfig {
     /// looks it chooses.
     #[serde(default)]
     pub wakeups: Option<crate::wakeup::WakeupConfig>,
+    /// The agent's Workspace connection: its reply tools and briefing, and
+    /// the inbox polling fallback.
+    #[serde(default)]
+    pub workspace: Option<crate::polling::WorkspaceConfig>,
 }
 
 fn default_quiet_hour() -> u8 {
@@ -107,6 +113,8 @@ pub struct Agent {
     pub clock: Arc<dyn Clock>,
     pub rhythm: Rhythm,
     pub limits: WakeLimits,
+    /// Shared by the agent's Workspace tools and the inbox poller.
+    pub workspace: Option<Arc<Workspace>>,
 }
 
 impl Agent {
@@ -141,8 +149,20 @@ impl Agent {
             source,
         })?;
         let store = Store::open(&config.state_dir.join(STORE_FILE))?;
-        let executor = PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
-            .with_tool(SleepTool);
+        let mut executor =
+            PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
+                .with_tool(SleepTool);
+        let workspace = match &config.workspace {
+            Some(settings) => {
+                settings.poll_every()?;
+                let workspace = settings.connect()?;
+                for tool in harness_workspace::tools(workspace.clone()) {
+                    executor.register(tool);
+                }
+                Some(workspace)
+            }
+            None => None,
+        };
         let policy = WorkdayPolicy {
             offset,
             quiet_hour: config.quiet_hour,
@@ -163,6 +183,7 @@ impl Agent {
             clock,
             rhythm,
             limits: WakeLimits::default(),
+            workspace,
         })
     }
 

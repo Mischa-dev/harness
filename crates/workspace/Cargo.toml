@@ -1,0 +1,27 @@
+[package]
+name = "harness-workspace"
+description = "The MCP client for Agent Workspace: reply requests, the briefing, and the tools that use them."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+harness-providers.workspace = true
+harness-tools.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url = "2"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+harness-core.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
+[lints]
+workspace = true

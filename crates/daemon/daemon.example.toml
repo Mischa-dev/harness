@@ -46,3 +46,11 @@ utc_offset_hours = 0
 listen = "100.64.0.5:8790"
 agent_id = "00000000-0000-0000-0000-000000000000"
 secret_file = "/run/credentials/harness-agent.service/workspace-webhook-secret"
+
+# The agent's Workspace connection: its briefing and reply tools, and a look
+# at the inbox at startup and every poll_seconds, in case a wakeup was missed.
+# The token is the agent's own Workspace credential; workers never get it.
+[agent.workspace]
+url = "https://workspace.example/api/v1/mcp"
+token_file = "/run/credentials/harness-agent.service/workspace-token"
+poll_seconds = 300

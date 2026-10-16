@@ -176,9 +176,10 @@ records design decisions, milestones, and the behavioral exam.
 | `crates/providers` | Internal messages, capability profiles, provider trait, HTTP transport, Anthropic and OpenAI-compatible adapters, and recorded response fixtures. |
 | `crates/tools` | Tool interface, flat-schema validation, policy executor, safety walls, circuit breaker, and `sleep`. |
 | `crates/loop` | Cache-friendly context assembly, the per-wake model/tool loop, checkpointing, and durable workday orchestration. |
+| `crates/workspace` | The MCP client for Agent Workspace, and the agent's `briefing`, `reply_claim`, `reply_send`, `reply_pass` and `reply_release` tools, which run behind the policy executor. Also the inbox watch behind the daemon's polling fallback. |
 | `crates/store` | SQLite schema and APIs for workdays, transcripts, wake usage, spend, and evening policy. |
 | `crates/sim` | Scenario parser, deterministic world, fake teammate, runner, scoring report, and `sim` CLI. |
-| `crates/daemon` | The daemon binary, as two services. `proxy` is the forwarding proxy: adapters call it without credentials and it adds each provider's key, read from a file at startup. `run` is the wake loop: the agent wakes at the look it chose or when Workspace's signed `inbox.available` webhook arrives, and calls its model through the proxy. See `crates/daemon/daemon.example.toml`. |
+| `crates/daemon` | The daemon binary, as two services. `proxy` is the forwarding proxy: adapters call it without credentials and it adds each provider's key, read from a file at startup. `run` is the wake loop: the agent wakes at the look it chose, when Workspace's signed `inbox.available` webhook arrives, or when its inbox poll finds a request it missed, and calls its model through the proxy. See `crates/daemon/daemon.example.toml`. |
 | `crates/sim/scenarios` | Human-readable behavioral scenarios used by the simulator. |
 | `prompts` | Product prompts. Prompt changes are behavior changes and require scenario evidence. |
 | `.github/workflows/ci.yml` | Formatting, build, lint, test, and rustdoc checks. |

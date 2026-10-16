@@ -6,8 +6,8 @@ use std::time::Duration;
 use harness_core::SystemClock;
 use harness_daemon::agent::{Agent, WakeEvent};
 use harness_daemon::config::Config;
-use harness_daemon::proxy;
 use harness_daemon::wakeup::{self, WebhookSecret};
+use harness_daemon::{polling, proxy};
 
 /// Long enough for a slow model's whole answer.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
@@ -71,23 +71,27 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let clock = Arc::new(SystemClock);
     let mut agent = Agent::from_config(&config, clock.clone())?;
     let (events_in, mut events) = tokio::sync::mpsc::channel::<WakeEvent>(64);
-    match &config.wakeups {
-        Some(wakeups) => {
-            let secret = std::fs::read_to_string(&wakeups.secret_file)
-                .map_err(|e| format!("couldn't read wakeups.secret_file: {e}"))?;
-            let secret = WebhookSecret::new(&secret)?;
-            let router = wakeup::router(&wakeups.agent_id, secret, clock, events_in);
-            let listener = tokio::net::TcpListener::bind(wakeups.listen).await?;
-            eprintln!("wakeups on {}", listener.local_addr()?);
-            tokio::spawn(async move {
-                if let Err(err) = axum::serve(listener, router).await {
-                    eprintln!("harness-daemon: the wakeup receiver stopped: {err}");
-                }
-            });
-        }
-        // Nothing sends; the agent wakes only at the looks it chooses.
-        None => drop(events_in),
+    if let Some(wakeups) = &config.wakeups {
+        let secret = std::fs::read_to_string(&wakeups.secret_file)
+            .map_err(|e| format!("couldn't read wakeups.secret_file: {e}"))?;
+        let secret = WebhookSecret::new(&secret)?;
+        let router = wakeup::router(&wakeups.agent_id, secret, clock, events_in.clone());
+        let listener = tokio::net::TcpListener::bind(wakeups.listen).await?;
+        eprintln!("wakeups on {}", listener.local_addr()?);
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                eprintln!("harness-daemon: the wakeup receiver stopped: {err}");
+            }
+        });
     }
+    if let (Some(settings), Some(workspace)) = (&config.workspace, agent.workspace.clone()) {
+        let every = settings.poll_every()?;
+        eprintln!("looking at the Workspace inbox every {}s", every.as_secs());
+        tokio::spawn(polling::poll(workspace, every, events_in.clone()));
+    }
+    // With neither, nothing sends, and the agent wakes only at the looks it
+    // chooses.
+    drop(events_in);
     eprintln!("agent running; first look at {}", agent.rhythm.next_look());
     agent.run(&mut events, shutdown()).await?;
     Ok(())

@@ -75,7 +75,9 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("daemon.example.toml");
         let config = Config::load(&path).unwrap();
         assert!(config.proxy.is_some());
-        assert!(config.agent.is_some());
+        let agent = config.agent.unwrap();
+        assert!(agent.wakeups.is_some());
+        assert!(agent.workspace.is_some());
     }
 
     #[test]
