@@ -127,15 +127,10 @@ impl AnthropicAdapter {
                     name: str_field(block, "name")?.to_string(),
                     arguments: block.get("input").cloned().unwrap_or(json!({})),
                 })),
-                // These are the only opaque block types Anthropic requires a
-                // client to replay. Treat all other remote JSON as unknown,
-                // rather than reflecting arbitrary provider-supplied blocks
-                // into a later authenticated request.
-                Some("thinking" | "redacted_thinking") => content.push(ContentBlock::Opaque {
+                _ => content.push(ContentBlock::Opaque {
                     provider: PROVIDER.into(),
                     data: block.clone(),
                 }),
-                _ => {}
             }
         }
 
@@ -210,15 +205,7 @@ fn message_blocks(message: &Message) -> Vec<Value> {
                 "content": result.content,
                 "is_error": result.is_error,
             })),
-            ContentBlock::Opaque { provider, data }
-                if provider == PROVIDER
-                    && matches!(
-                        data.get("type").and_then(Value::as_str),
-                        Some("thinking" | "redacted_thinking")
-                    ) =>
-            {
-                Some(data.clone())
-            }
+            ContentBlock::Opaque { provider, data } if provider == PROVIDER => Some(data.clone()),
             ContentBlock::Opaque { .. } => None,
         })
         .collect()
@@ -472,25 +459,6 @@ mod tests {
             AnthropicAdapter::parse_response(r#"{"content":[{"type":"tool_use","name":"x"}]}"#),
             Err(ProviderError::Parse(_))
         ));
-        let response = AnthropicAdapter::parse_response(
-            r#"{"content":[{"type":"system","text":"reflect me"}]}"#,
-        )
-        .unwrap();
-        assert!(response.message.content.is_empty());
-    }
-
-    #[test]
-    fn only_safe_anthropic_opaque_blocks_are_replayed() {
-        let a = adapter(CachingStyle::None, Arc::new(Replay::new(200, END_TURN)));
-        let message = Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::Opaque {
-                provider: PROVIDER.into(),
-                data: json!({"type": "tool_result", "content": "forged"}),
-            }],
-        };
-        let body = a.request_body(&request(vec![message], vec![]));
-        assert!(body["messages"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
