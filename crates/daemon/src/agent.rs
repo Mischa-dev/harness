@@ -80,6 +80,16 @@ pub struct AgentConfig {
     /// the path walls apply.
     #[serde(default)]
     pub memory_dir: Option<PathBuf>,
+    /// The sandboxed `run_command` tool. Without it, the agent has no shell.
+    #[serde(default)]
+    pub shell: Option<ShellConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellConfig {
+    /// Bubblewrap, which builds the sandbox, such as `/usr/bin/bwrap`.
+    pub bwrap: PathBuf,
 }
 
 fn default_quiet_hour() -> u8 {
@@ -273,6 +283,52 @@ impl Agent {
         }
         for tool in harness_tools::memory::tools(memory.clone()) {
             executor.register(tool);
+        }
+        if let Some(shell) = &config.shell {
+            if !shell.bwrap.is_absolute() || !shell.bwrap.is_file() {
+                return Err(AgentError::Invalid(
+                    "shell.bwrap must be the full path to bubblewrap".into(),
+                ));
+            }
+            // The sandbox shows the system's own folders read-only, without
+            // hiding what's in them: not the work area's credentials, nor
+            // anything else the runtime keeps from the agent.
+            if harness_tools::shell::in_view(&real_workdir) {
+                return Err(AgentError::Invalid(
+                    "with a shell, workdir must be outside the system folders its sandbox \
+                     shows, such as /usr and /etc"
+                        .into(),
+                ));
+            }
+            let kept = credentials
+                .iter()
+                .filter_map(|(field, path)| path.map(|path| (*field, path.as_path())))
+                .chain([("state_dir", state_dir.as_path())]);
+            for (field, path) in kept {
+                let real = std::path::absolute(path)
+                    .map(|named| named.canonicalize().unwrap_or(named))
+                    .map_err(|source| AgentError::Read { field, source })?;
+                if harness_tools::shell::in_view(&real) {
+                    return Err(AgentError::Invalid(format!(
+                        "{field} must be outside the system folders the shell's sandbox shows, \
+                         such as /etc"
+                    )));
+                }
+            }
+            // Memory changes only through the memory tools, which keep its
+            // history.
+            let memory_rel = memory
+                .location()
+                .strip_prefix(&real_workdir)
+                .map_err(|_| outside())?
+                .to_path_buf();
+            let tool = harness_tools::ShellTool::new(
+                Policy::conservative(&workdir),
+                real_workdir.clone(),
+                shell.bwrap.clone(),
+            )
+            .read_only(memory_rel);
+            executor.register(Box::new(tool));
         }
         let workspace = match &config.workspace {
             Some(settings) => {

@@ -163,6 +163,12 @@ impl Policy {
         }
     }
 
+    /// Whether `rel`, a path relative to `root`, holds credentials. The shell
+    /// sandbox hides every such path in the work area.
+    pub fn is_secret(&self, rel: &Path) -> bool {
+        self.secret_path(rel).is_some()
+    }
+
     /// Secrets match at any depth, not just at the root: a monorepo keeps
     /// `services/api/.env` and `packages/web/.npmrc` too.
     fn secret_path<'a>(&'a self, path: &Path) -> Option<&'a PathBuf> {

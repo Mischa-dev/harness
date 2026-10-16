@@ -58,3 +58,11 @@ secret_file = "/run/credentials/harness-agent.service/workspace-webhook-secret"
 url = "https://workspace.example/api/v1/mcp"
 token_file = "/run/credentials/harness-agent.service/workspace-token"
 poll_seconds = 300
+
+# The sandboxed shell: run_command, one program with an argument array,
+# inside bubblewrap. It can change only workdir (memory_dir stays read-only),
+# protected paths are read-only, credentials are hidden, and there's no
+# network. The system's /usr, /etc and /nix/store are shown read-only, so keep
+# the runtime's own files out of them. Leave this table out for no shell.
+[agent.shell]
+bwrap = "/run/current-system/sw/bin/bwrap"

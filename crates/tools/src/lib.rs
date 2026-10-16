@@ -7,11 +7,13 @@ pub mod files;
 pub mod memory;
 pub mod policy;
 pub mod schema;
+pub mod shell;
 pub mod sleep;
 pub mod tool;
 
 pub use executor::{ExecOutcome, PolicyExecutor};
 pub use memory::MemoryFiles;
 pub use policy::{BreakerLimits, CommandRule, Decision, Policy};
+pub use shell::ShellTool;
 pub use sleep::SleepTool;
 pub use tool::{Control, Effect, Tool, ToolContext, ToolError, ToolOutput};

@@ -12,7 +12,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use harness_core::{Clock, FakeClock, WakeReason};
-use harness_daemon::agent::{Agent, AgentConfig, WakeEvent};
+use harness_daemon::agent::{Agent, AgentConfig, ShellConfig, WakeEvent};
 use harness_daemon::proxy::{Auth, CALLER_TOKEN_HEADER, CallerToken, Route, router};
 use harness_loop::{ContextAssembler, Rhythm, WakeLimits};
 use harness_providers::{ContentBlock, Profiles, ScriptedProvider};
@@ -101,6 +101,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -151,6 +152,7 @@ fn a_missing_charter_is_named_without_its_path() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -507,6 +509,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(dir.path().join("work/mind")),
+        shell: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -586,6 +589,7 @@ async fn memory_that_cant_be_read_is_tried_again_next_wake() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(dir.path().join("work/mind")),
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
@@ -642,6 +646,7 @@ fn memory_must_live_inside_the_work_area() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(elsewhere.path().to_path_buf()),
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -674,6 +679,7 @@ fn a_linked_workdir_still_holds_the_memory() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
@@ -699,6 +705,7 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -745,6 +752,7 @@ async fn the_file_tools_stay_where_workdir_was_at_startup() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock).unwrap();
@@ -782,6 +790,7 @@ fn credentials_stay_out_of_the_work_area() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -833,6 +842,7 @@ fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(work.join("out/memory")),
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     assert!(Agent::from_config(&config, clock).is_err());
@@ -864,10 +874,105 @@ fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
         panic!("{err}");
     }
     assert!(real.join("agent/memory/journal").is_dir());
+}
+
+/// Bubblewrap, if it works here. CI sets `HARNESS_REQUIRE_SANDBOX` so the
+/// test can't quietly skip there.
+fn bwrap() -> Option<std::path::PathBuf> {
+    let works = |path: &Path| {
+        std::process::Command::new(path)
+            .args(["--ro-bind", "/", "/", "--unshare-all", "--", "true"])
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let found = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("bwrap"))
+            .find(|path| path.is_file() && works(path))
+    });
+    if found.is_none() {
+        assert!(
+            std::env::var_os("HARNESS_REQUIRE_SANDBOX").is_none(),
+            "bubblewrap isn't working here"
+        );
+        eprintln!("skipping: bubblewrap isn't working here");
+    }
+    found
+}
+
+#[tokio::test]
+async fn the_shell_works_in_the_work_area_and_leaves_memory_alone() {
+    let Some(bwrap) = bwrap() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: work.clone(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(work.join("mind")),
+        shell: Some(ShellConfig { bwrap }),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut agent = Agent::from_config(&config, clock).unwrap();
+    let mut run = async |args: serde_json::Value| {
+        let call = harness_providers::ToolCall {
+            id: "1".into(),
+            name: "run_command".into(),
+            arguments: args,
+        };
+        match agent.executor.execute(&call).await {
+            harness_tools::ExecOutcome::Ran(out) => out.content,
+            other => panic!("{other:?}"),
+        }
+    };
+    let out = run(json!({"program": "touch", "args": ["notes"]})).await;
+    assert_eq!(out, "exit code 0");
+    assert!(work.join("notes").exists());
+    let out = run(json!({"program": "touch", "args": ["mind/MEMORY.md"]})).await;
+    assert!(out.starts_with("exit code 1"), "{out}");
+    assert!(!work.join("mind/MEMORY.md").exists());
+}
+
+#[test]
+fn the_shell_needs_bubblewraps_full_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+        shell: Some(ShellConfig {
+            bwrap: "bwrap".into(),
+        }),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a bare program name was accepted");
+    };
+    assert!(err.to_string().contains("shell.bwrap"), "{err}");
 }
