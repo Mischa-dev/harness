@@ -510,13 +510,28 @@ fn has_odd_entries(dir: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-/// Whether `text` is `YYYY-MM-DD`.
+/// Whether `text` is `YYYY-MM-DD` and names a real day.
 fn is_date(text: &str) -> bool {
     text.len() == 10
         && text.bytes().enumerate().all(|(i, b)| match i {
             4 | 7 => b == b'-',
             _ => b.is_ascii_digit(),
         })
+        && real_day(text)
+}
+
+/// Whether a `YYYY-MM-DD` shaped text names a day the calendar has.
+fn real_day(text: &str) -> bool {
+    let (Ok(year), Ok(month), Ok(day)) = (
+        text[..4].parse::<i32>(),
+        text[5..7].parse::<u8>(),
+        text[8..].parse::<u8>(),
+    ) else {
+        return false;
+    };
+    time::Month::try_from(month)
+        .and_then(|month| time::Date::from_calendar_date(year, month, day))
+        .is_ok()
 }
 
 /// The journal's day files, and nothing else that may be in its folder.
@@ -968,6 +983,7 @@ mod tests {
         std::fs::create_dir(dir.join("journal")).unwrap();
         std::fs::write(dir.join("journal/2026-01-04.md"), "- yesterday\n").unwrap();
         std::fs::write(dir.join("journal/token.txt"), "not memory").unwrap();
+        std::fs::write(dir.join("journal/2026-02-30.md"), "not a day").unwrap();
         // Ignore rules and attributes in the folder don't keep memory out
         // of history or change it on the way in.
         std::fs::write(dir.join(".gitignore"), "*.md\n").unwrap();
@@ -1004,6 +1020,11 @@ mod tests {
         assert_eq!(show("HEAD:MEMORY.md"), "- from before\n");
         assert_eq!(show("HEAD:journal/2026-01-04.md"), "- yesterday\n");
         assert_eq!(show("HEAD:journal/token.txt"), "");
+        assert_eq!(show("HEAD:journal/2026-02-30.md"), "");
+        for date in ["2026-02-30", "2026-13-01", "2026-00-10", "2025-02-29"] {
+            assert!(!is_date(date), "{date}");
+        }
+        assert!(is_date("2028-02-29"));
         assert_eq!(show("HEAD:.env"), "");
         files
             .save("MEMORY.md", "- now\n", false, "Update MEMORY.md", at)
