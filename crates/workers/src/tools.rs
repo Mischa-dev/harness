@@ -1,7 +1,8 @@
-//! `spawn_worker`, `worker_status` and `stop_worker`: the agent hands a
-//! well-defined task to a coding CLI, checks on it, and stops it. Spawning
-//! and stopping declare actions, so the policy executor can put them behind
-//! the owner's yes; the worker's own CLI is declared as the command it runs.
+//! `spawn_worker`, `worker_status`, `steer_worker` and `stop_worker`: the
+//! agent hands a well-defined task to a coding CLI, checks on it, sends it
+//! back with feedback, and stops it. Spawning, steering and stopping declare
+//! actions, so the policy executor can put them behind the owner's yes; the
+//! worker's own CLI is declared as the command it runs.
 
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ pub fn tools(workers: Arc<Workers>) -> Vec<Box<dyn Tool>> {
     vec![
         Box::new(SpawnWorker(workers.clone())),
         Box::new(WorkerStatus(workers.clone())),
+        Box::new(SteerWorker(workers.clone())),
         Box::new(StopWorker(workers)),
     ]
 }
@@ -40,8 +42,13 @@ pub fn describe(worker: &WorkerRecord) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let brief: String = brief.chars().take(80).collect();
+    let turns = if worker.turns > 1 {
+        format!(" (turn {})", worker.turns)
+    } else {
+        String::new()
+    };
     format!(
-        "#{} {} in {}, {} since {since}: {brief}",
+        "#{} {} in {}, {}{turns} since {since}: {brief}",
         worker.id,
         worker.kind,
         worker.repo,
@@ -97,7 +104,7 @@ impl Tool for SpawnWorker {
                  of its own, on a new branch, that can change only the paths you name. It knows \
                  nothing but your brief, so give it the goal, the context, how to check the \
                  result, constraints, and what's out of scope. You're told when it ends; then \
-                 judge its diff with worker_status. Kinds: {}. Repositories: {}.",
+                 judge its diff with worker_status, and steer_worker it if it needs more. Kinds: {}. Repositories: {}.",
                 kinds.join(", "),
                 repos.join(", ")
             ),
@@ -236,6 +243,82 @@ impl Tool for WorkerStatus {
             text.push_str("\n\nIts worktree is gone.");
         }
         Ok(ToolOutput::text(text))
+    }
+}
+
+struct SteerWorker(Arc<Workers>);
+
+impl SteerWorker {
+    fn worker(&self, args: &Value) -> Result<WorkerRecord, ToolError> {
+        let id = args
+            .get("worker")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| ToolError::InvalidArguments("worker must be a number".into()))?;
+        self.0
+            .book
+            .get(id)
+            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .ok_or_else(|| ToolError::InvalidArguments(format!("there's no worker #{id}")))
+    }
+}
+
+#[async_trait]
+impl Tool for SteerWorker {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "steer_worker".into(),
+            description: "Send a worker that has ended back to work, in the same worktree with \
+                          the same paths, with specific feedback: what to fix, what to check, \
+                          what you decided. It takes its paths again, so it waits if another \
+                          worker holds one. You're told when it ends again."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "worker": {"type": "integer"},
+                    "message": {
+                        "type": "string",
+                        "description": format!("At most {MAX_BRIEF_CHARS} characters.")
+                    }
+                },
+                "required": ["worker", "message"]
+            }),
+        }
+    }
+
+    fn effects(&self, args: &Value) -> Result<Vec<Effect>, ToolError> {
+        let worker = self.worker(args)?;
+        let program = Kind::parse(&worker.kind)
+            .and_then(|kind| self.0.program(kind))
+            .ok_or_else(|| {
+                ToolError::InvalidArguments(format!("no {} workers are set up", worker.kind))
+            })?;
+        Ok(vec![
+            Effect::Action {
+                name: "steer_worker".into(),
+            },
+            Effect::RunCommand {
+                program: program.display().to_string(),
+                args: vec![],
+            },
+        ])
+    }
+
+    async fn run(&self, args: &Value, _: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        let worker = self.worker(args)?;
+        let message = args
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let record = self
+            .0
+            .steer(worker.id, message)
+            .await
+            .map_err(ToolError::Failed)?;
+        Ok(ToolOutput::text(format!(
+            "Worker #{} is working again (turn {}). You'll be told when it ends.",
+            record.id, record.turns
+        )))
     }
 }
 

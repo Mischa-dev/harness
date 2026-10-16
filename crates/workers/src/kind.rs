@@ -101,15 +101,34 @@ impl KindConfig {
 /// since nobody is there to say yes.
 const CLAUDE_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep"];
 
+/// Whether `kind` can continue an earlier session, so a steered worker
+/// keeps what it knew. Codex starts afresh with its first brief again.
+pub fn resumes(kind: Kind) -> bool {
+    kind == Kind::ClaudeCode
+}
+
+/// Whether a session id a CLI printed is safe to hand back to it.
+pub fn session_id(text: &str) -> Option<&str> {
+    let ok = !text.is_empty()
+        && text.len() <= 100
+        && !text.starts_with('-')
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+    ok.then_some(text)
+}
+
 /// The command line for a worker of `kind` in `dir`. `last_message` is a
 /// file the worker may write its final answer to. Claude Code is told not
 /// to edit `protected` paths; for every kind the runtime checks afterwards.
+/// `resume` continues an earlier session, where the kind can.
 pub fn args(
     kind: Kind,
     config: &KindConfig,
     dir: &Path,
     last_message: &Path,
     protected: &[LockPath],
+    resume: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = match kind {
         Kind::ClaudeCode => {
@@ -135,6 +154,9 @@ pub fn args(
                     })
                     .collect();
                 args.extend(["--disallowedTools".into(), rules.join(",")]);
+            }
+            if let Some(session) = resume.and_then(session_id) {
+                args.extend(["--resume".into(), session.into()]);
             }
             if let Some(usd) = config.max_budget_usd {
                 args.extend(["--max-budget-usd".into(), format!("{usd}")]);
@@ -234,6 +256,7 @@ mod tests {
             Path::new("/w"),
             Path::new("/x"),
             &protected,
+            None,
         );
         let joined = args.join(" ");
         assert!(joined.starts_with("-p --output-format json --permission-mode dontAsk"));
@@ -260,6 +283,7 @@ mod tests {
             Path::new("/w/1"),
             Path::new("/s/1.txt"),
             &[LockPath::parse(".github").unwrap()],
+            Some("s-1"),
         );
         assert_eq!(
             args,
@@ -276,6 +300,31 @@ mod tests {
                 "-"
             ]
         );
+    }
+
+    #[test]
+    fn claude_code_resumes_only_plain_session_ids() {
+        let resumed = |session| {
+            args(
+                Kind::ClaudeCode,
+                &config(),
+                Path::new("/w"),
+                Path::new("/x"),
+                &[],
+                Some(session),
+            )
+            .join(" ")
+        };
+        assert!(resumed("3f2a-b_9").contains("--resume 3f2a-b_9 "));
+        for bad in [
+            "",
+            "--dangerously-skip-permissions",
+            "a b",
+            "x;y",
+            &"a".repeat(101),
+        ] {
+            assert!(!resumed(bad).contains("--resume"), "{bad:?}");
+        }
     }
 
     #[test]

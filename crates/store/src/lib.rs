@@ -14,7 +14,9 @@ use time::OffsetDateTime;
 
 pub use schedule::{Repeat, ScheduleBook, Scheduled};
 pub use workday::{EveningReason, WorkdayPolicy};
-pub use workers::{LockConflict, LockPath, NewWorker, WorkerBook, WorkerRecord, WorkerState};
+pub use workers::{
+    LockConflict, LockPath, NewWorker, ResumeRefusal, WorkerBook, WorkerRecord, WorkerState,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

@@ -6,6 +6,9 @@
 //! while the worker runs; a lock whose lease has run out no longer counts,
 //! so a crash can't hold a path for ever.
 //!
+//! A worker that ended can be steered: it runs again in the same worktree,
+//! taking the same paths again, if nobody else holds them by then.
+//!
 //! The book is its own handle on the state file, like the schedule, so the
 //! worker tools and the wake loop can share it.
 
@@ -137,10 +140,35 @@ pub struct WorkerRecord {
     pub state: WorkerState,
     pub started_at: OffsetDateTime,
     pub ended_at: Option<OffsetDateTime>,
-    /// What it reported when it ended.
+    /// What it reported when it last ended.
     pub summary: Option<String>,
-    /// The paths it holds while it runs.
+    /// The paths it may change, which it holds while it runs.
     pub paths: Vec<LockPath>,
+    /// The coding CLI's session, if it said, to continue it when steered.
+    pub session: Option<String>,
+    /// How many times it has run: 1, plus once for each steer.
+    pub turns: u32,
+}
+
+/// Why an ended worker couldn't run again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeRefusal {
+    Missing,
+    Running,
+    /// It was recorded before workers kept their paths.
+    NoPaths,
+    Conflict(LockConflict),
+}
+
+impl std::fmt::Display for ResumeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("there's no such worker"),
+            Self::Running => f.write_str("it's still running"),
+            Self::NoPaths => f.write_str("it has no paths on record"),
+            Self::Conflict(conflict) => conflict.fmt(f),
+        }
+    }
 }
 
 /// Why a worker couldn't start: another one holds an overlapping path.
@@ -201,19 +229,13 @@ impl WorkerBook {
         paths.dedup();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let held = held_locks(&tx, &worker.repo, now)?;
-        for wanted in &paths {
-            if let Some((worker_id, held)) = held.iter().find(|(_, held)| held.overlaps(wanted)) {
-                return Ok(Err(LockConflict {
-                    worker_id: *worker_id,
-                    held: held.clone(),
-                    wanted: wanted.clone(),
-                }));
-            }
+        if let Some(conflict) = conflict(&tx, &worker.repo, &paths, now)? {
+            return Ok(Err(conflict));
         }
+        let names: Vec<&str> = paths.iter().map(LockPath::as_str).collect();
         tx.execute(
-            "INSERT INTO workers (kind, repo, base, branch, worktree, brief, state, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7)",
+            "INSERT INTO workers (kind, repo, base, branch, worktree, brief, state, started_at, paths)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
             params![
                 worker.kind,
                 worker.repo,
@@ -221,17 +243,18 @@ impl WorkerBook {
                 worker.branch,
                 worker.worktree,
                 worker.brief,
-                now.unix_timestamp()
+                now.unix_timestamp(),
+                serde_json::to_string(&names).map_err(|e| StoreError::Corrupt(e.to_string()))?
             ],
         )?;
         let id = tx.last_insert_rowid();
-        let until = (now + lease).unix_timestamp();
-        for path in &paths {
-            tx.execute(
-                "INSERT INTO path_locks (worker_id, repo, path, lease_until) VALUES (?1, ?2, ?3, ?4)",
-                params![id, worker.repo, path.as_str(), until],
-            )?;
-        }
+        take_locks(
+            &tx,
+            id,
+            &worker.repo,
+            &paths,
+            (now + lease).unix_timestamp(),
+        )?;
         tx.commit()?;
         drop(conn);
         let record = self
@@ -309,6 +332,61 @@ impl WorkerBook {
         Ok(changed > 0)
     }
 
+    /// Records the coding CLI's session for a worker, to continue it later.
+    pub fn set_session(&self, id: i64, session: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE workers SET session = ?1 WHERE id = ?2",
+            params![session, id],
+        )?;
+        Ok(())
+    }
+
+    /// Runs an ended worker again: it takes its paths again until
+    /// `now + lease`, if no other worker holds an overlapping one, and
+    /// counts another turn. All or nothing, like starting.
+    pub fn resume(
+        &self,
+        id: i64,
+        lease: Duration,
+        now: OffsetDateTime,
+    ) -> Result<std::result::Result<WorkerRecord, ResumeRefusal>> {
+        let Some(worker) = self.get(id)? else {
+            return Ok(Err(ResumeRefusal::Missing));
+        };
+        if worker.state == WorkerState::Running {
+            return Ok(Err(ResumeRefusal::Running));
+        }
+        if worker.paths.is_empty() {
+            return Ok(Err(ResumeRefusal::NoPaths));
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        if let Some(conflict) = conflict(&tx, &worker.repo, &worker.paths, now)? {
+            return Ok(Err(ResumeRefusal::Conflict(conflict)));
+        }
+        let changed = tx.execute(
+            "UPDATE workers SET state = 'running', ended_at = NULL, turns = turns + 1
+             WHERE id = ?1 AND state != 'running'",
+            params![id],
+        )?;
+        if changed == 0 {
+            return Ok(Err(ResumeRefusal::Running));
+        }
+        take_locks(
+            &tx,
+            id,
+            &worker.repo,
+            &worker.paths,
+            (now + lease).unix_timestamp(),
+        )?;
+        tx.commit()?;
+        drop(conn);
+        let record = self
+            .get(id)?
+            .ok_or_else(|| StoreError::Corrupt(format!("worker {id} vanished")))?;
+        Ok(Ok(record))
+    }
+
     pub fn get(&self, id: i64) -> Result<Option<WorkerRecord>> {
         let conn = self.conn();
         let row = conn
@@ -318,7 +396,7 @@ impl WorkerBook {
                 raw_row,
             )
             .optional()?;
-        row.map(|row| record(&conn, row)).transpose()
+        row.map(record).transpose()
     }
 
     /// Running workers, oldest first.
@@ -340,12 +418,12 @@ impl WorkerBook {
                 .query_map(params, raw_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        rows.into_iter().map(|row| record(&conn, row)).collect()
+        rows.into_iter().map(record).collect()
     }
 }
 
-const COLUMNS: &str =
-    "id, kind, repo, base, branch, worktree, brief, state, started_at, ended_at, summary";
+const COLUMNS: &str = "id, kind, repo, base, branch, worktree, brief, state, started_at, \
+                       ended_at, summary, paths, session, turns";
 
 type RawRow = (
     i64,
@@ -359,6 +437,9 @@ type RawRow = (
     i64,
     Option<i64>,
     Option<String>,
+    String,
+    Option<String>,
+    i64,
 );
 
 fn raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
@@ -374,18 +455,18 @@ fn raw_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         row.get(8)?,
         row.get(9)?,
         row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
     ))
 }
 
-fn record(conn: &Connection, row: RawRow) -> Result<WorkerRecord> {
-    let (id, kind, repo, base, branch, worktree, brief, state, started, ended, summary) = row;
-    let paths = {
-        let mut select =
-            conn.prepare("SELECT path FROM path_locks WHERE worker_id = ?1 ORDER BY path")?;
-        select
-            .query_map(params![id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
+fn record(row: RawRow) -> Result<WorkerRecord> {
+    let (id, kind, repo, base, branch, worktree, brief, state, started, ended, summary, paths) = (
+        row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10, row.11,
+    );
+    let paths: Vec<String> = serde_json::from_str(&paths)
+        .map_err(|e| StoreError::Corrupt(format!("worker {id} paths: {e}")))?;
     Ok(WorkerRecord {
         id,
         kind,
@@ -404,7 +485,45 @@ fn record(conn: &Connection, row: RawRow) -> Result<WorkerRecord> {
                 LockPath::parse(p).ok_or_else(|| StoreError::Corrupt(format!("lock path {p:?}")))
             })
             .collect::<Result<_>>()?,
+        session: row.12,
+        turns: u32::try_from(row.13)
+            .map_err(|_| StoreError::Corrupt(format!("worker {id} turns")))?,
     })
+}
+
+/// The first held lock in `repo` that overlaps one of `paths`.
+fn conflict(
+    conn: &Connection,
+    repo: &str,
+    paths: &[LockPath],
+    now: OffsetDateTime,
+) -> Result<Option<LockConflict>> {
+    let held = held_locks(conn, repo, now)?;
+    Ok(paths.iter().find_map(|wanted| {
+        held.iter()
+            .find(|(_, held)| held.overlaps(wanted))
+            .map(|(worker_id, held)| LockConflict {
+                worker_id: *worker_id,
+                held: held.clone(),
+                wanted: wanted.clone(),
+            })
+    }))
+}
+
+fn take_locks(
+    conn: &Connection,
+    id: i64,
+    repo: &str,
+    paths: &[LockPath],
+    until: i64,
+) -> Result<()> {
+    for path in paths {
+        conn.execute(
+            "INSERT INTO path_locks (worker_id, repo, path, lease_until) VALUES (?1, ?2, ?3, ?4)",
+            params![id, repo, path.as_str(), until],
+        )?;
+    }
+    Ok(())
 }
 
 /// Locks in `repo` whose leases haven't run out at `now`, by running
@@ -583,7 +702,8 @@ mod tests {
         assert_eq!(ended.state, WorkerState::Finished);
         assert_eq!(ended.summary.as_deref(), Some("diff ready"));
         assert_eq!(ended.ended_at, Some(later));
-        assert!(ended.paths.is_empty());
+        // It keeps its paths on record, but holds none.
+        assert_eq!(ended.paths, vec![path("src")]);
         assert!(book.running().unwrap().is_empty());
         assert!(start(&book, "harness", &["src"], later).is_ok());
         assert!(matches!(
@@ -623,5 +743,80 @@ mod tests {
         );
         assert_eq!(recent[1].state, WorkerState::Failed);
         assert_eq!(book.recent(1).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_ended_worker_resumes_with_its_paths_unless_someone_took_them() {
+        let book = WorkerBook::open_in_memory().unwrap();
+        let first = start(&book, "harness", &["src", "docs"], NOW).unwrap();
+        assert_eq!(first.turns, 1);
+        assert_eq!(first.session, None);
+        assert_eq!(
+            book.resume(first.id, LEASE, NOW).unwrap(),
+            Err(ResumeRefusal::Running)
+        );
+        book.set_session(first.id, "s-1").unwrap();
+        book.end(first.id, WorkerState::Finished, "done", NOW)
+            .unwrap();
+
+        // Someone took part of its paths meanwhile: it can't run, and takes
+        // nothing.
+        let other = start(&book, "harness", &["docs/a.md"], NOW).unwrap();
+        assert_eq!(
+            book.resume(first.id, LEASE, NOW).unwrap(),
+            Err(ResumeRefusal::Conflict(LockConflict {
+                worker_id: other.id,
+                held: path("docs/a.md"),
+                wanted: path("docs"),
+            }))
+        );
+        assert_eq!(book.running().unwrap().len(), 1);
+        // Its own paths weren't taken by the refusal.
+        let src = start(&book, "harness", &["src"], NOW).unwrap();
+        book.end(src.id, WorkerState::Stopped, "", NOW).unwrap();
+
+        book.end(other.id, WorkerState::Finished, "", NOW).unwrap();
+        let again = book.resume(first.id, LEASE, NOW).unwrap().unwrap();
+        assert_eq!(again.state, WorkerState::Running);
+        assert_eq!(again.turns, 2);
+        assert_eq!(again.ended_at, None);
+        assert_eq!(again.session.as_deref(), Some("s-1"));
+        assert_eq!(again.paths, vec![path("docs"), path("src")]);
+        // It holds them again, and renews them.
+        assert!(start(&book, "harness", &["src/lib.rs"], NOW).is_err());
+        assert!(book.renew(first.id, LEASE, NOW).unwrap());
+        assert_eq!(
+            book.resume(9_999, LEASE, NOW).unwrap(),
+            Err(ResumeRefusal::Missing)
+        );
+    }
+
+    #[test]
+    fn workers_from_before_paths_were_kept_get_them_from_their_locks() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Run the migrations up to 6, add a running and an ended worker,
+        // then the rest.
+        for (i, sql) in crate::schema::MIGRATIONS.iter().take(6).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO workers (id, kind, repo, base, branch, worktree, brief, state, started_at)
+             VALUES (1, 'codex', 'h', 'b', 'x', '/w', 'run', 'running', 0),
+                    (2, 'codex', 'h', 'b', 'y', '/w2', 'end', 'finished', 0);
+             INSERT INTO path_locks VALUES (1, 'h', 'src', 100), (1, 'h', 'docs', 100);",
+        )
+        .unwrap();
+        let book = WorkerBook {
+            conn: Mutex::new(prepare(conn).unwrap()),
+        };
+        let mut running = book.get(1).unwrap().unwrap().paths;
+        running.sort();
+        assert_eq!(running, vec![path("docs"), path("src")]);
+        assert_eq!(book.get(2).unwrap().unwrap().paths, vec![]);
+        assert_eq!(
+            book.resume(2, LEASE, NOW).unwrap(),
+            Err(ResumeRefusal::NoPaths)
+        );
     }
 }

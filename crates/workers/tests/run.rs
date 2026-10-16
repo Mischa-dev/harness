@@ -157,7 +157,9 @@ async fn a_worker_gets_its_brief_and_no_credentials_and_its_end_is_recorded() {
 
     let record = s.workers.book.get(started.id).unwrap().unwrap();
     assert_eq!(record.state, WorkerState::Finished);
-    assert!(record.paths.is_empty(), "its locks are given back");
+    assert_eq!(record.paths, vec![LockPath::parse("src").unwrap()]);
+    assert_eq!(record.session.as_deref(), Some("s-1"));
+    assert!(s.workers.book.running().unwrap().is_empty());
     let summary = record.summary.unwrap();
     assert!(
         summary.starts_with("Fixed it.\nRan cargo test."),
@@ -384,8 +386,14 @@ fn spawning_and_stopping_are_declared_actions() {
             .is_err()
     );
     assert!(tools[1].effects(&json!({})).unwrap().is_empty());
+    // Steering names a worker that exists.
+    assert!(
+        tools[2]
+            .effects(&json!({"worker": 1, "message": "x"}))
+            .is_err()
+    );
     assert_eq!(
-        tools[2].effects(&json!({"worker": 1})).unwrap(),
+        tools[3].effects(&json!({"worker": 1})).unwrap(),
         vec![harness_tools::Effect::Action {
             name: "stop_worker".into()
         }]
@@ -396,4 +404,123 @@ fn spawning_and_stopping_are_declared_actions() {
             .description
             .contains("Kinds: claude_code. Repositories: demo.")
     );
+}
+
+/// A fake CLI that counts its runs, keeps what each one was given, and sets
+/// one() to the run's number plus one.
+fn turns(session: bool) -> String {
+    let session = if session {
+        r#","session_id":"s-1""#
+    } else {
+        ""
+    };
+    format!(
+        r#"n=$(cat "$OUT/n" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$OUT/n"
+cat > "$OUT/brief-$n.txt"
+echo "$@" > "$OUT/args-$n.txt"
+echo "pub fn one() -> u8 {{ $((n+1)) }}" > src/lib.rs
+printf '{{"type":"result","subtype":"success","is_error":false,"result":"Turn %s done."{session}}}\n' "$n""#
+    )
+}
+
+#[tokio::test]
+async fn a_steered_worker_continues_its_session_in_the_same_worktree() {
+    let mut s = setup(&turns(true), 4);
+    let first = s
+        .workers
+        .spawn(request(&["src"], "Make one() return 2."))
+        .await
+        .unwrap();
+    s.done.recv().await.unwrap();
+    let args = std::fs::read_to_string(s.root.join("args-1.txt")).unwrap();
+    assert!(!args.contains("--resume"), "{args}");
+
+    let steer = &harness_workers::tools::tools(s.workers.clone())[2];
+    let out = steer
+        .run(
+            &json!({"worker": first.id, "message": "Make it 3, and run the tests."}),
+            &ToolContext {
+                clock: s.clock.as_ref(),
+            },
+        )
+        .await
+        .unwrap()
+        .content;
+    assert!(out.contains("turn 2"), "{out}");
+    let again = s.done.recv().await.unwrap();
+    assert_eq!(again.id, first.id);
+    assert!(
+        again.line.ends_with("finished: Turn 2 done."),
+        "{}",
+        again.line
+    );
+
+    let args = std::fs::read_to_string(s.root.join("args-2.txt")).unwrap();
+    assert!(args.contains("--resume s-1"), "{args}");
+    let brief = std::fs::read_to_string(s.root.join("brief-2.txt")).unwrap();
+    assert!(
+        brief.starts_with("Mara has read your last report"),
+        "{brief}"
+    );
+    assert!(brief.contains("Turn 1 done."), "{brief}");
+    assert!(brief.contains("Make it 3, and run the tests."), "{brief}");
+    assert!(!brief.contains("You're a worker for Mara"), "{brief}");
+
+    let record = s.workers.book.get(first.id).unwrap().unwrap();
+    assert_eq!(record.state, WorkerState::Finished);
+    assert_eq!(record.turns, 2);
+    assert!(record.summary.unwrap().starts_with("Turn 2 done."));
+    let lib = std::fs::read_to_string(Path::new(&record.worktree).join("src/lib.rs")).unwrap();
+    assert_eq!(lib.trim(), "pub fn one() -> u8 { 3 }");
+    assert!(s.workers.book.running().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_worker_without_a_session_gets_its_first_brief_again() {
+    let mut s = setup(&turns(false), 4);
+    let first = s
+        .workers
+        .spawn(request(&["src"], "Make one() return 2."))
+        .await
+        .unwrap();
+    s.done.recv().await.unwrap();
+    s.workers.steer(first.id, "Make it 3.").await.unwrap();
+    s.done.recv().await.unwrap();
+    let args = std::fs::read_to_string(s.root.join("args-2.txt")).unwrap();
+    assert!(!args.contains("--resume"), "{args}");
+    let brief = std::fs::read_to_string(s.root.join("brief-2.txt")).unwrap();
+    assert!(brief.starts_with("You're a worker for Mara"), "{brief}");
+    assert!(brief.contains("Make one() return 2."), "{brief}");
+    assert!(brief.contains("Turn 1 done."), "{brief}");
+    assert!(
+        brief
+            .trim_end()
+            .ends_with("end with the same short report."),
+        "{brief}"
+    );
+}
+
+#[tokio::test]
+async fn running_or_unknown_workers_cant_be_steered() {
+    let mut s = setup(SLEEPS, 4);
+    let running = s.workers.spawn(request(&["src"], "Sleep.")).await.unwrap();
+    let refused = s.workers.steer(running.id, "More.").await.unwrap_err();
+    assert!(refused.contains("still running"), "{refused}");
+    assert!(s.workers.steer(running.id + 1, "More.").await.is_err());
+    s.workers.stop(running.id).unwrap();
+    s.done.recv().await.unwrap();
+    assert!(s.workers.steer(running.id, "  ").await.is_err());
+    // Someone else holds its path now: it waits.
+    let other = s
+        .workers
+        .spawn(request(&["src/lib.rs"], "Sleep."))
+        .await
+        .unwrap();
+    let refused = s.workers.steer(running.id, "More.").await.unwrap_err();
+    assert!(
+        refused.contains(&format!("worker #{} holds", other.id)),
+        "{refused}"
+    );
+    s.workers.stop(other.id).unwrap();
+    s.done.recv().await.unwrap();
 }
