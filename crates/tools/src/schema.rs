@@ -1,6 +1,7 @@
 //! Validation for the simple, flat tool schemas the runtime uses: one object
-//! whose properties are strings, integers, numbers or booleans. Calls are
-//! checked strictly so a malformed call never reaches a tool.
+//! whose properties are strings, integers, numbers, booleans or lists of
+//! strings. Calls are checked strictly so a malformed call never reaches a
+//! tool.
 
 use serde_json::Value;
 
@@ -32,9 +33,21 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), String> {
             "integer" => value.is_i64() || value.is_u64(),
             "number" => value.is_number(),
             "boolean" => value.is_boolean(),
+            // Only lists of strings, such as a command's arguments.
+            "array" => {
+                if prop.pointer("/items/type").and_then(Value::as_str) != Some("string") {
+                    return Err(format!("schema for `{name}` must list strings"));
+                }
+                value
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(Value::is_string))
+            }
             other => return Err(format!("schema for `{name}` uses unsupported type {other}")),
         };
         if !ok {
+            if expected == "array" {
+                return Err(format!("argument `{name}` must be a list of strings"));
+            }
             return Err(format!("argument `{name}` must be a {expected}"));
         }
     }
@@ -80,5 +93,21 @@ mod tests {
                 .contains("integer")
         );
         assert!(validate(&schema(), &json!("minutes")).is_err());
+    }
+
+    #[test]
+    fn lists_must_hold_only_strings() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"args": {"type": "array", "items": {"type": "string"}}}
+        });
+        assert!(validate(&schema, &json!({"args": ["-l", "src"]})).is_ok());
+        assert!(validate(&schema, &json!({"args": []})).is_ok());
+        assert!(
+            validate(&schema, &json!({"args": ["-l", 3]}))
+                .unwrap_err()
+                .contains("list of strings")
+        );
+        assert!(validate(&schema, &json!({"args": "-l"})).is_err());
     }
 }
