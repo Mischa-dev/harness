@@ -195,6 +195,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         clock,
         limits: WakeLimits::default(),
         workspace: None,
+        shadow: None,
         memory: None,
         memory_settled: false,
         waiting: Vec::new(),

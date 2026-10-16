@@ -59,6 +59,16 @@ url = "https://workspace.example/api/v1/mcp"
 token_file = "/run/credentials/harness-agent.service/workspace-token"
 poll_seconds = 300
 
+# Shadow mode, for the agent's first real week: anything it would say outside
+# the live conversations goes to a private channel instead, saying where it
+# was meant to go, and nobody else sees it. Leave this table out to turn
+# shadow mode off.
+[agent.workspace.shadow]
+# The private channel's conversation id.
+channel = "00000000-0000-0000-0000-000000000001"
+# Where it answers for real, such as your direct message with it.
+live = ["00000000-0000-0000-0000-000000000002"]
+
 # The sandboxed shell: run_command, one program with an argument array,
 # inside bubblewrap. It can change only workdir (memory_dir stays read-only),
 # protected paths are read-only, credentials are hidden, and there's no

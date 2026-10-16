@@ -7,7 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use harness_core::{Clock, WakeReason};
-use harness_workspace::{AccessToken, InboxWatch, McpClient, McpError, NewRequests, Workspace};
+use harness_workspace::{
+    AccessToken, InboxWatch, McpClient, McpError, NewRequests, Shadow, Workspace,
+};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -30,6 +32,21 @@ pub struct WorkspaceConfig {
     /// How often to look at the inbox when no wakeup has come.
     #[serde(default = "default_poll_seconds")]
     pub poll_seconds: u64,
+    /// Shadow mode: what the agent would say goes to a private channel
+    /// instead. Leave it out and replies go where they're asked for.
+    #[serde(default)]
+    pub shadow: Option<ShadowConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowConfig {
+    /// The private channel's Workspace conversation id.
+    pub channel: String,
+    /// Conversations where the agent answers for real, such as its owner's
+    /// direct message with it.
+    #[serde(default)]
+    pub live: Vec<String>,
 }
 
 fn default_poll_seconds() -> u64 {
@@ -44,6 +61,17 @@ impl WorkspaceConfig {
             )));
         }
         Ok(Duration::from_secs(self.poll_seconds))
+    }
+
+    pub fn shadow(&self) -> Result<Option<Arc<Shadow>>, AgentError> {
+        self.shadow
+            .as_ref()
+            .map(|shadow| {
+                Shadow::new(&shadow.channel, &shadow.live)
+                    .map(Arc::new)
+                    .map_err(|e| AgentError::Invalid(format!("workspace.shadow: {e}")))
+            })
+            .transpose()
     }
 
     pub fn connect(&self) -> Result<Arc<Workspace>, AgentError> {
@@ -64,9 +92,10 @@ pub async fn poll(
     workspace: Arc<Workspace>,
     clock: Arc<dyn Clock>,
     every: Duration,
+    shadow: Option<Arc<Shadow>>,
     events: mpsc::Sender<WakeEvent>,
 ) {
-    let mut watch = InboxWatch::default();
+    let mut watch = InboxWatch::with_shadow(shadow);
     let mut next = clock.now();
     loop {
         let now = clock.now();

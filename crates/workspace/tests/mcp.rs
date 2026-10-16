@@ -16,7 +16,9 @@ use futures_util::StreamExt;
 use harness_core::FakeClock;
 use harness_providers::ToolCall;
 use harness_tools::{BreakerLimits, Decision, ExecOutcome, Policy, PolicyExecutor};
-use harness_workspace::{AccessToken, InboxWatch, McpClient, McpError, NewRequests, Workspace};
+use harness_workspace::{
+    AccessToken, InboxWatch, McpClient, McpError, NewRequests, Shadow, Workspace,
+};
 use serde_json::{Value, json};
 
 const TOKEN: &str = "aw_ext_test-token-for-the-fake-server";
@@ -188,6 +190,10 @@ fn tool(name: &str, arguments: &Value) -> Value {
         }
         "reply_send" | "reply_pass" | "reply_release" => json!({"outcome": "ok", "value": {
             "requestId": arguments["requestId"], "status": "answered", "messageId": "m-2"
+        }}),
+        "message_send" => json!({"outcome": "ok", "value": {
+            "conversationId": arguments["conversationId"], "messageId": "m-3", "sequence": 9,
+            "text": "", "sentAt": "now", "idempotentReplay": false
         }}),
         other => panic!("unexpected tool {other}"),
     }
@@ -481,4 +487,93 @@ async fn an_open_event_stream_is_read_up_to_the_answer() {
         .expect("answered without waiting for the stream to close")
         .unwrap();
     assert_eq!(entries.len(), 3);
+}
+
+fn shadowed_executor(workspace: Arc<Workspace>, shadow: Arc<Shadow>) -> PolicyExecutor {
+    let mut executor = PolicyExecutor::new(
+        Policy::conservative("/home/agent"),
+        Arc::new(FakeClock::at_default_start()),
+    );
+    for tool in harness_workspace::tools_with(workspace, Some(shadow)) {
+        executor.register(tool);
+    }
+    executor
+}
+
+#[tokio::test]
+async fn in_shadow_mode_replies_go_to_the_shadow_channel() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    let shadow = Arc::new(Shadow::new("shadow-1", &["dm-owner".into()]).unwrap());
+    let mut executor = shadowed_executor(workspace, shadow.clone());
+
+    // Before a claim, where the request is from is unknown.
+    let send = |request: &str| {
+        call(
+            "reply_send",
+            json!({"request_id": request, "generation": 2, "text": "On it, @mara."}),
+        )
+    };
+    let outcome = executor.execute(&send("r-1")).await;
+    assert!(
+        matches!(&outcome, ExecOutcome::Failed(why) if why.contains("reply_claim first")),
+        "{outcome:?}"
+    );
+
+    ran(executor
+        .execute(&call("reply_claim", json!({"request_id": "r-1"})))
+        .await);
+    let sent = ran(executor.execute(&send("r-1")).await);
+    assert!(sent.contains("Shadow mode"), "{sent}");
+    assert!(sent.contains("\"Direct message\""), "{sent}");
+    let calls = fake.calls();
+    assert_eq!(
+        calls.last().unwrap(),
+        &(
+            "message_send".to_string(),
+            json!({
+                "conversationId": "shadow-1",
+                "text": "Would reply in Direct message:\n\nOn it, @\u{200B}mara."
+            })
+        )
+    );
+    // The request itself was left alone: required, so not passed either.
+    assert!(
+        !calls
+            .iter()
+            .any(|(name, _)| name == "reply_send" || name == "reply_pass")
+    );
+    assert!(shadow.is_shadowed("r-1"));
+
+    // It leaves the briefing and the inbox watch.
+    let briefing = ran(executor.execute(&call("briefing", json!({}))).await);
+    assert!(!briefing.contains("\"r-1\""), "{briefing}");
+    let mut watch = InboxWatch::with_shadow(Some(shadow));
+    let (_, workspace) = workspace_with(TOKEN).await;
+    assert_eq!(
+        watch.check(&workspace).await.unwrap(),
+        Some(NewRequests {
+            count: 1,
+            pressing: 0
+        })
+    );
+}
+
+#[tokio::test]
+async fn in_shadow_mode_live_conversations_get_real_replies() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    // The fake's requests are all from conversation `c`.
+    let shadow = Arc::new(Shadow::new("shadow-1", &["c".into()]).unwrap());
+    let mut executor = shadowed_executor(workspace, shadow.clone());
+    ran(executor
+        .execute(&call("reply_claim", json!({"request_id": "r-1"})))
+        .await);
+    let sent = ran(executor
+        .execute(&call(
+            "reply_send",
+            json!({"request_id": "r-1", "generation": 2, "text": "On it."}),
+        ))
+        .await);
+    assert!(sent.contains("answered"));
+    assert_eq!(fake.calls().last().unwrap().0, "reply_send");
+    assert!(!shadow.is_shadowed("r-1"));
 }

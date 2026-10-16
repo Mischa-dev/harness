@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::api::{Outcome, Workspace};
 use crate::client::McpError;
+use crate::shadow::{self, Route, Shadow};
 
 /// Workspace's own limit on a reply.
 pub const MAX_REPLY_CHARS: usize = 20_000;
@@ -27,6 +28,11 @@ const MAX_REASON_CHARS: usize = 2_000;
 
 /// All of the agent's Workspace tools, sharing one session.
 pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
+    tools_with(workspace, None)
+}
+
+/// The tools, with replies routed through `shadow` when it's set.
+pub fn tools_with(workspace: Arc<Workspace>, shadow: Option<Arc<Shadow>>) -> Vec<Box<dyn Tool>> {
     [
         Kind::Briefing,
         Kind::Claim,
@@ -39,6 +45,7 @@ pub fn tools(workspace: Arc<Workspace>) -> Vec<Box<dyn Tool>> {
         Box::new(WorkspaceTool {
             kind,
             workspace: workspace.clone(),
+            shadow: shadow.clone(),
         }) as Box<dyn Tool>
     })
     .collect()
@@ -56,6 +63,7 @@ enum Kind {
 struct WorkspaceTool {
     kind: Kind,
     workspace: Arc<Workspace>,
+    shadow: Option<Arc<Shadow>>,
 }
 
 const REQUEST_ID: &str = "The reply request's id, from the briefing";
@@ -148,6 +156,22 @@ impl Tool for WorkspaceTool {
         let call = Call::read(self.kind, args)?;
         let workspace = &self.workspace;
         let id = call.request_id.as_str();
+        if let (Some(shadow), Kind::Send | Kind::Release) = (&self.shadow, self.kind) {
+            match shadow.route(id) {
+                Route::Live => {}
+                Route::Unknown => {
+                    return Err(ToolError::Failed(
+                        "You're in shadow mode, and this request hasn't been claimed since the \
+                         runtime started, so it can't tell where it's from. Claim it with \
+                         reply_claim first."
+                            .into(),
+                    ));
+                }
+                Route::Shadow(claimed) => {
+                    return self.answer_in_shadow(shadow, &call, claimed).await;
+                }
+            }
+        }
         let outcome = match self.kind {
             Kind::Briefing => workspace.briefing().await,
             Kind::Claim => workspace.claim(id).await,
@@ -161,17 +185,64 @@ impl Tool for WorkspaceTool {
             }
             Kind::Release => workspace.release(id, call.generation, &call.text).await,
         };
-        match outcome.map_err(failed)? {
-            Outcome::Ok(value) => Ok(ToolOutput::text(render(&value))),
-            Outcome::Declined { outcome, detail } => Err(ToolError::Failed(format!(
-                "Workspace declined ({outcome}){}",
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
-            ))),
+        let mut value = accepted(outcome)?;
+        if let Some(shadow) = &self.shadow {
+            match self.kind {
+                Kind::Claim => shadow.remember(id, &value),
+                Kind::Briefing => shadow.hide_answered(&mut value),
+                _ => {}
+            }
         }
+        Ok(ToolOutput::text(render(&value)))
+    }
+}
+
+impl WorkspaceTool {
+    /// Posts what the agent meant for another conversation in the shadow
+    /// channel, and leaves the request itself alone. An optional one is
+    /// passed, which nobody sees, so it stops waiting on the agent.
+    async fn answer_in_shadow(
+        &self,
+        shadow: &Shadow,
+        call: &Call,
+        claimed: shadow::Claimed,
+    ) -> Result<ToolOutput, ToolError> {
+        let name = &claimed.conversation_name;
+        let heading = match self.kind {
+            Kind::Send => format!("Would reply in {name}:"),
+            _ => format!("Would give back a reply request in {name}, telling them:"),
+        };
+        let text = shadow::post(&heading, &call.text, MAX_REPLY_CHARS);
+        accepted(self.workspace.post(shadow.channel(), &text).await)?;
+        shadow.mark(&call.request_id);
+        if !claimed.required {
+            // Best effort: if it fails, the request just stays open.
+            let _ = self
+                .workspace
+                .pass(&call.request_id, call.generation, Some("shadow mode"))
+                .await;
+        }
+        let quoted = serde_json::to_string(name).unwrap_or_default();
+        Ok(ToolOutput::text(format!(
+            "Shadow mode: this went to your shadow channel for your owner to read, not to \
+             {quoted}. Nobody there saw it. The request is done as far as you're concerned; \
+             don't answer it again."
+        )))
+    }
+}
+
+/// The value of an accepted call, or why it wasn't.
+fn accepted(outcome: Result<Outcome, McpError>) -> Result<Value, ToolError> {
+    match outcome.map_err(failed)? {
+        Outcome::Ok(value) => Ok(value),
+        Outcome::Declined { outcome, detail } => Err(ToolError::Failed(format!(
+            "Workspace declined ({outcome}){}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ))),
     }
 }
 

@@ -118,6 +118,7 @@ fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
             url: format!("http://{workspace}/api/v1/mcp"),
             token_file: write(dir, "workspace-token", &format!("{WORKSPACE_TOKEN}\n")),
             poll_seconds: 300,
+            shadow: None,
         }),
     }
 }
@@ -204,6 +205,7 @@ async fn the_poller_wakes_the_agent_for_requests_it_missed() {
         agent.workspace.clone().unwrap(),
         clock.clone(),
         every,
+        None,
         send,
     ));
 
@@ -252,4 +254,21 @@ async fn the_poller_wakes_the_agent_for_requests_it_missed() {
         .await
         .expect("the poller stops when the agent stops listening")
         .unwrap();
+}
+
+#[test]
+fn a_shadow_channel_must_be_a_conversation_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(dir.path(), "127.0.0.1:9".parse().unwrap());
+    if let Some(workspace) = config.workspace.as_mut() {
+        workspace.shadow = Some(harness_daemon::polling::ShadowConfig {
+            channel: "../general".into(),
+            live: vec![],
+        });
+    }
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a bad shadow channel was accepted");
+    };
+    assert!(err.to_string().contains("workspace.shadow"), "{err}");
 }
