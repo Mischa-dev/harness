@@ -298,39 +298,41 @@ fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // Non-blocking, so a FIFO planted under a memory name can't hang
+        // the open; it's refused below. Regular files ignore the flag.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(not(unix))]
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(std::io::Error::other("the file is a symlink"));
     }
     let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("it isn't a regular file"));
+    }
     // A hard link is another name for some other file, which could be one
     // the walls keep the agent from.
-    if !lone_file(&file.metadata()?) {
+    if !lone_file(&meta) {
         return Err(std::io::Error::other("the file has other names"));
     }
     Ok(file)
 }
 
-/// Whether `meta` is a regular file with no other names, or anything other
-/// than a regular file (which opening or reading refuses on its own).
+/// Whether `meta` is a regular file with no other names.
 fn lone_file(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        !meta.is_file() || meta.nlink() == 1
+        meta.is_file() && meta.nlink() == 1
     }
     #[cfg(not(unix))]
-    {
-        let _ = meta;
-        true
-    }
+    meta.is_file()
 }
 
 /// Whether `path` is a regular file of its own: no link, no other names.
 fn plain_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && lone_file(&m))
+    std::fs::symlink_metadata(path).is_ok_and(|m| lone_file(&m))
 }
 
 /// The file's text within `limit` characters, saying so if it was cut, or
@@ -1159,6 +1161,16 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "TOKEN=outside");
+
+        // A FIFO under a memory name is refused without waiting for a writer.
+        let fifo = files.dir().join("USER.md");
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        assert!(
+            run(read.as_ref(), json!({"file": "user"}), &clock)
+                .await
+                .is_err()
+        );
 
         // Nor does a new history take them in.
         let history = tmp.path().join("fresh.git");
