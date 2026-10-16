@@ -65,7 +65,11 @@ pub fn is_loopback(url: &str) -> bool {
         return false;
     };
     match url.host() {
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        // `localhost.` is the same name written fully qualified.
+        Some(url::Host::Domain(domain)) => domain
+            .strip_suffix('.')
+            .unwrap_or(domain)
+            .eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         // `::1`, or a 127.x address written as `::ffff:127.0.0.1`.
         Some(url::Host::Ipv6(ip)) => {
@@ -119,6 +123,7 @@ mod tests {
         for yes in [
             "http://127.0.0.1:8787/anthropic/v1/messages",
             "http://localhost:8787/x",
+            "http://localhost.:8787/x",
             "http://LOCALHOST/x",
             "http://127.1.2.3/x",
             "http://[::1]:8787/x",

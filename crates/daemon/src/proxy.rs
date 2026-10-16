@@ -227,7 +227,11 @@ pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::
 /// 127.x address written as `::ffff:127.0.0.1`.
 fn is_loopback(url: &reqwest::Url) -> bool {
     match url.host() {
-        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        // `localhost.` is the same name written fully qualified.
+        Some(url::Host::Domain(domain)) => domain
+            .strip_suffix('.')
+            .unwrap_or(domain)
+            .eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => {
             ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
@@ -397,6 +401,7 @@ mod tests {
             "http://localhost:8080/v1",
             "https://localhost:8443/v1",
             "https://LOCALHOST/v1",
+            "https://localhost.:8443/v1",
             "https://127.0.0.1/v1",
             "https://127.2.3.4/v1",
             "https://[::1]/v1",
