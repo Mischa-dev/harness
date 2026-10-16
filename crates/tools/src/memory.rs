@@ -290,17 +290,23 @@ fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
 /// big the file has grown.
 fn read_capped(path: &Path, limit: usize) -> std::io::Result<String> {
     let mut bytes = Vec::new();
+    // A character is at most 4 bytes, so one more byte than that shows
+    // whether there is more.
+    let most = limit as u64 * 4 + 1;
     match open_file(path, OpenOptions::new().read(true)) {
-        // A character is at most 4 bytes, so one more byte than that shows
-        // whether there is more.
-        Ok(file) => file.take(limit as u64 * 4 + 1).read_to_end(&mut bytes)?,
+        Ok(file) => file.take(most).read_to_end(&mut bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => return Err(e),
     };
+    let unread = bytes.len() as u64 == most;
     let text = String::from_utf8_lossy(&bytes);
     Ok(match text.char_indices().nth(limit) {
-        None => text.into_owned(),
-        Some((at, _)) => format!("{}\n[cut at {limit} characters]", &text[..at]),
+        // Trailing whitespace past the limit, like the newline each file
+        // ends with, isn't worth a cut.
+        Some((at, _)) if unread || !text[at..].trim().is_empty() => {
+            format!("{}\n[cut at {limit} characters]", &text[..at])
+        }
+        _ => text.into_owned(),
     })
 }
 
@@ -508,7 +514,8 @@ impl Tool for MemoryWrite {
             .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let length = content.chars().count();
+        // Trailing whitespace isn't kept, so it doesn't count.
+        let length = content.trim_end().chars().count();
         if length > cap {
             return Err(ToolError::InvalidArguments(format!(
                 "{name} is capped at {cap} characters and this is {length}; keep what matters most"
@@ -971,6 +978,24 @@ mod tests {
         assert!(shown.contains("entry 19 "));
         assert!(!shown.contains("entry 0 "));
         assert!(shown.chars().count() < MAX_READ_CHARS + 100);
+    }
+
+    #[tokio::test]
+    async fn a_file_written_at_its_cap_is_shown_whole() {
+        let (_tmp, files) = open();
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let write = tools(files.clone()).remove(1);
+        let full = "x".repeat(6_000);
+        run(
+            write.as_ref(),
+            json!({"file": "memory", "content": format!("{full}\n\n")}),
+            &clock,
+        )
+        .await
+        .unwrap();
+        let snapshot = files.snapshot();
+        assert!(snapshot.contains(&full));
+        assert!(!snapshot.contains("[cut at"));
     }
 
     #[test]
