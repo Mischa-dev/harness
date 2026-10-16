@@ -219,6 +219,43 @@ async fn web_pages_cannot_spend_the_key() {
     }
 }
 
+/// Sends only a request's head, announcing a body that never comes, and
+/// returns the first answer if one arrives within two seconds.
+async fn head_only(proxy: SocketAddr, extra: &str, length: usize) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let request = format!(
+        "POST /anthropic/v1/messages HTTP/1.1\r\nhost: {proxy}\r\n{extra}content-length: {length}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = [0u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+    match read {
+        Ok(Ok(n)) if n > 0 => Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn refused_and_oversized_requests_are_answered_before_their_body() {
+    let (proxy, log) = setup().await;
+    let refused = head_only(proxy, "origin: https://evil.example\r\n", 1_000_000).await;
+    assert!(
+        refused
+            .as_deref()
+            .is_some_and(|r| r.starts_with("HTTP/1.1 403")),
+        "{refused:?}"
+    );
+    let oversized = head_only(proxy, "", 64 * 1024 * 1024).await;
+    assert!(
+        oversized
+            .as_deref()
+            .is_some_and(|r| r.starts_with("HTTP/1.1 413")),
+        "{oversized:?}"
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn only_get_and_post_reach_the_provider() {
     let (proxy, log) = setup().await;

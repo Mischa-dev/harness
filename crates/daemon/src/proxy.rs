@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::{Body, Bytes};
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use serde::Deserialize;
@@ -220,7 +220,6 @@ pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::
     };
     Ok(Router::new()
         .fallback(any(forward))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(proxy)))
 }
 
@@ -259,13 +258,11 @@ fn from_a_local_program(headers: &HeaderMap) -> bool {
     reqwest::Url::parse(&format!("http://{host}/")).is_ok_and(|url| is_loopback(&url))
 }
 
-async fn forward(
-    State(proxy): State<Arc<Proxy>>,
-    uri: Uri,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response {
+    // Every check runs on the head alone, so a request that will be refused
+    // never gets its body read into memory.
+    let (parts, body) = request.into_parts();
+    let (uri, method, headers) = (parts.uri, parts.method, parts.headers);
     if !from_a_local_program(&headers) {
         return (StatusCode::FORBIDDEN, "only local programs may call\n").into_response();
     }
@@ -283,6 +280,15 @@ async fn forward(
     }
     let Some(url) = upstream_url(route, rest, uri.query()) else {
         return (StatusCode::BAD_REQUEST, "that path leaves the route\n").into_response();
+    };
+    let announced = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if announced.is_some_and(|n| n > MAX_BODY_BYTES as u64) {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "the request is too large\n").into_response();
+    }
+    let Ok(body) = axum::body::to_bytes(body, MAX_BODY_BYTES).await else {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "the request is too large\n").into_response();
     };
 
     let mut outgoing = HeaderMap::new();
