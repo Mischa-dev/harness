@@ -265,6 +265,12 @@ async fn credential_and_repository_metadata_paths_are_protected() {
         ".pypirc",
         ".netrc",
         ".env.local",
+        "services/api/.env",
+        "services/api/.env.production",
+        "packages/web/.npmrc",
+        "vendor/lib/.git/config",
+        "home/.ssh/id_ed25519",
+        "home/.config/gcloud/credentials.db",
     ] {
         for tool in ["read", "write"] {
             let out = h.exec.execute(&call(tool, json!({"path": path}))).await;
@@ -272,6 +278,23 @@ async fn credential_and_repository_metadata_paths_are_protected() {
         }
     }
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ordinary_nested_files_near_secret_names_are_not_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    for path in [
+        "services/api/config.toml",
+        "src/environment.rs",
+        "docs/npmrc.md",
+    ] {
+        let out = h.exec.execute(&call("read", json!({"path": path}))).await;
+        assert!(
+            !is_deny(&out),
+            "read {path} should not be denied, got {out:?}"
+        );
+    }
 }
 
 #[tokio::test]
