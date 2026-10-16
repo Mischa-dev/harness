@@ -55,8 +55,9 @@ pub struct MemoryFiles {
 
 impl MemoryFiles {
     /// Opens the folder, creating it if needed, with its history kept in
-    /// the git repository at `history`, which is created if needed. Without
-    /// git on the machine the files still work, without history.
+    /// the git repository at `history`. A new repository starts with
+    /// whatever the folder already holds, committed as of `now`. Without git
+    /// on the machine the files still work, without history.
     ///
     /// The folder itself can't be a symlink, so it can't lead somewhere
     /// else.
@@ -64,6 +65,7 @@ impl MemoryFiles {
         dir: impl Into<PathBuf>,
         history: Option<PathBuf>,
         offset: UtcOffset,
+        now: OffsetDateTime,
     ) -> std::io::Result<Self> {
         let dir = std::path::absolute(dir.into())?;
         let history = history.map(std::path::absolute).transpose()?;
@@ -75,7 +77,17 @@ impl MemoryFiles {
         let history = history.filter(|git_dir| match std::fs::symlink_metadata(git_dir) {
             Ok(meta) => meta.is_dir(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok)
+                let created = git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok);
+                if created {
+                    let present: Vec<&str> = FILES
+                        .iter()
+                        .map(|(_, name, _)| *name)
+                        .chain(["journal"])
+                        .filter(|name| real.join(name).exists())
+                        .collect();
+                    commit(git_dir, &real, &present, "Start the history", now, false);
+                }
+                created
             }
             Err(_) => false,
         });
@@ -158,43 +170,80 @@ impl MemoryFiles {
         };
         let root = self.root().map_err(failed)?;
         let path = root.join(relative);
-        let mut options = OpenOptions::new();
         if append {
-            options.create(true).append(true);
+            open_file(&path, OpenOptions::new().create(true).append(true))
+                .and_then(|mut file| file.write_all(text.as_bytes()))
         } else {
-            options.create(true).write(true).truncate(true);
+            replace(&path, text.as_bytes())
         }
-        open_file(&path, &mut options)
-            .and_then(|mut file| file.write_all(text.as_bytes()))
-            .map_err(failed)?;
+        .map_err(failed)?;
         // A failed commit loses history, not the change, so it doesn't fail
         // the write.
-        if let Some(git_dir) = &self.history
-            && git(git_dir, root, &["add", "--", relative]).is_ok_and(|ok| ok)
-        {
-            // Dated by the runtime's clock, like everything else.
-            let date = format!("@{} +0000", at.unix_timestamp());
-            let _ = git_dated(
-                git_dir,
-                root,
-                &[
-                    "-c",
-                    "user.name=harness",
-                    "-c",
-                    "user.email=harness@localhost",
-                    "commit",
-                    "--quiet",
-                    "--no-verify",
-                    "-m",
-                    message,
-                    "--",
-                    relative,
-                ],
-                Some(&date),
-            );
+        if let Some(git_dir) = &self.history {
+            commit(git_dir, root, &[relative], message, at, true);
         }
         Ok(())
     }
+}
+
+/// Replaces the file at `path` whole: the new text goes to a file beside it,
+/// which then takes its place, so a failed write leaves the old one intact.
+fn replace(path: &Path, text: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.new"));
+    match std::fs::remove_file(&temp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let written = open_file(&temp, OpenOptions::new().write(true).create_new(true))
+        .and_then(|mut file| {
+            file.write_all(text)?;
+            file.sync_all()
+        })
+        // A rename replaces a link at `path` rather than following it.
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+/// Commits `paths` (whatever exists of them) as of `at`, by the runtime's
+/// clock. Only the `paths` are committed when `only` is set. Ignore files in
+/// the folder can't keep them out.
+fn commit(
+    git_dir: &Path,
+    work_tree: &Path,
+    paths: &[&str],
+    message: &str,
+    at: OffsetDateTime,
+    only: bool,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut add = vec!["add", "--force", "--"];
+    add.extend_from_slice(paths);
+    if !git(git_dir, work_tree, &add).is_ok_and(|ok| ok) {
+        return;
+    }
+    let date = format!("@{} +0000", at.unix_timestamp());
+    let mut args = vec![
+        "-c",
+        "user.name=harness",
+        "-c",
+        "user.email=harness@localhost",
+        "commit",
+        "--quiet",
+        "--no-verify",
+        "-m",
+        message,
+    ];
+    if only {
+        args.push("--");
+        args.extend_from_slice(paths);
+    }
+    let _ = git_dated(git_dir, work_tree, &args, Some(&date));
 }
 
 /// Opens `path` without following a symlink at its last step.
@@ -532,6 +581,7 @@ mod tests {
             dir.path().join("memory"),
             Some(dir.path().join("memory.git")),
             offset!(-7),
+            datetime!(2026-01-05 00:00 UTC),
         )
         .unwrap();
         (dir, Arc::new(files))
@@ -724,17 +774,55 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
+        assert!(!files.snapshot().contains("outside"));
+
+        // A rewrite replaces the link itself, as does a link left where the
+        // new text is first written.
+        link(".MEMORY.md.new");
+        for file in ["user", "memory"] {
             run(
                 write.as_ref(),
-                json!({"file": "user", "content": "overwritten"}),
-                &clock
+                json!({"file": file, "content": "rewritten"}),
+                &clock,
             )
             .await
-            .is_err()
-        );
-        assert!(!files.snapshot().contains("outside"));
+            .unwrap();
+        }
+        let user = files.dir().join("USER.md");
+        assert!(!std::fs::symlink_metadata(&user).unwrap().is_symlink());
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), "rewritten\n");
+        assert!(!files.dir().join(".MEMORY.md.new").exists());
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "outside");
+    }
+
+    #[test]
+    fn history_starts_from_what_the_folder_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("memory");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("MEMORY.md"), "- from before\n").unwrap();
+        // Ignore rules in the folder don't keep memory out of history.
+        std::fs::write(dir.join(".gitignore"), "*.md\n").unwrap();
+        let history = tmp.path().join("memory.git");
+        let at = datetime!(2026-01-05 00:00 UTC);
+        let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
+        assert_eq!(commits(&history), 1);
+        let show = |rev: &str| {
+            let out = Command::new("git")
+                .arg("--git-dir")
+                .arg(&history)
+                .args(["show", rev])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(show("HEAD:MEMORY.md"), "- from before\n");
+        files
+            .save("MEMORY.md", "- now\n", false, "Update MEMORY.md", at)
+            .unwrap();
+        assert_eq!(commits(&history), 2);
+        assert_eq!(show("HEAD:MEMORY.md"), "- now\n");
+        assert_eq!(show("HEAD~1:MEMORY.md"), "- from before\n");
     }
 
     #[cfg(unix)]
@@ -765,7 +853,13 @@ mod tests {
         std::fs::write(dir.join(".gitattributes"), "* filter=x\n").unwrap();
 
         let history = tmp.path().join("memory.git");
-        let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7)).unwrap();
+        let files = MemoryFiles::open(
+            &dir,
+            Some(history.clone()),
+            offset!(-7),
+            datetime!(2026-01-05 00:00 UTC),
+        )
+        .unwrap();
         let files = Arc::new(files);
         let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
         let write = tools(files).remove(1);
@@ -794,11 +888,14 @@ mod tests {
         std::fs::write(outside.join("MEMORY.md"), "outside").unwrap();
         let link = tmp.path().join("linked");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
-        assert!(MemoryFiles::open(&link, None, offset!(-7)).is_err());
+        assert!(
+            MemoryFiles::open(&link, None, offset!(-7), datetime!(2026-01-05 00:00 UTC)).is_err()
+        );
 
         // Nor can it be swapped for one after it's opened.
         let dir = tmp.path().join("memory");
-        let files = MemoryFiles::open(&dir, None, offset!(-7)).unwrap();
+        let files =
+            MemoryFiles::open(&dir, None, offset!(-7), datetime!(2026-01-05 00:00 UTC)).unwrap();
         std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &dir).unwrap();
         assert!(!files.snapshot().contains("outside"));

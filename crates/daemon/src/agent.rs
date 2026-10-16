@@ -162,16 +162,24 @@ impl Agent {
             source,
         })?;
         let store = Store::open(&config.state_dir.join(STORE_FILE))?;
+        // Absolute, so the walls compare like with like.
+        let workdir = std::path::absolute(&config.workdir).map_err(|source| AgentError::Read {
+            field: "workdir",
+            source,
+        })?;
         let mut executor =
-            PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
-                .with_tool(SleepTool);
+            PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
         let memory_dir = config
             .memory_dir
             .clone()
-            .unwrap_or_else(|| config.workdir.join("memory"));
+            .unwrap_or_else(|| workdir.join("memory"));
+        let memory_dir = std::path::absolute(&memory_dir).map_err(|source| AgentError::Read {
+            field: "memory_dir",
+            source,
+        })?;
         // The snapshot goes straight into every request, so the folder has
         // to be one the walls let the agent use anyway.
-        let walls = Policy::conservative(&config.workdir);
+        let walls = Policy::conservative(&workdir);
         let inside = |dir: &Path| {
             matches!(
                 walls.check(&Effect::WritePath(dir.to_path_buf())),
@@ -192,6 +200,7 @@ impl Agent {
                 memory_dir.clone(),
                 Some(config.state_dir.join(MEMORY_HISTORY)),
                 offset,
+                clock.now(),
             )
             .map_err(|source| AgentError::Read {
                 field: "memory_dir",
