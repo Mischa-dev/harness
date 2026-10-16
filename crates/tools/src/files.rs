@@ -47,7 +47,7 @@ const MATCH_CHARS: usize = 300;
 
 /// The work-area tools, judged by `policy`, which should be the executor's.
 pub fn tools(policy: Policy) -> Vec<Box<dyn Tool>> {
-    let area = Arc::new(Area::new(policy));
+    let area = Arc::new(Area { named: policy });
     vec![
         Box::new(ReadFile(area.clone())),
         Box::new(SearchFiles(area)),
@@ -60,16 +60,18 @@ pub fn tools(policy: Policy) -> Vec<Box<dyn Tool>> {
 /// in case the work area itself is reached through a link.
 struct Area {
     named: Policy,
-    real: Policy,
 }
 
 impl Area {
-    fn new(named: Policy) -> Self {
-        let mut real = named.clone();
-        if let Ok(root) = real.root.canonicalize() {
-            real.root = root;
-        }
-        Self { named, real }
+    /// The walls with the root where it really is now. Found on each call,
+    /// since the work area may not exist yet when the tools are made.
+    fn real(&self) -> Result<Policy, ToolError> {
+        let mut real = self.named.clone();
+        real.root = real
+            .root
+            .canonicalize()
+            .map_err(|e| ToolError::Failed(format!("couldn't find the work area: {}", e.kind())))?;
+        Ok(real)
     }
 }
 
@@ -107,7 +109,7 @@ impl Tool for ReadFile {
         let path = named_path(&self.0.named, args, true)?;
         let (offset, limit) = line_window(args)?;
         let area = self.0.clone();
-        blocking(move || read(&area.real, &path, offset, limit)).await
+        blocking(move || read(&area.real()?, &path, offset, limit)).await
     }
 }
 
@@ -145,7 +147,7 @@ impl Tool for SearchFiles {
         let start = named_path(&self.0.named, args, false)?;
         let (text, case_sensitive) = needle(args)?;
         let area = self.0.clone();
-        blocking(move || search(&area.real, &start, &text, case_sensitive)).await
+        blocking(move || search(&area.real()?, &start, &text, case_sensitive)).await
     }
 }
 
@@ -729,6 +731,42 @@ mod tests {
             .await;
         assert!(big.len() <= MAX_CHARS + 100);
         assert!(big.contains("Continue with offset"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_work_area_made_after_the_tools_behind_a_link_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
+        let root = tmp.path().join("link/work");
+        let policy = Policy::conservative(&root);
+        let mut executor =
+            PolicyExecutor::new(policy.clone(), Arc::new(FakeClock::at_default_start()));
+        for tool in tools(policy) {
+            executor.register(tool);
+        }
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("notes.txt"), "hello\n").unwrap();
+        for (name, arguments, expected) in [
+            ("read_file", json!({"path": "notes.txt"}), "     1\thello\n"),
+            (
+                "search_files",
+                json!({"text": "hello"}),
+                "notes.txt:1: hello\n",
+            ),
+        ] {
+            let call = ToolCall {
+                id: "1".into(),
+                name: name.into(),
+                arguments,
+            };
+            match executor.execute(&call).await {
+                ExecOutcome::Ran(output) => assert_eq!(output.content, expected),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
