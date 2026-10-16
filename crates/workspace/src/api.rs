@@ -166,6 +166,16 @@ impl Workspace {
         self.call("message_send", arguments).await
     }
 
+    /// Calls a Workspace tool and returns its whole result, whatever the
+    /// outcome, for the tools that show it to the model as it is.
+    pub async fn call_raw(&self, tool: &str, arguments: Value) -> Result<Value, McpError> {
+        let content = self.client.call_tool(tool, arguments).await?;
+        if content.get("outcome").and_then(Value::as_str).is_none() {
+            return Err(McpError::Protocol("the result had no outcome"));
+        }
+        Ok(content)
+    }
+
     async fn call(&self, tool: &str, arguments: Value) -> Result<Outcome, McpError> {
         let mut content = self.client.call_tool(tool, arguments).await?;
         outcome(&mut content)
