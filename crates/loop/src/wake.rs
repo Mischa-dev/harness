@@ -88,6 +88,18 @@ pub trait Checkpoint {
         pending: Option<&Message>,
         progress: &Progress,
     ) -> Result<(), CheckpointError>;
+
+    /// The save that records `breaker` tripping. The pause must be saved
+    /// with the transcript, in one write, so a restart can't lose it.
+    fn save_paused(
+        &mut self,
+        transcript: &[Message],
+        progress: &Progress,
+        breaker: &str,
+    ) -> Result<(), CheckpointError> {
+        let _ = breaker;
+        self.save(transcript, None, progress)
+    }
 }
 
 /// Urgent events that arrive while a wake runs. The wake takes them at its
@@ -159,6 +171,10 @@ impl LoopError {
 
 const SLEEP_REMINDER: &str =
     "(runtime) End the wake by calling `sleep` with when you want to look again.";
+
+/// What a call says when urgent news arrived before it could run.
+const URGENT_FIRST: &str = "not run: urgent news arrived first (below). \
+     Decide again with it in mind.";
 
 /// What a saved call says until it reports back. If the process dies, this is
 /// what the agent finds after the restart.
@@ -313,9 +329,19 @@ pub async fn run_wake_interruptible(
         let mut sleep_until = None;
         let mut paused = None;
         let mut malformed = false;
+        // Urgent news taken in between calls. Calls after it don't run: the
+        // agent decides again with the news in front of it.
+        let mut news = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             if paused.is_some() {
                 results.push(error(call, "not run: the agent is paused"));
+                continue;
+            }
+            if news.is_empty() {
+                news = interrupts.take();
+            }
+            if !news.is_empty() {
+                results.push(error(call, URGENT_FIRST));
                 continue;
             }
             if i > 0 && profile.tool_calls == ToolCallStyle::Sequential {
@@ -374,18 +400,33 @@ pub async fn run_wake_interruptible(
                 .map(|r| r.content.len().div_ceil(BYTES_PER_TOKEN) as u64)
                 .fold(0_u64, u64::saturating_add),
         );
+        if paused.is_none() && news.is_empty() {
+            news = interrupts.take();
+        }
         transcript.push(results_message(results));
-        save(
-            checkpoint,
-            transcript,
-            None,
-            progress(turns, usage, context_tokens),
-        )?;
+        // News that arrived during the batch comes right after its results.
+        let interrupted = !news.is_empty();
+        transcript.extend(news);
+        if let Some(breaker) = &paused {
+            let progress = progress(turns, usage, context_tokens);
+            checkpoint
+                .save_paused(transcript, &progress, breaker)
+                .map_err(|source| LoopError::Checkpoint { source, progress })?;
+        } else {
+            save(
+                checkpoint,
+                transcript,
+                None,
+                progress(turns, usage, context_tokens),
+            )?;
+        }
 
         if let Some(breaker) = paused {
             break WakeEnd::Paused { breaker };
         }
-        if let Some(until) = sleep_until {
+        if let Some(until) = sleep_until
+            && !interrupted
+        {
             break WakeEnd::Slept { until };
         }
         if malformed && malformed_last_turn {

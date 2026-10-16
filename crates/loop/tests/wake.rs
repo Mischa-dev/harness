@@ -468,3 +468,68 @@ async fn an_urgent_message_cancels_the_call_in_flight() {
     assert_eq!(retried, &Message::user_text("Urgent: prod is down."));
     assert_eq!(w.transcript[1], Message::user_text("Urgent: prod is down."));
 }
+
+/// Urgent news that turns up on the `at`-th look.
+struct NewsAt {
+    looks: usize,
+    at: usize,
+}
+
+impl harness_loop::Interrupts for NewsAt {
+    fn take(&mut self) -> Vec<Message> {
+        self.looks += 1;
+        if self.looks == self.at {
+            vec![Message::user_text("Urgent: stop the deploy.")]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn wait(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + std::marker::Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+async fn urgent_news_between_calls_stops_the_rest_of_the_batch() {
+    let mut w = world();
+    let provider = ScriptedProvider::new()
+        .then_calls(
+            "",
+            vec![
+                ("message_send", json!({"to": "dm", "text": "Deploying."})),
+                ("sleep", json!({"minutes": 60})),
+            ],
+        )
+        .then_calls("", vec![("sleep", json!({"minutes": 30}))]);
+    // Looks: before the first model call, before each tool call.
+    let mut news = NewsAt { looks: 0, at: 3 };
+
+    let outcome = harness_loop::run_wake_interruptible(
+        &provider,
+        &mut w.executor,
+        &assembler(),
+        &profile(ToolCallStyle::Parallel),
+        &mut w.transcript,
+        Message::user_text("Wake."),
+        WakeLimits::default(),
+        &mut NoCheckpoint,
+        &mut news,
+    )
+    .await
+    .unwrap();
+
+    let batch = results(&w.transcript[2]);
+    assert_eq!(batch[0].content, "sent");
+    assert!(batch[1].content.starts_with("not run: urgent news"));
+    assert_eq!(
+        w.transcript[3],
+        Message::user_text("Urgent: stop the deploy.")
+    );
+    // It didn't sleep on the stale call; it decided again.
+    assert_eq!(outcome.turns, 2);
+    assert!(matches!(outcome.end, WakeEnd::Slept { .. }));
+    assert_eq!(provider.remaining(), 0);
+}

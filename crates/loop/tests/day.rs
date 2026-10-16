@@ -351,3 +351,108 @@ async fn a_provider_without_usage_still_grows_the_day() {
     let day = r.store.current_day().unwrap().unwrap();
     assert!(day.context_tokens >= 5_000, "{}", day.context_tokens);
 }
+
+struct Say;
+
+#[async_trait::async_trait]
+impl Tool for Say {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "say".into(),
+            description: String::new(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    fn effects(&self, _args: &serde_json::Value) -> Result<Vec<Effect>, ToolError> {
+        Ok(vec![Effect::SendMessage {
+            conversation: "#general".into(),
+        }])
+    }
+
+    async fn run(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("said"))
+    }
+}
+
+#[tokio::test]
+async fn a_tripped_breaker_is_saved_with_the_trip() {
+    let mut r = rig();
+    let mut policy = Policy::conservative(r._dir.path());
+    policy.breakers.messages_per_hour = 0;
+    r.executor = PolicyExecutor::new(policy, r.clock.clone()).with_tool(Say);
+    let provider = ScriptedProvider::new().then_calls("", vec![("say", json!({}))]);
+
+    let outcome = r.wake(&provider, "wake").await.unwrap();
+
+    assert!(matches!(outcome.end, WakeEnd::Paused { .. }));
+    assert_eq!(
+        r.store.rhythm_state().unwrap().paused.as_deref(),
+        Some("messages_per_hour")
+    );
+}
+
+/// Records which saves carried a pause.
+#[derive(Default)]
+struct Saves {
+    paused: Vec<(usize, String)>,
+}
+
+impl harness_loop::Checkpoint for Saves {
+    fn save(
+        &mut self,
+        _: &[Message],
+        _: Option<&Message>,
+        _: &harness_loop::Progress,
+    ) -> Result<(), harness_loop::CheckpointError> {
+        Ok(())
+    }
+
+    fn save_paused(
+        &mut self,
+        transcript: &[Message],
+        _: &harness_loop::Progress,
+        breaker: &str,
+    ) -> Result<(), harness_loop::CheckpointError> {
+        self.paused.push((transcript.len(), breaker.into()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn the_trip_and_the_pause_are_one_save() {
+    let r = rig();
+    let mut policy = Policy::conservative(r._dir.path());
+    policy.breakers.messages_per_hour = 0;
+    let mut executor = PolicyExecutor::new(policy, r.clock.clone()).with_tool(Say);
+    let provider = ScriptedProvider::new().then_calls("", vec![("say", json!({}))]);
+    let mut transcript = Vec::new();
+    let mut saves = Saves::default();
+
+    harness_loop::run_wake(
+        &provider,
+        &mut executor,
+        &assembler(),
+        &profile(),
+        &mut transcript,
+        Message::user_text("wake"),
+        WakeLimits::default(),
+        &mut saves,
+    )
+    .await
+    .unwrap();
+
+    // The save that carries the pause is the one with the blocked result.
+    assert_eq!(
+        saves.paused,
+        vec![(transcript.len(), "messages_per_hour".to_string())]
+    );
+    let ContentBlock::ToolResult(result) = &transcript.last().unwrap().content[0] else {
+        panic!("the last message holds the call's result");
+    };
+    assert!(result.content.starts_with("blocked: breaker"));
+}

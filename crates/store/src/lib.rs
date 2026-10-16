@@ -253,6 +253,43 @@ impl Store {
         wake: &WakeRecord,
         context_tokens: u64,
     ) -> Result<()> {
+        self.save_wake_tx(wake_id, from, messages, pending, wake, context_tokens, None)
+    }
+
+    /// Like [`Store::save_wake`], for the save that records a breaker
+    /// tripping: the pause is saved in the same transaction, so no crash can
+    /// keep the record of the trip and lose the pause.
+    pub fn save_wake_paused(
+        &mut self,
+        wake_id: i64,
+        from: usize,
+        messages: &[Message],
+        wake: &WakeRecord,
+        context_tokens: u64,
+        breaker: &str,
+    ) -> Result<()> {
+        self.save_wake_tx(
+            wake_id,
+            from,
+            messages,
+            None,
+            wake,
+            context_tokens,
+            Some(breaker),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_wake_tx(
+        &mut self,
+        wake_id: i64,
+        from: usize,
+        messages: &[Message],
+        pending: Option<&Message>,
+        wake: &WakeRecord,
+        context_tokens: u64,
+        paused: Option<&str>,
+    ) -> Result<()> {
         let from_sql = i64::try_from(from)
             .map_err(|_| StoreError::Corrupt("transcript position is too large".into()))?;
         let usage = usage_to_sql(&wake.usage);
@@ -306,6 +343,13 @@ impl Store {
             "UPDATE days SET context_tokens = MAX(context_tokens, ?2) WHERE id = ?1",
             params![wake.day_id, context_tokens],
         )?;
+        if let Some(breaker) = paused {
+            tx.execute(
+                "INSERT INTO rhythm (id, paused) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET paused = excluded.paused",
+                params![breaker],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }

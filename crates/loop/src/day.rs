@@ -9,8 +9,8 @@ use harness_tools::PolicyExecutor;
 
 use crate::context::ContextAssembler;
 use crate::wake::{
-    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeLimits,
-    WakeOutcome, run_wake_interruptible,
+    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeEnd,
+    WakeLimits, WakeOutcome, run_wake_interruptible,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -111,7 +111,14 @@ impl Workday<'_> {
             Err(err) => ("error", *err.progress()),
         };
         saver.record.end = end.into();
-        saver.write(&transcript, None, &progress)?;
+        let paused = match &result {
+            Ok(WakeOutcome {
+                end: WakeEnd::Paused { breaker },
+                ..
+            }) => Some(breaker.as_str()),
+            _ => None,
+        };
+        saver.write(&transcript, None, &progress, paused)?;
         Ok(result?)
     }
 }
@@ -133,20 +140,31 @@ impl Saver<'_> {
         transcript: &[Message],
         pending: Option<&Message>,
         progress: &Progress,
+        paused: Option<&str>,
     ) -> Result<(), StoreError> {
         self.record.ended_at = self.clock.now();
         self.record.turns = progress.turns as u32;
         self.record.usage = progress.usage;
         self.record.cost_usd = progress.cost_usd;
         // Starting at `saved` replaces the last pending message, if any.
-        self.store.save_wake_with_pending(
-            self.wake_id,
-            self.saved,
-            &transcript[self.saved..],
-            pending,
-            &self.record,
-            progress.context_tokens,
-        )?;
+        match paused {
+            Some(breaker) => self.store.save_wake_paused(
+                self.wake_id,
+                self.saved,
+                &transcript[self.saved..],
+                &self.record,
+                progress.context_tokens,
+                breaker,
+            )?,
+            None => self.store.save_wake_with_pending(
+                self.wake_id,
+                self.saved,
+                &transcript[self.saved..],
+                pending,
+                &self.record,
+                progress.context_tokens,
+            )?,
+        }
         self.saved = transcript.len();
         Ok(())
     }
@@ -159,6 +177,15 @@ impl Checkpoint for Saver<'_> {
         pending: Option<&Message>,
         progress: &Progress,
     ) -> Result<(), CheckpointError> {
-        Ok(self.write(transcript, pending, progress)?)
+        Ok(self.write(transcript, pending, progress, None)?)
+    }
+
+    fn save_paused(
+        &mut self,
+        transcript: &[Message],
+        progress: &Progress,
+        breaker: &str,
+    ) -> Result<(), CheckpointError> {
+        Ok(self.write(transcript, None, progress, Some(breaker))?)
     }
 }

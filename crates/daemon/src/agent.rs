@@ -264,11 +264,9 @@ impl Agent {
         self.store.set_next_look(self.rhythm.next_look())?;
         match after {
             AfterWake::Slept => eprintln!("wake {summary}; next look {}", self.rhythm.next_look()),
-            AfterWake::Paused { breaker } => {
-                // Saved, so a restart doesn't lift it.
-                self.store.set_paused(Some(&breaker))?;
-                eprintln!("wake {summary}; paused by {breaker}");
-            }
+            // The wake saved the pause along with the trip, so a restart
+            // doesn't lift it.
+            AfterWake::Paused { breaker } => eprintln!("wake {summary}; paused by {breaker}"),
             AfterWake::Fallback { problem } => eprintln!(
                 "wake {summary}: {problem}; next look {}",
                 self.rhythm.next_look()
