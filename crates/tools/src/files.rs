@@ -8,7 +8,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use harness_providers::ToolSpec;
@@ -47,7 +47,10 @@ const MATCH_CHARS: usize = 300;
 
 /// The work-area tools, judged by `policy`, which should be the executor's.
 pub fn tools(policy: Policy) -> Vec<Box<dyn Tool>> {
-    let area = Arc::new(Area { named: policy });
+    let area = Arc::new(Area {
+        named: policy,
+        real_root: OnceLock::new(),
+    });
     vec![
         Box::new(ReadFile(area.clone())),
         Box::new(SearchFiles(area)),
@@ -60,17 +63,27 @@ pub fn tools(policy: Policy) -> Vec<Box<dyn Tool>> {
 /// in case the work area itself is reached through a link.
 struct Area {
     named: Policy,
+    /// The root's real path, found once. Not at startup, since the work
+    /// area may not exist yet when the tools are made, and never again, so
+    /// a link on the way to it that's pointed elsewhere later can't move
+    /// the work area with it.
+    real_root: OnceLock<PathBuf>,
 }
 
 impl Area {
-    /// The walls with the root where it really is now. Found on each call,
-    /// since the work area may not exist yet when the tools are made.
+    /// The walls with the root where it really is.
     fn real(&self) -> Result<Policy, ToolError> {
+        let root = match self.real_root.get() {
+            Some(root) => root.clone(),
+            None => {
+                let root = self.named.root.canonicalize().map_err(|e| {
+                    ToolError::Failed(format!("couldn't find the work area: {}", e.kind()))
+                })?;
+                self.real_root.get_or_init(|| root).clone()
+            }
+        };
         let mut real = self.named.clone();
-        real.root = real
-            .root
-            .canonicalize()
-            .map_err(|e| ToolError::Failed(format!("couldn't find the work area: {}", e.kind())))?;
+        real.root = root;
         Ok(real)
     }
 }
@@ -279,6 +292,7 @@ fn open_regular(path: &Path) -> std::io::Result<File> {
         return Err(std::io::Error::other("it isn't a regular file"));
     }
     let file = options.open(path)?;
+    check_opened(&file, path)?;
     let meta = file.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::other("it isn't a regular file"));
@@ -293,6 +307,47 @@ fn open_regular(path: &Path) -> std::io::Result<File> {
         }
     }
     Ok(file)
+}
+
+/// Opens a folder at `path`, a real path the walls have judged, and a path
+/// that lists it. On Linux the listing goes through the open folder itself,
+/// so swapping the folder for a link afterwards changes nothing.
+fn open_dir(path: &Path) -> std::io::Result<(File, PathBuf)> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    let dir = options.open(path)?;
+    check_opened(&dir, path)?;
+    #[cfg(target_os = "linux")]
+    let listing = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let listing = path.to_path_buf();
+    Ok((dir, listing))
+}
+
+/// Refuses an open that ended up somewhere other than `expected`. The
+/// walls judged a path; a folder on the way to it could have been swapped
+/// for a link before the open, which `O_NOFOLLOW` doesn't catch. The kernel
+/// says where the open really landed.
+fn check_opened(file: &File, expected: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let at = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        if at != expected {
+            return Err(std::io::Error::other("it moved while it was being opened"));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, expected);
+    Ok(())
 }
 
 /// The file's start, if it looks like text, and a reader for all of it.
@@ -410,12 +465,13 @@ fn read(
 }
 
 fn list(policy: &Policy, dir: &Path, name: &str) -> Result<ToolOutput, ToolError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| ToolError::Failed(format!("couldn't list {name}: {}", e.kind())))?;
+    let failed = |e: std::io::Error| ToolError::Failed(format!("couldn't list {name}: {e}"));
+    let (_open, listing) = open_dir(dir).map_err(failed)?;
+    let entries = std::fs::read_dir(listing).map_err(failed)?;
     let mut names = Vec::new();
     let mut hidden = 0;
     for entry in entries.flatten() {
-        let path = entry.path();
+        let path = dir.join(entry.file_name());
         if readable(policy, &path).is_err() {
             hidden += 1;
             continue;
@@ -431,12 +487,17 @@ fn list(policy: &Policy, dir: &Path, name: &str) -> Result<ToolOutput, ToolError
     names.sort();
     let total = names.len();
     let mut out = format!("{name}/\n");
-    for entry in names.iter().take(MAX_ENTRIES) {
+    let mut listed = 0;
+    for entry in &names {
+        if listed == MAX_ENTRIES || out.len() + entry.len() + 1 > MAX_CHARS {
+            break;
+        }
         out.push_str(entry);
         out.push('\n');
+        listed += 1;
     }
-    if total > MAX_ENTRIES {
-        out.push_str(&format!("(and {} more)\n", total - MAX_ENTRIES));
+    if total > listed {
+        out.push_str(&format!("(and {} more)\n", total - listed));
     }
     if total == 0 {
         out.push_str("(empty)\n");
@@ -477,14 +538,17 @@ fn search(
     if meta.is_dir() {
         let mut folders = vec![real];
         while let Some(dir) = folders.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
+            let Ok((_open, listing)) = open_dir(&dir) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(listing) else {
                 continue;
             };
             let mut entries: Vec<_> = entries.flatten().collect();
             entries.sort_by_key(|entry| entry.file_name());
             let mut inner = Vec::new();
             for entry in entries {
-                let path = entry.path();
+                let path = dir.join(entry.file_name());
                 let Ok(kind) = entry.file_type() else {
                     continue;
                 };
@@ -767,6 +831,72 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_work_area_stays_where_it_was_first_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, second) = (tmp.path().join("first"), tmp.path().join("second"));
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(first.join("notes.txt"), "mine\n").unwrap();
+        std::fs::write(second.join("notes.txt"), "someone else's\n").unwrap();
+        let link = tmp.path().join("work");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let policy = Policy::conservative(&link);
+        let mut executor =
+            PolicyExecutor::new(policy.clone(), Arc::new(FakeClock::at_default_start()));
+        for tool in tools(policy) {
+            executor.register(tool);
+        }
+        let call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            arguments: json!({"path": "notes.txt"}),
+        };
+        assert_eq!(
+            executor.execute(&call).await,
+            ExecOutcome::Ran(ToolOutput::text("     1\tmine\n"))
+        );
+        // The link is pointed elsewhere; the work area doesn't follow it.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&second, &link).unwrap();
+        let outcome = executor.execute(&call).await;
+        assert!(
+            matches!(&outcome, ExecOutcome::Failed(why) if why.contains("outside")),
+            "{outcome:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_open_that_lands_elsewhere_is_refused() {
+        // As if a checked folder were swapped for a link before the open:
+        // the path judged isn't where the file really is.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("notes.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("swapped")).unwrap();
+        let judged = tmp.path().join("swapped/notes.txt");
+        let error = open_regular(&judged).unwrap_err();
+        assert!(error.to_string().contains("moved"), "{error}");
+        assert!(open_regular(&real.join("notes.txt")).is_ok());
+        assert!(open_dir(&tmp.path().join("swapped")).is_err());
+        assert!(open_dir(&real).is_ok());
+    }
+
+    #[tokio::test]
+    async fn listings_keep_to_the_character_cap() {
+        let mut f = fixture();
+        for i in 0..400 {
+            f.write(&format!("{i:03}{}", "n".repeat(200)), "");
+        }
+        let listing = f.text("read_file", json!({"path": "."})).await;
+        assert!(listing.len() <= MAX_CHARS + 100, "{}", listing.len());
+        let shown = listing.lines().filter(|l| l.ends_with('n')).count();
+        assert!(listing.ends_with(&format!("(and {} more)\n", 400 - shown)));
     }
 
     #[tokio::test]
