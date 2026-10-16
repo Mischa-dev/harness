@@ -173,7 +173,11 @@ fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
         ))
     };
     let url = reqwest::Url::parse(upstream).map_err(|_| invalid())?;
-    if url.query().is_some() || url.fragment().is_some() || !url.username().is_empty() {
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(invalid());
     }
     let local = matches!(
@@ -191,21 +195,32 @@ fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
 
 struct Proxy {
     routes: Vec<Route>,
-    client: reqwest::Client,
+    /// For HTTPS upstreams. It may go through the system's proxy, which
+    /// sees only an encrypted tunnel.
+    remote: reqwest::Client,
+    /// For plain-HTTP upstreams on this machine. Never through a proxy,
+    /// which would see the key in the clear.
+    local: reqwest::Client,
 }
 
 /// The proxy's HTTP routes. `timeout` bounds one upstream call, and should
 /// allow for a slow model's whole answer.
 pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::Error> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        // A redirect would carry the key to wherever it points.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let builder = || {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            // A redirect would carry the key to wherever it points.
+            .redirect(reqwest::redirect::Policy::none())
+    };
+    let proxy = Proxy {
+        routes,
+        remote: builder().build()?,
+        local: builder().no_proxy().build()?,
+    };
     Ok(Router::new()
         .fallback(any(forward))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(Arc::new(Proxy { routes, client })))
+        .with_state(Arc::new(proxy)))
 }
 
 async fn forward(
@@ -240,8 +255,12 @@ async fn forward(
     let (auth_name, auth_value) = route.auth_header();
     outgoing.insert(auth_name, auth_value);
 
-    let sent = proxy
-        .client
+    let client = if url.scheme() == "https" {
+        &proxy.remote
+    } else {
+        &proxy.local
+    };
+    let sent = client
         .request(method, url)
         .headers(outgoing)
         .body(body)
@@ -340,6 +359,7 @@ mod tests {
             "http://127.0.0.2",
             "ftp://example.com",
             "https://user@example.com",
+            "https://:secret@example.com",
             "https://example.com/?a=b",
             "not a url",
         ] {

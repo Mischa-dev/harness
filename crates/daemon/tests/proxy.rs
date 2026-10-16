@@ -229,6 +229,59 @@ impl futures_core::Stream for FirstChunkThenNothing {
     }
 }
 
+/// Runs `local_upstreams_skip_the_system_proxy_inner` in a child process
+/// whose `HTTP_PROXY` and `ALL_PROXY` point at a listener here, since
+/// changing this process's environment would race the other tests. Any
+/// connection to that listener means a key went through the proxy.
+#[test]
+fn local_upstreams_skip_the_system_proxy() {
+    let snoop = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    snoop.set_nonblocking(true).unwrap();
+    let proxy_url = format!("http://{}", snoop.local_addr().unwrap());
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "local_upstreams_skip_the_system_proxy_inner",
+            "--ignored",
+        ])
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        snoop.accept().is_err(),
+        "the call went through the system proxy"
+    );
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+#[ignore = "run by local_upstreams_skip_the_system_proxy"]
+async fn local_upstreams_skip_the_system_proxy_inner() {
+    let (proxy, log) = setup().await;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(format!("http://{proxy}/anthropic/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(log.lock().unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn redirects_go_back_to_the_caller_without_the_key() {
     let (proxy, log) = setup().await;
