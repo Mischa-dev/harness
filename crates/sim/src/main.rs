@@ -1,9 +1,12 @@
-//! `sim run <scenario> --provider fake`: run a scenario and print its report.
+//! `sim run <scenario> --provider fake`: run a scenario, with the fake
+//! teammate and the fake wake filter, and print its report.
 //! Exits non-zero when a check fails.
 
 use std::process::ExitCode;
 
-use sim::{FakeTeammate, Scenario, fake_profile, find_scenario, run, scenarios_dir};
+use sim::{
+    FakeFilter, FakeTeammate, Helper, Scenario, fake_profile, find_scenario, run, scenarios_dir,
+};
 
 const USAGE: &str = "usage: sim run <scenario> --provider fake
        sim list";
@@ -84,7 +87,21 @@ async fn run_fake(name: &str) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&scenario, &FakeTeammate::default(), &fake_profile(), "fake").await {
+    let profile = fake_profile();
+    let filter = Helper {
+        provider: &FakeFilter,
+        profile: &profile,
+        profile_name: "fake",
+    };
+    match run(
+        &scenario,
+        &FakeTeammate::default(),
+        &profile,
+        "fake",
+        Some(filter),
+    )
+    .await
+    {
         Ok(report) => {
             print!("{report}");
             if report.passed() {

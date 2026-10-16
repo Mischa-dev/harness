@@ -89,6 +89,76 @@ fn addressed_conversations(request: &ModelRequest) -> Vec<String> {
     found
 }
 
+/// The fake wake filter: wakes the agent for news that sounds like
+/// something broke, and otherwise drops what isn't a question. Like the fake
+/// teammate, it tests the plumbing, not judgment.
+#[derive(Debug, Default)]
+pub struct FakeFilter;
+
+/// Words that make the fake filter wake the agent.
+const ALARMS: &[&str] = &["urgent", "outage", "is down", "broken"];
+
+#[async_trait]
+impl Provider for FakeFilter {
+    async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ProviderError> {
+        let events = filter_events(request);
+        let alarm = events.iter().find(|(_, text)| {
+            let text = text.to_lowercase();
+            ALARMS.iter().any(|word| text.contains(word))
+        });
+        let answer = match alarm {
+            Some((id, _)) => {
+                json!({"decision": "wake_now", "reason": format!("{id} sounds like something broke")})
+            }
+            None => json!({
+                "decision": "drop",
+                "keep": events
+                    .iter()
+                    .filter(|(_, text)| text.contains('?'))
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+            }),
+        };
+        Ok(ModelResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: answer.to_string(),
+                }],
+            },
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: serde_json::to_string(request).map_or(0, |s| s.len() / 4) as u64,
+                output_tokens: 20,
+                ..Usage::default()
+            },
+        })
+    }
+}
+
+/// The `e1: "text"` lines of a filter request, decoded.
+fn filter_events(request: &ModelRequest) -> Vec<(String, String)> {
+    let Some(ContentBlock::Text { text }) = request.messages.last().and_then(|m| m.content.first())
+    else {
+        return vec![];
+    };
+    let Some(section) = text
+        .split_once("<events>\n")
+        .and_then(|(_, rest)| rest.split_once("\n</events>"))
+        .map(|(events, _)| events)
+    else {
+        return vec![];
+    };
+    section
+        .lines()
+        .filter_map(|line| {
+            let (id, quoted) = line.split_once(": ")?;
+            let text = serde_json::from_str::<String>(quoted).ok()?;
+            Some((id.to_string(), text))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +187,7 @@ mod tests {
             from: "Sam".into(),
             text: text.into(),
             addressed,
+            wake_within: None,
         };
         let events = [
             event("#general", "Sam, to you: not really", false),
@@ -126,5 +197,26 @@ mod tests {
         let refs: Vec<_> = events.iter().collect();
         let text = wake_message(at, &WakeReason::NextLook, &refs);
         assert_eq!(addressed_conversations(&request(text)), ["dm"]);
+    }
+
+    #[tokio::test]
+    async fn the_fake_filter_wakes_for_alarms_and_keeps_questions() {
+        use harness_loop::filter::{FilterAgent, FilterInput, look};
+        let input = |events: &[&str]| FilterInput {
+            agent: FilterAgent::default(),
+            watching_for: None,
+            next_look: datetime!(2026-01-05 17:00 UTC),
+            events: events.iter().map(|e| e.to_string()).collect(),
+            replies: vec![],
+        };
+        let quiet = input(&["[#general] Sam: lunch?", "[#general] Jo: done"]);
+        let (decision, _) = look(&FakeFilter, &quiet, "fake", "").await.unwrap();
+        assert!(!decision.wake_now);
+        assert_eq!(decision.keep, vec![0]);
+
+        let loud = input(&["[#general] Jo: done", "[#ops] Eve: the API is down"]);
+        let (decision, _) = look(&FakeFilter, &loud, "fake", "").await.unwrap();
+        assert!(decision.wake_now);
+        assert_eq!(decision.reason, "e2 sounds like something broke");
     }
 }

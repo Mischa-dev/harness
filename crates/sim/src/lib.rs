@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 
 use harness_providers::{CachingStyle, CapabilityProfile, Pricing, ToolCallStyle};
 
-pub use fake::FakeTeammate;
-pub use report::{Check, Report};
-pub use runner::{RunError, run};
+pub use fake::{FakeFilter, FakeTeammate};
+pub use report::{Check, FilterStats, Report};
+pub use runner::{Helper, RunError, run};
 pub use scenario::{Scenario, ScenarioError};
 
 /// Where the bundled scenarios live.

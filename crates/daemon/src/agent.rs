@@ -25,7 +25,7 @@ use harness_tools::sleep::MIN_SLEEP;
 use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, Schedule, SleepTool};
 use harness_workspace::{Shadow, Workspace};
 
-use crate::state::StateFacts;
+use harness_loop::state::{Budget, StateFacts, WorkspaceCounts};
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -666,7 +666,7 @@ impl Agent {
                 )
                 .await
                 {
-                    Ok(Ok(counts)) => Ok(counts),
+                    Ok(Ok(counts)) => Ok(workspace_counts(counts)),
                     Ok(Err(e)) => Err(e.to_string()),
                     Err(_) => Err("it took too long".into()),
                 },
@@ -676,7 +676,7 @@ impl Agent {
             Some(day) => self.store.wakes_since(day.started_at)?.len(),
             None => 0,
         };
-        let budget = crate::state::Budget {
+        let budget = Budget {
             limit_usd: self.breakers.spend_per_day_usd,
             roles: self.store.spend_by_role(self.local_midnight(at))?,
         };
@@ -699,6 +699,18 @@ impl Agent {
     }
 }
 
+fn workspace_counts(counts: harness_workspace::BriefingCounts) -> WorkspaceCounts {
+    WorkspaceCounts {
+        reply_requests: counts.reply_requests,
+        required: counts.required,
+        mentions: counts.mentions,
+        unread: counts.unread,
+        tasks: counts.tasks,
+        claims: counts.claims,
+        thread_updates: counts.thread_updates,
+    }
+}
+
 /// The rhythm saved before a restart. A look already past is due now; with
 /// none saved, the first look comes a few minutes after startup.
 pub fn restore_rhythm(
@@ -716,7 +728,7 @@ pub fn spend(config: &AgentConfig, now: OffsetDateTime) -> Result<String, AgentE
     let offset = UtcOffset::from_hms(config.utc_offset_hours, 0, 0)
         .map_err(|_| AgentError::Invalid("utc_offset_hours is out of range".into()))?;
     let store = Store::open(&config.state_dir.join(STORE_FILE))?;
-    Ok(crate::state::spend_report(
+    Ok(harness_loop::state::spend_report(
         &store,
         now,
         offset,

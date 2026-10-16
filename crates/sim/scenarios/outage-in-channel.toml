@@ -1,0 +1,45 @@
+name = "outage-in-channel"
+summary = """
+A quiet morning, then someone in #ops says the API is down, without
+mentioning the agent. Nobody asked it anything, but an outage can't wait for
+its next look hours later: it should be awake within half an hour. The
+chatter before and after shouldn't wake it.
+"""
+agent = "Mara"
+start = "2026-01-07T08:00:00Z"
+length = "1d"
+
+[[event]]
+at = "20m"
+conversation = "#general"
+from = "Sam"
+text = "Morning all. Coffee machine on 3 is fixed."
+
+[[event]]
+at = "45m"
+conversation = "#general"
+from = "Priya"
+text = "Anyone up for the design review at 2?"
+
+[[event]]
+at = "2h10m"
+conversation = "#ops"
+from = "Jo"
+text = "The public API is down, every request is a 502. Looking at the load balancer."
+wake_within = "30m"
+
+[[event]]
+at = "2h25m"
+conversation = "#ops"
+from = "Jo"
+text = "Rolled back the config change, 200s again."
+
+[[event]]
+at = "5h"
+conversation = "#general"
+from = "Sam"
+text = "Lunch order going in at 12:30."
+
+[expect]
+max_messages = 0
+max_wakes = 6

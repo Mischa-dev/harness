@@ -8,13 +8,18 @@
 //! waiting events, and pass optional replies (which posts nothing). It can't
 //! act otherwise, and an answer that can't be read changes nothing.
 
+use harness_core::WakeReason;
 use harness_providers::{ContentBlock, Message, ModelRequest, Provider, ProviderError, Usage};
+use harness_store::{Store, StoreError};
 use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::charter;
+
+/// Batches news: the filter looks at most this often.
+pub const FILTER_GAP: time::Duration = time::Duration::minutes(2);
 
 /// Enough for the answer's JSON, even with many replies.
 const MAX_OUTPUT_TOKENS: u32 = 1024;
@@ -72,6 +77,54 @@ impl FilterDecision {
             pass: vec![],
         }
     }
+}
+
+impl FilterDecision {
+    /// Keeps the waiting events the filter kept, in order. `waiting` is
+    /// what [`FilterInput::events`] was made from.
+    pub fn keep_only<T>(&self, waiting: &mut Vec<T>) {
+        let mut index = 0;
+        waiting.retain(|_| {
+            let kept = self.keep.contains(&index);
+            index += 1;
+            kept
+        });
+    }
+
+    /// Why the agent woke, when the filter woke it.
+    pub fn wake_reason(&self) -> WakeReason {
+        let reason = if self.reason.is_empty() {
+            "the wake filter thought what's waiting is worth a look now".to_string()
+        } else {
+            format!(
+                "the wake filter thought this worth a look now: {}",
+                self.reason
+            )
+        };
+        WakeReason::Filter { reason }
+    }
+}
+
+/// What the agent said it's watching for when it last went to sleep today.
+pub fn watching_for(store: &Store) -> Result<Option<String>, StoreError> {
+    let Some(day) = store.current_day()? else {
+        return Ok(None);
+    };
+    let transcript = store.transcript(day.id)?;
+    Ok(transcript
+        .iter()
+        .rev()
+        .flat_map(|m| m.content.iter().rev())
+        .find_map(|block| match block {
+            ContentBlock::ToolCall(call) if call.name == "sleep" => Some(
+                call.arguments
+                    .get("watching_for")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            ),
+            _ => None,
+        })
+        .flatten())
 }
 
 /// The filter's instructions, filled in for this agent.

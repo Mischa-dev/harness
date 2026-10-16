@@ -26,6 +26,18 @@ pub struct Report {
     pub cost_usd: f64,
     pub sent: Vec<Sent>,
     pub checks: Vec<Check>,
+    /// What the wake filter did, when the run had one.
+    pub filter: Option<FilterStats>,
+}
+
+/// What the wake filter did in a run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FilterStats {
+    pub looks: usize,
+    pub early_wakes: usize,
+    /// Events it dropped, so the agent never saw them.
+    pub dropped: usize,
+    pub cost_usd: f64,
 }
 
 impl Report {
@@ -103,6 +115,40 @@ impl Report {
                 errors.join("; ")
             },
         );
+        // News that can't wait: some wake starts within its window.
+        let urgent: Vec<_> = scenario
+            .events
+            .iter()
+            .filter_map(|e| e.wake_within.map(|within| (e, within)))
+            .collect();
+        if !urgent.is_empty() {
+            let missed: Vec<String> = urgent
+                .iter()
+                .filter(|(e, within)| {
+                    !wakes
+                        .iter()
+                        .any(|w| w.started_at >= e.at && w.started_at <= e.at + *within)
+                })
+                .map(|(e, within)| {
+                    format!(
+                        "{} in {} at {} (within {}m)",
+                        e.from,
+                        e.conversation,
+                        stamp(e.at),
+                        within.whole_minutes()
+                    )
+                })
+                .collect();
+            check(
+                "wakes for what can't wait",
+                missed.is_empty(),
+                if missed.is_empty() {
+                    format!("awake in time for {}", count(urgent.len(), "urgent event"))
+                } else {
+                    format!("not awake in time for: {}", missed.join("; "))
+                },
+            );
+        }
         if let Some(max) = scenario.expect.max_messages {
             check(
                 "stays quiet",
@@ -133,6 +179,7 @@ impl Report {
             days,
             sent,
             checks,
+            filter: None,
         }
     }
 
@@ -159,6 +206,16 @@ impl fmt::Display for Report {
             count(self.sent.len(), "message"),
             self.cost_usd
         )?;
+        if let Some(filter) = &self.filter {
+            writeln!(
+                f,
+                "  wake filter: {}, {}, {} dropped, ${:.4}",
+                count(filter.looks, "look"),
+                count(filter.early_wakes, "early wake"),
+                count(filter.dropped, "event"),
+                filter.cost_usd
+            )?;
+        }
         for c in &self.checks {
             writeln!(
                 f,
@@ -210,6 +267,7 @@ mod tests {
             from: from.into(),
             text: "question".into(),
             addressed: true,
+            wake_within: None,
         }
     }
 
