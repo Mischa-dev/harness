@@ -140,9 +140,15 @@ async fn replaces_any_key_the_caller_sends() {
 
 /// Sends a request line as written, without a client tidying the path.
 async fn raw_get(proxy: SocketAddr, path: &str) -> String {
+    raw_get_as(proxy, path, &proxy.to_string(), "").await
+}
+
+/// The same, naming `host` and adding `extra` header lines.
+async fn raw_get_as(proxy: SocketAddr, path: &str, host: &str, extra: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
-    let request = format!("GET {path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nhost: {host}\r\n{extra}connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
@@ -170,6 +176,47 @@ async fn unknown_routes_and_dot_dot_go_nowhere() {
         );
     }
     assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn web_pages_cannot_spend_the_key() {
+    let (proxy, log) = setup().await;
+    let port = proxy.port();
+    // A page posting across origins, as a form or fetch would.
+    let cross_origin = local_client()
+        .post(format!("http://{proxy}/anthropic/v1/messages"))
+        .header("origin", "https://evil.example")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), 403);
+    for (host, extra) in [
+        // A page that rebound its own name to 127.0.0.1.
+        (format!("evil.example:{port}"), ""),
+        (format!("localhost.evil.example:{port}"), ""),
+        (format!("evil.example@127.0.0.1:{port}"), ""),
+        // A browser's own request with no Origin, such as an image.
+        (
+            format!("127.0.0.1:{port}"),
+            "sec-fetch-site: cross-site\r\n",
+        ),
+        (format!("127.0.0.1:{port}"), "sec-fetch-mode: no-cors\r\n"),
+    ] {
+        let response = raw_get_as(proxy, "/anthropic/v1/models", &host, extra).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{host}: {response}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+
+    // The runtime's own calls, by any loopback name, still go through.
+    for host in [
+        format!("127.0.0.1:{port}"),
+        format!("localhost:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let response = raw_get_as(proxy, "/anthropic/v1/models", &host, "").await;
+        assert!(response.starts_with("HTTP/1.1 201"), "{host}: {response}");
+    }
 }
 
 #[tokio::test]

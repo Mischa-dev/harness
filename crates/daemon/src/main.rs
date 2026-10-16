@@ -32,13 +32,13 @@ async fn main() -> ExitCode {
 async fn run_proxy(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(path)?;
     let routes = config.proxy.load_routes()?;
-    let names: Vec<_> = routes.iter().map(|r| r.name.clone()).collect();
+    // A count, not the names: whatever the config holds stays out of logs.
+    let count = routes.len();
     let router = proxy::router(routes, UPSTREAM_TIMEOUT)?;
     let listener = tokio::net::TcpListener::bind(config.proxy.listen).await?;
     eprintln!(
-        "forwarding proxy on {} for {}",
-        listener.local_addr()?,
-        names.join(", ")
+        "forwarding proxy on {} with {count} route(s)",
+        listener.local_addr()?
     );
     axum::serve(listener, router)
         .with_graceful_shutdown(async {

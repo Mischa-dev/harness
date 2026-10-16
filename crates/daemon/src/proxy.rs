@@ -239,6 +239,28 @@ fn is_loopback(url: &reqwest::Url) -> bool {
     }
 }
 
+/// Whether a request comes from a program on this machine rather than a web
+/// page. A page can send simple requests to loopback, or rebind its own
+/// hostname to 127.0.0.1, and either would spend the route's key. Browsers
+/// mark their requests with `Origin` or `Sec-Fetch-*`, which the runtime
+/// never sends, and a rebound page still names its own host in `Host`.
+fn from_a_local_program(headers: &HeaderMap) -> bool {
+    let from_a_browser = headers.contains_key(header::ORIGIN)
+        || headers
+            .keys()
+            .any(|name| name.as_str().starts_with("sec-fetch-"));
+    if from_a_browser {
+        return false;
+    }
+    let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else {
+        return false;
+    };
+    if host.contains(['@', '/', '\\', '?', '#']) {
+        return false;
+    }
+    reqwest::Url::parse(&format!("http://{host}/")).is_ok_and(|url| is_loopback(&url))
+}
+
 async fn forward(
     State(proxy): State<Arc<Proxy>>,
     uri: Uri,
@@ -246,6 +268,9 @@ async fn forward(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if !from_a_local_program(&headers) {
+        return (StatusCode::FORBIDDEN, "only local programs may call\n").into_response();
+    }
     // The raw path, still percent-encoded, so nothing is decoded into a
     // different meaning on the way through.
     let path = uri.path().trim_start_matches('/');
