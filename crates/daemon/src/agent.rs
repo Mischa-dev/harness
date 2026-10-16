@@ -38,6 +38,9 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The store's file inside `state_dir`.
 const STORE_FILE: &str = "harness.sqlite3";
+/// The git repository that keeps the memory folder's history, inside
+/// `state_dir`, out of the agent's reach.
+const MEMORY_HISTORY: &str = "memory.git";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -166,13 +169,17 @@ impl Agent {
             .memory_dir
             .clone()
             .unwrap_or_else(|| config.workdir.join("memory"));
-        let memory =
-            Arc::new(
-                MemoryFiles::open(memory_dir, offset).map_err(|source| AgentError::Read {
-                    field: "memory_dir",
-                    source,
-                })?,
-            );
+        let memory = Arc::new(
+            MemoryFiles::open(
+                memory_dir,
+                Some(config.state_dir.join(MEMORY_HISTORY)),
+                offset,
+            )
+            .map_err(|source| AgentError::Read {
+                field: "memory_dir",
+                source,
+            })?,
+        );
         if !memory.has_history() {
             eprintln!("harness-daemon: git isn't available, so memory changes have no history");
         }

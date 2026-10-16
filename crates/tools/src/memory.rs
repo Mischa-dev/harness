@@ -1,8 +1,11 @@
 //! The agent's own memory: `MEMORY.md` (its capped index), `USER.md` (its
 //! owner and how they work), the handoff note for tomorrow, and a journal
-//! with one file per day. All Markdown in a folder that is also a git repo,
-//! so every change has history and can be undone (ARCHITECTURE.md,
-//! "Memory").
+//! with one file per day. All Markdown, with every change kept in git so it
+//! can be undone (ARCHITECTURE.md, "Memory").
+//!
+//! The git repository lives outside the folder, where the runtime keeps its
+//! state. Only the runtime writes its config, so nothing the agent can edit
+//! (a filter, a hook, an fsmonitor command) runs when a change is saved.
 //!
 //! The folder lives in the agent's work area, so the policy executor's
 //! path walls apply to every read and write like any other file. Files are
@@ -41,34 +44,57 @@ const MAX_READ_CHARS: usize = 40_000;
 #[derive(Debug)]
 pub struct MemoryFiles {
     dir: PathBuf,
+    /// Where `dir` really is, fixed when it's opened.
+    real: PathBuf,
+    /// The git repository that keeps the history, if there is one.
+    history: Option<PathBuf>,
     /// The owner's offset, so journal days match theirs.
     offset: UtcOffset,
-    /// Whether changes are committed to git.
-    history: bool,
     lock: Mutex<()>,
 }
 
 impl MemoryFiles {
-    /// Opens the folder, creating it and its git repo if needed. Without
+    /// Opens the folder, creating it if needed, with its history kept in
+    /// the git repository at `history`, which is created if needed. Without
     /// git on the machine the files still work, without history.
-    pub fn open(dir: impl Into<PathBuf>, offset: UtcOffset) -> std::io::Result<Self> {
+    ///
+    /// The folder itself can't be a symlink, so it can't lead somewhere
+    /// else.
+    pub fn open(
+        dir: impl Into<PathBuf>,
+        history: Option<PathBuf>,
+        offset: UtcOffset,
+    ) -> std::io::Result<Self> {
         let dir = dir.into();
+        if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(std::io::Error::other("the memory folder is a symlink"));
+        }
         std::fs::create_dir_all(dir.join("journal"))?;
-        // History only in the folder's own repo: a `.git` that is a link or
-        // a pointer file could aim git at some other repository.
-        let history = match std::fs::symlink_metadata(dir.join(".git")) {
+        let real = dir.canonicalize()?;
+        let history = history.filter(|git_dir| match std::fs::symlink_metadata(git_dir) {
             Ok(meta) => meta.is_dir(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                git(&dir, &["init", "--quiet"]).is_ok_and(|ok| ok)
+                git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok)
             }
             Err(_) => false,
-        };
+        });
         Ok(Self {
             dir,
-            offset,
+            real,
             history,
+            offset,
             lock: Mutex::new(()),
         })
+    }
+
+    /// The folder, as long as it's still where it was opened: a folder
+    /// swapped for a link since then is refused.
+    fn root(&self) -> std::io::Result<&Path> {
+        if self.real.canonicalize()? == self.real {
+            Ok(&self.real)
+        } else {
+            Err(std::io::Error::other("the memory folder has moved"))
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -77,16 +103,19 @@ impl MemoryFiles {
 
     /// Whether changes are kept in git.
     pub fn has_history(&self) -> bool {
-        self.history
+        self.history.is_some()
     }
 
     /// `MEMORY.md`, `USER.md` and the handoff note, for the start of a day.
     /// Each is held to its cap, even if it was edited outside the tools.
     pub fn snapshot(&self) -> String {
+        let root = self.root().ok();
         FILES
             .iter()
             .map(|(_, name, cap)| {
-                let text = read_capped(&self.dir.join(name), *cap).unwrap_or_default();
+                let text = root
+                    .and_then(|root| read_capped(&root.join(name), *cap).ok())
+                    .unwrap_or_default();
                 let text = text.trim();
                 format!(
                     "## {name}\n{}",
@@ -116,21 +145,28 @@ impl MemoryFiles {
         message: &str,
     ) -> Result<(), ToolError> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let path = self.dir.join(relative);
+        let failed = |e: std::io::Error| {
+            ToolError::Failed(format!("couldn't save {relative}: {}", e.kind()))
+        };
+        let root = self.root().map_err(failed)?;
+        let path = root.join(relative);
         let mut options = OpenOptions::new();
         if append {
             options.create(true).append(true);
         } else {
             options.create(true).write(true).truncate(true);
         }
-        let result =
-            open_file(&path, &mut options).and_then(|mut file| file.write_all(text.as_bytes()));
-        result.map_err(|e| ToolError::Failed(format!("couldn't save {relative}: {}", e.kind())))?;
+        open_file(&path, &mut options)
+            .and_then(|mut file| file.write_all(text.as_bytes()))
+            .map_err(failed)?;
         // A failed commit loses history, not the change, so it doesn't fail
         // the write.
-        if self.history && git(&self.dir, &["add", "--", relative]).is_ok_and(|ok| ok) {
+        if let Some(git_dir) = &self.history
+            && git(git_dir, root, &["add", "--", relative]).is_ok_and(|ok| ok)
+        {
             let _ = git(
-                &self.dir,
+                git_dir,
+                root,
                 &[
                     "-c",
                     "user.name=harness",
@@ -183,22 +219,55 @@ fn read_capped(path: &Path, limit: usize) -> std::io::Result<String> {
     })
 }
 
-/// Runs git in `dir` with an argument array; whether it succeeded. Hooks and
-/// the user's global config stay out of it.
-fn git(dir: &Path, args: &[&str]) -> std::io::Result<bool> {
+/// The last `limit` characters of the file, saying so if earlier ones were
+/// left out, or empty if it doesn't exist yet. For the journal, where the
+/// newest entries matter most.
+fn read_tail(path: &Path, limit: usize) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = match open_file(path, OpenOptions::new().read(true)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(limit as u64 * 4);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(limit as u64 * 4).read_to_end(&mut bytes)?;
+    // Start on a whole character.
+    let skip = bytes
+        .iter()
+        .take_while(|b| (0x80..0xC0).contains(*b))
+        .count();
+    let text = String::from_utf8_lossy(&bytes[skip..]);
+    let count = text.chars().count();
+    if start == 0 && count <= limit {
+        return Ok(text.into_owned());
+    }
+    let tail: String = text.chars().skip(count.saturating_sub(limit)).collect();
+    Ok(format!(
+        "[earlier entries left out; the last {limit} characters]\n{tail}"
+    ))
+}
+
+/// Runs git on the repository `git_dir` for the files in `work_tree`, with
+/// an argument array; whether it succeeded. Hooks, fsmonitor and the
+/// machine's global config stay out of it.
+fn git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> std::io::Result<bool> {
     Command::new("git")
         .arg("-C")
-        .arg(dir)
+        .arg(work_tree)
         .args([
             "-c",
             "core.hooksPath=/dev/null",
             "-c",
+            "core.fsmonitor=false",
+            "-c",
             "commit.gpgSign=false",
         ])
         .args(args)
-        // The folder's own repo, never one git finds by searching upward.
-        .env("GIT_DIR", dir.join(".git"))
-        .env("GIT_WORK_TREE", dir)
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", work_tree)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -275,8 +344,13 @@ impl Tool for MemoryRead {
 
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let path = self.path(args, Some(ctx.clock.now()))?;
-        let text = read_capped(&path, MAX_READ_CHARS)
-            .map_err(|e| ToolError::Failed(format!("couldn't read it: {}", e.kind())))?;
+        let journal = args.get("file").and_then(Value::as_str) == Some("journal");
+        let text = if journal {
+            read_tail(&path, MAX_READ_CHARS)
+        } else {
+            read_capped(&path, MAX_READ_CHARS)
+        }
+        .map_err(|e| ToolError::Failed(format!("couldn't read it: {}", e.kind())))?;
         if text.trim().is_empty() {
             return Ok(ToolOutput::text("(empty)"));
         }
@@ -421,7 +495,12 @@ mod tests {
 
     fn open() -> (tempfile::TempDir, Arc<MemoryFiles>) {
         let dir = tempfile::tempdir().unwrap();
-        let files = MemoryFiles::open(dir.path().join("memory"), offset!(-7)).unwrap();
+        let files = MemoryFiles::open(
+            dir.path().join("memory"),
+            Some(dir.path().join("memory.git")),
+            offset!(-7),
+        )
+        .unwrap();
         (dir, Arc::new(files))
     }
 
@@ -430,10 +509,10 @@ mod tests {
         tool.run(&args, &ToolContext { clock }).await
     }
 
-    fn commits(dir: &Path) -> usize {
+    fn commits(git_dir: &Path) -> usize {
         let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+            .arg("--git-dir")
+            .arg(git_dir)
             .args(["rev-list", "--count", "HEAD"])
             .output()
             .unwrap();
@@ -510,7 +589,7 @@ mod tests {
         assert!(snapshot.contains("## USER.md\nMischa, UTC-7."));
         assert!(snapshot.contains("## HANDOFF.md\n(empty)"));
         assert!(files.has_history(), "git keeps the history");
-        assert_eq!(commits(files.dir()), 3);
+        assert_eq!(commits(&files.dir().with_extension("git")), 3);
     }
 
     #[tokio::test]
@@ -615,7 +694,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn history_stays_in_the_folders_own_repo() {
+    async fn nothing_in_the_folder_steers_git() {
         let tmp = tempfile::tempdir().unwrap();
         let other = tmp.path().join("other");
         std::fs::create_dir(&other).unwrap();
@@ -628,12 +707,21 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        // A planted repo whose config runs a command on `git add`.
+        let ran = tmp.path().join("filter-ran");
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(other.join(".git/config"))
+            .unwrap();
+        writeln!(config, "[filter \"x\"]\n\tclean = touch {}", ran.display()).unwrap();
         let dir = tmp.path().join("memory");
         std::fs::create_dir(&dir).unwrap();
         std::os::unix::fs::symlink(other.join(".git"), dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=x\n").unwrap();
 
-        let files = Arc::new(MemoryFiles::open(&dir, offset!(-7)).unwrap());
-        assert!(!files.has_history());
+        let history = tmp.path().join("memory.git");
+        let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7)).unwrap();
+        let files = Arc::new(files);
         let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
         let write = tools(files).remove(1);
         run(
@@ -643,8 +731,57 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(commits(&other), 0, "the other repo is untouched");
-        assert!(!other.join(".git/index").exists());
+        assert_eq!(commits(&history), 1);
+        assert_eq!(
+            commits(&other.join(".git")),
+            0,
+            "the other repo is untouched"
+        );
+        assert!(!ran.exists(), "the planted filter never ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_cant_be_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("MEMORY.md"), "outside").unwrap();
+        let link = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(MemoryFiles::open(&link, None, offset!(-7)).is_err());
+
+        // Nor can it be swapped for one after it's opened.
+        let dir = tmp.path().join("memory");
+        let files = MemoryFiles::open(&dir, None, offset!(-7)).unwrap();
+        std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &dir).unwrap();
+        assert!(!files.snapshot().contains("outside"));
+        assert!(files.save("USER.md", "x", false, "x").is_err());
+        assert!(!outside.join("USER.md").exists());
+    }
+
+    #[tokio::test]
+    async fn a_long_journal_day_shows_its_newest_entries() {
+        let (_tmp, files) = open();
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let [read, _, journal] = <[Box<dyn Tool>; 3]>::try_from(tools(files.clone()))
+            .ok()
+            .unwrap();
+        for i in 0..20 {
+            let entry = format!("entry {i} {}", "é".repeat(3_000));
+            run(journal.as_ref(), json!({"entry": entry}), &clock)
+                .await
+                .unwrap();
+        }
+        let shown = run(read.as_ref(), json!({"file": "journal"}), &clock)
+            .await
+            .unwrap()
+            .content;
+        assert!(shown.starts_with("[earlier entries left out"));
+        assert!(shown.contains("entry 19 "));
+        assert!(!shown.contains("entry 0 "));
+        assert!(shown.chars().count() < MAX_READ_CHARS + 100);
     }
 
     #[test]
