@@ -596,3 +596,33 @@ fn memory_must_live_inside_the_work_area() {
     };
     assert!(err.to_string().contains("inside workdir"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_linked_workdir_still_holds_the_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-home");
+    std::fs::create_dir(&real).unwrap();
+    let linked = dir.path().join("home");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: linked,
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    if let Err(err) = Agent::from_config(&config, clock) {
+        panic!("{err}");
+    }
+    assert!(real.join("memory/journal").is_dir());
+}

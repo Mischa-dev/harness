@@ -179,10 +179,9 @@ impl Agent {
         })?;
         // The snapshot goes straight into every request, so the folder has
         // to be one the walls let the agent use anyway.
-        let walls = Policy::conservative(&workdir);
-        let inside = |dir: &Path| {
+        let inside = |root: &Path, dir: &Path| {
             matches!(
-                walls.check(&Effect::WritePath(dir.to_path_buf())),
+                Policy::conservative(root).check(&Effect::WritePath(dir.to_path_buf())),
                 Decision::Allow
             )
         };
@@ -192,7 +191,7 @@ impl Agent {
                 memory_dir.display()
             ))
         };
-        if !inside(&memory_dir) {
+        if !inside(&workdir, &memory_dir) {
             return Err(outside());
         }
         let memory = Arc::new(
@@ -207,7 +206,10 @@ impl Agent {
                 source,
             })?,
         );
-        if !inside(memory.location()) {
+        // Where it really is, against where workdir really is, in case
+        // workdir is reached through a link.
+        let real_workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
+        if !inside(&real_workdir, memory.location()) {
             return Err(outside());
         }
         if !memory.has_history() {
