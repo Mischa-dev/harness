@@ -98,3 +98,15 @@ bwrap = "/run/current-system/sw/bin/bwrap"
 # A profile name from profiles_file, and the proxy route for its provider.
 profile = "helper"
 model_url = "http://127.0.0.1:8787/anthropic"
+
+# Circuit breakers, set high on purpose: one tripping means something is
+# probably broken. The agent pauses until you run `harness-daemon resume`.
+# The values below are the defaults.
+[agent.breakers]
+messages_per_hour = 30
+wakes_per_hour = 30
+# Model spend in your day, the wake filter's included.
+spend_per_day_usd = 15.0
+# Where the runtime tells you a breaker tripped: a Workspace conversation
+# id, such as your direct message with the agent. Needs [agent.workspace].
+# notify = "your-dm-conversation-id"

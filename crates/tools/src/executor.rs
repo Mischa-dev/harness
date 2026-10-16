@@ -77,6 +77,12 @@ impl PolicyExecutor {
         self.paused.as_deref()
     }
 
+    /// Pauses for a breaker tripped outside the executor, such as the
+    /// daemon's wake or spend breakers. Nothing runs until `resume`.
+    pub fn pause(&mut self, breaker: &str) {
+        self.paused = Some(breaker.to_string());
+    }
+
     /// Only the owner resumes a paused agent; the daemon calls this on their command.
     pub fn resume(&mut self) {
         self.paused = None;

@@ -64,6 +64,9 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
                     "request": request("r-1", "claimed", true, 2),
                     "recentMessages": [{"author": "Mischa", "text": "Is the proxy merged?"}]
                 }),
+                "message_send" => {
+                    json!({"conversationId": arguments["conversationId"], "messageId": "m-9"})
+                }
                 "reply_send" | "reply_pass" => {
                     json!({"requestId": arguments["requestId"], "status": "answered"})
                 }
@@ -120,6 +123,7 @@ fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
         workspace: Some(WorkspaceConfig {
             url: format!("http://{workspace}/api/v1/mcp"),
             token_file: write(dir, "workspace-token", &format!("{WORKSPACE_TOKEN}\n")),
@@ -414,4 +418,35 @@ async fn an_unreadable_filter_answer_leaves_the_news_waiting() {
     assert!(agent.store.wakes_since(start).unwrap().is_empty());
     // It looked once, and won't look again until something new arrives.
     assert!(!agent.unjudged);
+}
+
+#[tokio::test]
+async fn the_owner_hears_when_a_breaker_pauses_the_agent() {
+    let (fake, addr) = workspace().await;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut config = config(dir.path(), addr);
+    config.breakers.notify = Some("dm-owner".into());
+    let mut agent = Agent::from_config(&config, clock).unwrap();
+    agent
+        .trip(harness_daemon::breakers::Tripped {
+            breaker: "spend_per_day".into(),
+            detail: "$15.20 of model spend today".into(),
+        })
+        .await
+        .unwrap();
+    let calls = fake.calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].0, "message_send");
+    assert_eq!(calls[0].1["conversationId"], "dm-owner");
+    let text = calls[0].1["text"].as_str().unwrap();
+    assert!(text.contains("spend_per_day"), "{text}");
+    assert!(text.contains("harness-daemon resume"), "{text}");
+
+    config.breakers.notify = Some("../dm".into());
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a bad notify conversation was accepted");
+    };
+    assert!(err.to_string().contains("breakers.notify"), "{err}");
 }
