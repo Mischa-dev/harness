@@ -197,11 +197,12 @@ fn validate_upstream(name: &str, upstream: &str) -> Result<(), ConfigError> {
 
 struct Proxy {
     routes: Vec<Route>,
-    /// For HTTPS upstreams. It may go through the system's proxy, which
-    /// sees only an encrypted tunnel.
+    /// For HTTPS upstreams elsewhere. It may go through the system's proxy,
+    /// which sees only an encrypted tunnel.
     remote: reqwest::Client,
-    /// For plain-HTTP upstreams on this machine. Never through a proxy,
-    /// which would see the key in the clear.
+    /// For upstreams on this machine, HTTP or HTTPS. Never through a proxy:
+    /// a plain-HTTP call would show it the key, and a local call has no
+    /// business leaving the machine.
     local: reqwest::Client,
 }
 
@@ -223,6 +224,19 @@ pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::
         .fallback(any(forward))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(Arc::new(proxy)))
+}
+
+/// Whether `url` names this machine: `localhost`, 127.0.0.0/8, `::1`, or a
+/// 127.x address written as `::ffff:127.0.0.1`.
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        None => false,
+    }
 }
 
 async fn forward(
@@ -257,10 +271,10 @@ async fn forward(
     let (auth_name, auth_value) = route.auth_header();
     outgoing.insert(auth_name, auth_value);
 
-    let client = if url.scheme() == "https" {
-        &proxy.remote
-    } else {
+    let client = if is_loopback(&url) {
         &proxy.local
+    } else {
+        &proxy.remote
     };
     let sent = client
         .request(method, url)
@@ -342,6 +356,29 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_upstreams_of_either_scheme_skip_the_system_proxy() {
+        for local in [
+            "http://localhost:8080/v1",
+            "https://localhost:8443/v1",
+            "https://LOCALHOST/v1",
+            "https://127.0.0.1/v1",
+            "https://127.2.3.4/v1",
+            "https://[::1]/v1",
+            "https://[::ffff:127.0.0.1]/v1",
+        ] {
+            assert!(is_loopback(&local.parse().unwrap()), "{local}");
+        }
+        for remote in [
+            "https://api.anthropic.com/v1",
+            "https://localhost.example.com/v1",
+            "https://10.0.0.1/v1",
+            "https://[::ffff:10.0.0.1]/v1",
+        ] {
+            assert!(!is_loopback(&remote.parse().unwrap()), "{remote}");
+        }
+    }
 
     #[test]
     fn upstreams_need_https_except_on_this_machine() {
