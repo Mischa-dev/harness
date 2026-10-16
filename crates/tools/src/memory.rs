@@ -34,6 +34,11 @@ const FILES: [(&str, &str, usize); 3] = [
     ("handoff", "HANDOFF.md", 4_000),
 ];
 
+/// Every file is saved byte for byte, whatever `.gitattributes` the folder
+/// holds.
+const PLAIN_ATTRIBUTES: &str =
+    "* -text -filter -diff -merge -ident -working-tree-encoding -export-subst\n";
+
 /// One journal entry's limit.
 pub const MAX_ENTRY_CHARS: usize = 4_000;
 
@@ -81,6 +86,15 @@ impl MemoryFiles {
             }
             // Safe on an existing repository; makes an empty folder one.
             if !git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok) {
+                return false;
+            }
+            // The repository's own attributes come before the folder's, so
+            // nothing there can re-encode or filter what's saved.
+            let info = git_dir.join("info");
+            if std::fs::create_dir_all(&info)
+                .and_then(|()| std::fs::write(info.join("attributes"), PLAIN_ATTRIBUTES))
+                .is_err()
+            {
                 return false;
             }
             let started = git(
@@ -833,8 +847,14 @@ mod tests {
         let dir = tmp.path().join("memory");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("MEMORY.md"), "- from before\n").unwrap();
-        // Ignore rules in the folder don't keep memory out of history.
+        // Ignore rules and attributes in the folder don't keep memory out
+        // of history or change it on the way in.
         std::fs::write(dir.join(".gitignore"), "*.md\n").unwrap();
+        std::fs::write(
+            dir.join(".gitattributes"),
+            "*.md working-tree-encoding=UTF-16 eol=crlf\n",
+        )
+        .unwrap();
         let history = tmp.path().join("memory.git");
         let at = datetime!(2026-01-05 00:00 UTC);
         let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();

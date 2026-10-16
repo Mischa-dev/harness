@@ -191,13 +191,19 @@ impl Agent {
                 memory_dir.display()
             ))
         };
+        // Where workdir really is, in case it's reached through a link.
+        let real_workdir = std::fs::create_dir_all(&workdir)
+            .and_then(|()| workdir.canonicalize())
+            .map_err(|source| AgentError::Read {
+                field: "workdir",
+                source,
+            })?;
         if !inside(&workdir, &memory_dir) {
             return Err(outside());
         }
         // Only the runtime may write the history's git config, or a filter
         // set there would run on the next save: it can't be where the
         // agent's tools reach.
-        let real_workdir = workdir.canonicalize().unwrap_or_else(|_| workdir.clone());
         let state_dir = config
             .state_dir
             .canonicalize()
@@ -222,8 +228,7 @@ impl Agent {
                 source,
             })?,
         );
-        // Where it really is, against where workdir really is, in case
-        // workdir is reached through a link.
+        // Where it really is, now that it exists.
         if !inside(&real_workdir, memory.location()) {
             return Err(outside());
         }

@@ -652,3 +652,65 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
     assert!(err.to_string().contains("outside workdir"), "{err}");
     assert!(!dir.path().join("work/.state/memory.git").exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, work.join("out")).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: work.clone(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(work.join("out/memory")),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    assert!(Agent::from_config(&config, clock).is_err());
+    assert!(
+        !elsewhere.join("memory").exists(),
+        "nothing was made outside"
+    );
+    assert!(!dir.path().join("state/memory.git").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("home")).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("home/agent"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    if let Err(err) = Agent::from_config(&config, clock) {
+        panic!("{err}");
+    }
+    assert!(real.join("agent/memory/journal").is_dir());
+}
