@@ -83,18 +83,31 @@ impl OpenAiCompatAdapter {
             .ok_or_else(|| ProviderError::Parse("choice has no message".into()))?;
 
         let mut content = Vec::new();
-        if let Some(text) = message.get("content").and_then(Value::as_str)
-            && !text.is_empty()
+        if let Some(raw_content) = message.get("content")
+            && !raw_content.is_null()
         {
-            content.push(ContentBlock::Text { text: text.into() });
+            let text = raw_content.as_str().ok_or_else(|| {
+                ProviderError::Parse("choice message `content` must be a string or null".into())
+            })?;
+            if !text.is_empty() {
+                content.push(ContentBlock::Text { text: text.into() });
+            }
         }
-        if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        if let Some(raw_calls) = message.get("tool_calls") {
+            let calls = raw_calls.as_array().ok_or_else(|| {
+                ProviderError::Parse("choice message `tool_calls` must be an array".into())
+            })?;
             for call in calls {
                 let id = call.get("id").and_then(Value::as_str);
                 let name = call.pointer("/function/name").and_then(Value::as_str);
                 let (Some(id), Some(name)) = (id, name) else {
                     return Err(ProviderError::Parse("tool call without id or name".into()));
                 };
+                if id.is_empty() || name.is_empty() {
+                    return Err(ProviderError::Parse(
+                        "tool call id and name must not be empty".into(),
+                    ));
+                }
                 let raw = call
                     .pointer("/function/arguments")
                     .and_then(Value::as_str)
@@ -399,6 +412,23 @@ mod tests {
         assert_eq!(response.message.content.len(), 1);
         assert_eq!(response.usage.input_tokens, 20);
         assert_eq!(response.usage.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn rejects_malformed_message_fields_and_empty_tool_identity() {
+        for body in [
+            r#"{"choices":[{"message":{"content":42}}]}"#,
+            r#"{"choices":[{"message":{"tool_calls":{}}}]}"#,
+            r#"{"choices":[{"message":{"tool_calls":[{"id":"","function":{"name":"sleep","arguments":"{}"}}]}}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    OpenAiCompatAdapter::parse_response(body),
+                    Err(ProviderError::Parse(_))
+                ),
+                "accepted malformed response: {body}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -35,15 +35,40 @@ fn usage() -> ExitCode {
 }
 
 fn list() -> ExitCode {
-    let mut names: Vec<String> = std::fs::read_dir(scenarios_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            (path.extension()? == "toml").then(|| path.file_stem()?.to_str().map(String::from))?
-        })
-        .collect();
+    let entries = match std::fs::read_dir(scenarios_dir()) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!(
+                "couldn't list scenarios in {}: {err}",
+                scenarios_dir().display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!(
+                    "couldn't read an entry in {}: {err}",
+                    scenarios_dir().display()
+                );
+                return ExitCode::from(2);
+            }
+        };
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                eprintln!("scenario filename is not valid UTF-8: {}", path.display());
+                return ExitCode::from(2);
+            };
+            names.push(name.to_string());
+        }
+    }
     names.sort();
     for name in names {
         println!("{name}");

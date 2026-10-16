@@ -18,6 +18,8 @@ pub enum DayError {
     Loop(#[from] LoopError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("couldn't serialize the wake reason: {0}")]
+    SerializeReason(#[from] serde_json::Error),
 }
 
 /// Everything a recorded wake needs, borrowed from the daemon's wiring.
@@ -54,7 +56,7 @@ impl Workday<'_> {
         let mut transcript = self.store.transcript(day.id)?;
         let record = WakeRecord {
             day_id: day.id,
-            reason: serde_json::to_string(reason).unwrap_or_default(),
+            reason: serde_json::to_string(reason)?,
             started_at,
             ended_at: started_at,
             end: RUNNING.into(),

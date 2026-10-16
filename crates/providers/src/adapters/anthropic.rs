@@ -123,17 +123,20 @@ impl AnthropicAdapter {
                     text: str_field(block, "text")?.to_string(),
                 }),
                 Some("tool_use") => {
-                    let arguments = block
-                        .get("input")
-                        .filter(|input| input.is_object())
-                        .cloned()
-                        .ok_or_else(|| {
-                            ProviderError::Parse("tool_use block is missing object `input`".into())
-                        })?;
+                    let id = nonempty_str_field(block, "id")?;
+                    let name = nonempty_str_field(block, "name")?;
+                    let arguments = block.get("input").ok_or_else(|| {
+                        ProviderError::Parse("tool_use block is missing `input`".into())
+                    })?;
+                    if !arguments.is_object() {
+                        return Err(ProviderError::Parse(
+                            "tool_use block `input` must be an object".into(),
+                        ));
+                    }
                     content.push(ContentBlock::ToolCall(ToolCall {
-                        id: str_field(block, "id")?.to_string(),
-                        name: str_field(block, "name")?.to_string(),
-                        arguments,
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        arguments: arguments.clone(),
                     }));
                 }
                 _ => content.push(ContentBlock::Opaque {
@@ -233,6 +236,16 @@ fn str_field<'a>(block: &'a Value, key: &str) -> Result<&'a str, ProviderError> 
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| ProviderError::Parse(format!("block is missing `{key}`")))
+}
+
+fn nonempty_str_field<'a>(block: &'a Value, key: &str) -> Result<&'a str, ProviderError> {
+    let value = str_field(block, key)?;
+    if value.is_empty() {
+        return Err(ProviderError::Parse(format!(
+            "block field `{key}` must not be empty"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -474,6 +487,19 @@ mod tests {
             ),
             Err(ProviderError::Parse(problem)) if problem.contains("input")
         ));
+        for body in [
+            r#"{"content":[{"type":"tool_use","id":"","name":"x","input":{}}]}"#,
+            r#"{"content":[{"type":"tool_use","id":"1","name":"x"}]}"#,
+            r#"{"content":[{"type":"tool_use","id":"1","name":"x","input":[]}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    AnthropicAdapter::parse_response(body),
+                    Err(ProviderError::Parse(_))
+                ),
+                "accepted malformed response: {body}"
+            );
+        }
     }
 
     #[tokio::test]

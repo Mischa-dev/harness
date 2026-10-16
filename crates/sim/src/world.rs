@@ -60,11 +60,14 @@ impl Tool for MessageSend {
 
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let text = text(args)?;
-        self.outbox.lock().expect("outbox poisoned").push(Sent {
-            at: ctx.clock.now(),
-            conversation: conversation(args)?.into(),
-            text: text.into(),
-        });
+        self.outbox
+            .lock()
+            .map_err(|_| ToolError::Failed("message outbox is unavailable".into()))?
+            .push(Sent {
+                at: ctx.clock.now(),
+                conversation: conversation(args)?.into(),
+                text: text.into(),
+            });
         Ok(ToolOutput::text("Sent."))
     }
 }
@@ -81,9 +84,14 @@ fn text(args: &Value) -> Result<&str, ToolError> {
 }
 
 fn conversation(args: &Value) -> Result<&str, ToolError> {
-    args.get("conversation")
+    let conversation = args
+        .get("conversation")
         .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::InvalidArguments("conversation must be a string".into()))
+        .ok_or_else(|| ToolError::InvalidArguments("conversation must be a string".into()))?;
+    if conversation.trim().is_empty() {
+        return Err(ToolError::InvalidArguments("conversation is empty".into()));
+    }
+    Ok(conversation)
 }
 
 /// Marks a message the agent is expected to answer.
@@ -206,5 +214,14 @@ mod tests {
         let text = wake_message(datetime!(2026-01-05 09:00 UTC), &WakeReason::NextLook, &[]);
         assert!(text.contains("Why: the time you chose to look again."));
         assert!(text.ends_with("Nothing new since you last looked."));
+    }
+
+    #[test]
+    fn rejects_empty_message_destinations() {
+        let error = conversation(&json!({"conversation": "  "})).unwrap_err();
+        assert_eq!(
+            error,
+            ToolError::InvalidArguments("conversation is empty".into())
+        );
     }
 }
