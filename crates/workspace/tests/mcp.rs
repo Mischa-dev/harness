@@ -30,6 +30,8 @@ struct Fake {
     stream: AtomicBool,
     /// The next tool call gets 429.
     limit_next: AtomicBool,
+    /// Keep no sessions, as a stateless server may.
+    stateless: AtomicBool,
     /// Where to redirect tool calls, if anywhere.
     redirect_to: Mutex<Option<String>>,
 }
@@ -55,15 +57,32 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let known = session
-        .as_ref()
-        .is_some_and(|s| fake.sessions.lock().unwrap().contains(s));
+    let stateless = fake.stateless.load(Ordering::SeqCst);
+    let known = stateless
+        || session
+            .as_ref()
+            .is_some_and(|s| fake.sessions.lock().unwrap().contains(s));
+    if message["method"] != "initialize" {
+        assert_eq!(
+            headers
+                .get("mcp-protocol-version")
+                .map(|v| v.to_str().unwrap()),
+            Some("2025-06-18"),
+            "every request after initialize names the protocol"
+        );
+    }
     match message["method"].as_str().unwrap() {
         "initialize" => {
             assert_eq!(message["params"]["protocolVersion"], "2025-06-18");
             let n = fake.initializes.fetch_add(1, Ordering::SeqCst);
             let id = format!("session-{n}");
             fake.sessions.lock().unwrap().push(id.clone());
+            if stateless {
+                return axum::Json(json!({"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "protocolVersion": "2025-06-18", "capabilities": {"tools": {}}
+                }}))
+                .into_response();
+            }
             let reply = json!({"jsonrpc": "2.0", "id": message["id"], "result": {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {}},
@@ -79,7 +98,6 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
             if !known {
                 return StatusCode::NOT_FOUND.into_response();
             }
-            assert_eq!(headers.get("mcp-protocol-version").unwrap(), "2025-06-18");
             if let Some(to) = fake.redirect_to.lock().unwrap().clone() {
                 return (StatusCode::TEMPORARY_REDIRECT, [("location", to)]).into_response();
             }
@@ -408,4 +426,14 @@ async fn the_watch_reports_new_pending_requests_once() {
         })
     );
     assert_eq!(watch.check(&workspace).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn a_stateless_server_still_hears_the_protocol_version() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    fake.stateless.store(true, Ordering::SeqCst);
+    workspace.briefing().await.unwrap();
+    workspace.inbox(50).await.unwrap();
+    assert_eq!(fake.initializes.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.calls().len(), 2);
 }

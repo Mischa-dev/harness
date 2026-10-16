@@ -200,10 +200,13 @@ impl McpClient {
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .body(body.to_string());
+        // Every request after initialize names the protocol, with or
+        // without a session.
+        if method != "initialize" {
+            request = request.header("mcp-protocol-version", PROTOCOL_VERSION);
+        }
         if let Some(session) = session {
-            request = request
-                .header(SESSION_HEADER, session.clone())
-                .header("mcp-protocol-version", PROTOCOL_VERSION);
+            request = request.header(SESSION_HEADER, session.clone());
         }
         let mut response = request.send().await.map_err(|_| McpError::Unreachable)?;
         let status = response.status().as_u16();
