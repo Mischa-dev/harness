@@ -23,15 +23,27 @@ pub enum ExecOutcome {
     Blocked(Decision),
 }
 
+/// The mandatory gateway from model-requested calls to tool execution.
+///
+/// It validates arguments, asks each tool to declare its effects, applies
+/// walls and circuit breakers, and only then invokes the tool.
 pub struct PolicyExecutor {
     policy: Policy,
-    tools: BTreeMap<String, Box<dyn Tool>>,
+    tools: BTreeMap<String, RegisteredTool>,
     clock: Arc<dyn Clock>,
     messages_sent: VecDeque<OffsetDateTime>,
     paused: Option<String>,
 }
 
+struct RegisteredTool {
+    /// Tool schemas are immutable and can be expensive JSON trees. Build each
+    /// one once instead of rebuilding it for every model turn and validation.
+    spec: ToolSpec,
+    tool: Box<dyn Tool>,
+}
+
 impl PolicyExecutor {
+    /// Creates an executor with no registered tools.
     pub fn new(policy: Policy, clock: Arc<dyn Clock>) -> Self {
         Self {
             policy,
@@ -42,17 +54,22 @@ impl PolicyExecutor {
         }
     }
 
+    /// Registers or replaces a tool by its specification name.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.spec().name, tool);
+        let spec = tool.spec();
+        self.tools
+            .insert(spec.name.clone(), RegisteredTool { spec, tool });
     }
 
+    /// Registers a tool and returns the executor for builder-style wiring.
     pub fn with_tool(mut self, tool: impl Tool + 'static) -> Self {
         self.register(Box::new(tool));
         self
     }
 
+    /// Returns model-facing specifications for all registered tools.
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| t.spec()).collect()
+        self.tools.values().map(|tool| tool.spec.clone()).collect()
     }
 
     /// The breaker that paused the agent, if one has.
@@ -65,16 +82,18 @@ impl PolicyExecutor {
         self.paused = None;
     }
 
+    /// Validates, authorizes, charges, and executes one model-requested call.
     pub async fn execute(&mut self, call: &ToolCall) -> ExecOutcome {
         let effects = match self.tools.get(&call.name) {
             None => {
                 return ExecOutcome::Malformed(format!("there is no tool named `{}`", call.name));
             }
-            Some(tool) => {
-                if let Err(problem) = schema::validate(&tool.spec().parameters, &call.arguments) {
+            Some(registered) => {
+                if let Err(problem) = schema::validate(&registered.spec.parameters, &call.arguments)
+                {
                     return ExecOutcome::Malformed(problem);
                 }
-                match tool.effects(&call.arguments) {
+                match registered.tool.effects(&call.arguments) {
                     Ok(effects) => effects,
                     Err(e) => return ExecOutcome::Malformed(e.to_string()),
                 }
@@ -96,7 +115,7 @@ impl PolicyExecutor {
             return ExecOutcome::Blocked(tripped);
         }
 
-        let tool = &self.tools[&call.name];
+        let tool = &self.tools[&call.name].tool;
         let ctx = ToolContext {
             clock: self.clock.as_ref(),
         };

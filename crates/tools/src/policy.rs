@@ -51,11 +51,14 @@ impl Default for BreakerLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Static safety boundaries and circuit-breaker thresholds for one agent.
 pub struct Policy {
     /// The agent's working area. Paths outside it can't be read or written.
     pub root: PathBuf,
     /// Paths under `root` that can be read but never written.
     pub protected_paths: Vec<PathBuf>,
+    /// Credential-bearing paths that the agent can neither read nor write.
+    pub secret_paths: Vec<PathBuf>,
     pub forbidden_commands: Vec<CommandRule>,
     /// Actions that need the owner's yes before they run.
     pub approval_required: Vec<String>,
@@ -69,10 +72,20 @@ impl Policy {
     pub fn conservative(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            protected_paths: [".github", "tests", ".env"]
-                .iter()
-                .map(PathBuf::from)
-                .collect(),
+            protected_paths: [".github", "tests"].iter().map(PathBuf::from).collect(),
+            secret_paths: [
+                ".env",
+                ".git",
+                ".ssh",
+                ".aws",
+                ".config/gcloud",
+                ".npmrc",
+                ".pypirc",
+                ".netrc",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect(),
             forbidden_commands: vec![
                 CommandRule::program("sh"),
                 CommandRule::program("bash"),
@@ -95,20 +108,32 @@ impl Policy {
         }
     }
 
+    /// Decides whether one declared effect is allowed to proceed.
     pub fn check(&self, effect: &Effect) -> Decision {
         match effect {
             Effect::ReadPath(path) => match self.resolve(path) {
+                Some(rel) if self.secret_path(&rel).is_some() => {
+                    Decision::deny(format!("{} contains credentials", path.display()))
+                }
                 Some(_) => Decision::Allow,
                 None => Decision::deny(format!("{} is outside the work area", path.display())),
             },
             Effect::WritePath(path) => match self.resolve(path) {
                 None => Decision::deny(format!("{} is outside the work area", path.display())),
-                Some(rel) => match self.protected_paths.iter().find(|p| rel.starts_with(p)) {
+                Some(rel) => match self
+                    .protected_paths
+                    .iter()
+                    .find(|p| rel.starts_with(p))
+                    .or_else(|| self.secret_path(&rel))
+                {
                     Some(p) => Decision::deny(format!("{} is protected", p.display())),
                     None => Decision::Allow,
                 },
             },
             Effect::RunCommand { program, args } => {
+                if is_dangerous_git_push(program, args) {
+                    return Decision::deny("git force push is not allowed".into());
+                }
                 match self
                     .forbidden_commands
                     .iter()
@@ -138,6 +163,14 @@ impl Policy {
         }
     }
 
+    /// Secrets match at any depth, not just at the root: a monorepo keeps
+    /// `services/api/.env` and `packages/web/.npmrc` too.
+    fn secret_path<'a>(&'a self, path: &Path) -> Option<&'a PathBuf> {
+        self.secret_paths
+            .iter()
+            .find(|secret| contains_path(path, secret) || env_variant(path, secret))
+    }
+
     /// Resolves `path` to a path relative to `root`, or `None` if it falls
     /// outside. Checked lexically first, then again after following symlinks
     /// through the deepest part of the path that exists.
@@ -162,6 +195,44 @@ impl Policy {
         }
         Some(rel)
     }
+}
+
+/// True when `needle`'s components appear consecutively anywhere in `path`, so
+/// `.config/gcloud` matches `home/.config/gcloud/credentials.db`.
+fn contains_path(path: &Path, needle: &Path) -> bool {
+    let parts: Vec<_> = path.components().collect();
+    let wanted: Vec<_> = needle.components().collect();
+    !wanted.is_empty() && parts.windows(wanted.len()).any(|w| w == wanted.as_slice())
+}
+
+fn env_variant(path: &Path, protected: &Path) -> bool {
+    protected == Path::new(".env")
+        && path.components().any(|part| {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".env."))
+        })
+}
+
+/// Git accepts long options with `=`, combined short flags, options before
+/// the subcommand, and `+` refspecs. Match those forms rather than relying on
+/// exact argv items, which the generic command rules deliberately do.
+fn is_dangerous_git_push(program: &str, args: &[String]) -> bool {
+    if program_name(program) != "git" {
+        return false;
+    }
+    let Some(push_at) = args.iter().position(|arg| arg == "push") else {
+        return false;
+    };
+    args[push_at + 1..].iter().any(|arg| {
+        // Covers --force, --force=<bool>, --force-with-lease[=...] and
+        // --force-if-includes.
+        arg.starts_with("--force")
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|flag| flag == 'f'))
+            || (arg.starts_with('+') && arg.len() > 1)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

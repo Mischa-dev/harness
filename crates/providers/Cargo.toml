@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 reqwest = { workspace = true, optional = true }
-url = { version = "2", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -19,7 +18,7 @@ toml.workspace = true
 [features]
 default = ["http"]
 # The real HTTP transport. Tests and the simulator run without it.
-http = ["dep:reqwest", "dep:url"]
+http = ["dep:reqwest"]
 
 [dev-dependencies]
 tokio.workspace = true

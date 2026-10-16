@@ -5,6 +5,10 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+/// Model responses are text and should be far smaller than this. Bounding
+/// them prevents a broken or hostile proxy from exhausting the daemon's RAM.
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
@@ -30,52 +34,25 @@ pub trait Transport: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ReqwestTransport {
     client: reqwest::Client,
-    /// For the daemon's forwarding proxy and anything else on this machine:
-    /// never through a system proxy, which would see the whole request in
-    /// the clear.
-    direct: reqwest::Client,
 }
 
 #[cfg(feature = "http")]
 impl ReqwestTransport {
     /// `timeout` bounds one whole request, including a slow model's full answer.
     pub fn new(timeout: std::time::Duration) -> Result<Self, TransportError> {
-        let builder = || {
-            reqwest::Client::builder()
-                .timeout(timeout)
-                // A redirect would replay the request, conversation and all,
-                // to wherever it points, possibly another proxy route that
-                // adds a different key. The caller sees the 3xx instead.
-                .redirect(reqwest::redirect::Policy::none())
-        };
-        let build =
-            |b: reqwest::ClientBuilder| b.build().map_err(|e| TransportError(e.to_string()));
-        Ok(Self {
-            client: build(builder())?,
-            direct: build(builder().no_proxy())?,
-        })
-    }
-}
-
-/// Whether `url` names this machine: `localhost`, `127.0.0.0/8` (also as
-/// an IPv4-mapped IPv6 address) or `::1`.
-#[cfg(feature = "http")]
-pub fn is_loopback(url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    match url.host() {
-        // `localhost.` is the same name written fully qualified.
-        Some(url::Host::Domain(domain)) => domain
-            .strip_suffix('.')
-            .unwrap_or(domain)
-            .eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        // `::1`, or a 127.x address written as `::ffff:127.0.0.1`.
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-        None => false,
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            // Never route private agent context through ambient HTTP proxy
+            // environment variables. The explicit broker URL is the only
+            // endpoint this transport trusts.
+            .no_proxy()
+            // The configured broker/proxy is the trust boundary. Following a
+            // redirect could disclose the complete agent context to another
+            // origin chosen by a compromised endpoint.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| TransportError(e.to_string()))?;
+        Ok(Self { client })
     }
 }
 
@@ -89,56 +66,95 @@ impl Transport for ReqwestTransport {
         body: &Value,
     ) -> Result<HttpResponse, TransportError> {
         let bytes = serde_json::to_vec(body).map_err(|e| TransportError(e.to_string()))?;
-        let client = if is_loopback(url) {
-            &self.direct
-        } else {
-            &self.client
-        };
-        let mut request = client
+        let mut request = self
+            .client
             .post(url)
             .header("content-type", "application/json")
             .body(bytes);
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let response = request
+        let mut response = request
             .send()
             .await
             .map_err(|e| TransportError(e.to_string()))?;
         let status = response.status().as_u16();
-        let body = response
-            .text()
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(TransportError("response exceeds 8 MiB limit".into()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|e| TransportError(e.to_string()))?;
+            .map_err(|e| TransportError(e.to_string()))?
+        {
+            let remaining = MAX_RESPONSE_BYTES.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                return Err(TransportError("response exceeds 8 MiB limit".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(bytes)
+            .map_err(|_| TransportError("response body is not valid UTF-8".into()))?;
         Ok(HttpResponse { status, body })
     }
 }
 
 #[cfg(all(test, feature = "http"))]
 mod tests {
-    use super::is_loopback;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
-    #[test]
-    fn loopback_urls_are_recognised() {
-        for yes in [
-            "http://127.0.0.1:8787/anthropic/v1/messages",
-            "http://localhost:8787/x",
-            "http://localhost.:8787/x",
-            "http://LOCALHOST/x",
-            "http://127.1.2.3/x",
-            "http://[::1]:8787/x",
-            "http://[::ffff:127.0.0.1]:8787/x",
-        ] {
-            assert!(is_loopback(yes), "{yes}");
-        }
-        for no in [
-            "https://api.anthropic.com/v1/messages",
-            "http://localhost.evil.com/x",
-            "http://10.0.0.1/x",
-            "http://[::ffff:10.0.0.1]/x",
-            "not a url",
-        ] {
-            assert!(!is_loopback(no), "{no}");
-        }
+    use serde_json::json;
+
+    use super::*;
+
+    fn serve_once(response: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request);
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_responses_before_reading_the_body() {
+        let (url, server) = serve_once(format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        ));
+        let transport = ReqwestTransport::new(Duration::from_secs(2)).unwrap();
+        let error = transport
+            .post_json(&url, &[], &json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("8 MiB"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_cross_origin_redirects() {
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let location = format!("http://{}", destination.local_addr().unwrap());
+        let (url, server) = serve_once(format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ));
+        let transport = ReqwestTransport::new(Duration::from_secs(2)).unwrap();
+        let response = transport.post_json(&url, &[], &json!({})).await.unwrap();
+        assert_eq!(response.status, 307);
+        assert!(
+            matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        server.join().unwrap();
     }
 }

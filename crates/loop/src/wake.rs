@@ -201,17 +201,24 @@ pub async fn run_wake(
         };
         usage.add(response.usage);
         let u = response.usage;
-        context_tokens =
-            u.input_tokens + u.cache_read_tokens + u.cache_write_tokens + u.output_tokens;
-        if u.input_tokens + u.cache_read_tokens + u.cache_write_tokens == 0 {
+        let input_tokens = u
+            .input_tokens
+            .saturating_add(u.cache_read_tokens)
+            .saturating_add(u.cache_write_tokens);
+        context_tokens = input_tokens.saturating_add(u.output_tokens);
+        if input_tokens == 0 {
             // The provider didn't report usage. Estimate, so the day's size
             // still grows toward its evening.
-            context_tokens += estimate_tokens(&request) + estimate_tokens(&response.message);
+            context_tokens = context_tokens
+                .saturating_add(estimate_tokens(&request))
+                .saturating_add(estimate_tokens(&response.message));
         }
         let calls: Vec<ToolCall> = response.message.tool_calls().cloned().collect();
         transcript.push(response.message);
 
         if calls.is_empty() {
+            // A text-only turn breaks a run of malformed tool-call turns.
+            malformed_last_turn = false;
             if reminded {
                 break WakeEnd::NoSleep;
             }
@@ -285,10 +292,12 @@ pub async fn run_wake(
         }
         // The next call will send these results, so they count toward the
         // context the workday policy watches; a big result can't hide.
-        context_tokens += results
-            .iter()
-            .map(|r| r.content.len().div_ceil(BYTES_PER_TOKEN) as u64)
-            .sum::<u64>();
+        context_tokens = context_tokens.saturating_add(
+            results
+                .iter()
+                .map(|r| r.content.len().div_ceil(BYTES_PER_TOKEN) as u64)
+                .fold(0_u64, u64::saturating_add),
+        );
         transcript.push(results_message(results));
         save(
             checkpoint,

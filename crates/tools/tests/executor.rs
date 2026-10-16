@@ -103,6 +103,43 @@ fn is_deny(outcome: &ExecOutcome) -> bool {
     matches!(outcome, ExecOutcome::Blocked(Decision::Deny { .. }))
 }
 
+struct CountingSpec(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for CountingSpec {
+    fn spec(&self) -> ToolSpec {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolSpec {
+            name: "counting".into(),
+            description: String::new(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    fn effects(&self, _args: &Value) -> Result<Vec<Effect>, ToolError> {
+        Ok(vec![])
+    }
+
+    async fn run(&self, _args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ran"))
+    }
+}
+
+#[tokio::test]
+async fn tool_schema_is_built_only_when_registered() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock = Arc::new(FakeClock::at_default_start());
+    let mut executor = PolicyExecutor::new(Policy::conservative(dir.path()), clock)
+        .with_tool(CountingSpec(calls.clone()));
+
+    executor.specs();
+    executor.specs();
+    executor.execute(&call("counting", json!({}))).await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn allowed_calls_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -189,6 +226,10 @@ async fn forbidden_commands_are_denied_by_program_name() {
         ("/usr/bin/env", "python"),
         ("git", "push --force origin main"),
         ("/run/current-system/sw/bin/git", "push origin main -f"),
+        ("git", "push --force=true origin main"),
+        ("git", "push --force-with-lease=main:deadbeef origin main"),
+        ("git", "push -uf origin main"),
+        ("git", "push origin +main:main"),
     ];
     for (program, args) in cases {
         let out = h
@@ -209,6 +250,51 @@ async fn forbidden_commands_are_denied_by_program_name() {
         .await;
     assert!(matches!(ok, ExecOutcome::Ran(_)));
     assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn credential_and_repository_metadata_paths_are_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    for path in [
+        ".git/config",
+        ".ssh/authorized_keys",
+        ".aws/credentials",
+        ".config/gcloud/credentials.db",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".env.local",
+        "services/api/.env",
+        "services/api/.env.production",
+        "packages/web/.npmrc",
+        "vendor/lib/.git/config",
+        "home/.ssh/id_ed25519",
+        "home/.config/gcloud/credentials.db",
+    ] {
+        for tool in ["read", "write"] {
+            let out = h.exec.execute(&call(tool, json!({"path": path}))).await;
+            assert!(is_deny(&out), "{tool} {path} should be denied, got {out:?}");
+        }
+    }
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn ordinary_nested_files_near_secret_names_are_not_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    for path in [
+        "services/api/config.toml",
+        "src/environment.rs",
+        "docs/npmrc.md",
+    ] {
+        let out = h.exec.execute(&call("read", json!({"path": path}))).await;
+        assert!(
+            !is_deny(&out),
+            "read {path} should not be denied, got {out:?}"
+        );
+    }
 }
 
 #[tokio::test]

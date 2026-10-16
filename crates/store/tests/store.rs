@@ -134,6 +134,24 @@ fn migrations_are_idempotent() {
     assert_eq!(store.current_day().unwrap(), None);
 }
 
+#[cfg(unix)]
+#[test]
+fn state_database_is_private_and_symlinks_are_rejected() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    drop(Store::open(&path).unwrap());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let link = dir.path().join("linked.sqlite");
+    symlink(&path, &link).unwrap();
+    assert!(matches!(Store::open(&link), Err(StoreError::Io(_))));
+}
+
 #[test]
 fn the_days_context_size_never_shrinks() {
     let mut store = Store::open_in_memory().unwrap();
@@ -145,6 +163,32 @@ fn the_days_context_size_never_shrinks() {
     // A provider that reports no usage must not hide how large the day is.
     store.record_wake(&wake(day.id, start, 0.0), 0).unwrap();
     assert_eq!(store.current_day().unwrap().unwrap().context_tokens, 70_000);
+}
+
+#[test]
+fn oversized_provider_counters_do_not_wrap_negative_in_sqlite() {
+    let mut store = Store::open_in_memory().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let day = store.start_day(start).unwrap();
+    let mut record = wake(day.id, start, 0.0);
+    record.usage = Usage {
+        input_tokens: u64::MAX,
+        output_tokens: u64::MAX,
+        cache_read_tokens: u64::MAX,
+        cache_write_tokens: u64::MAX,
+    };
+    store.record_wake(&record, u64::MAX).unwrap();
+
+    let largest_sqlite_integer = i64::MAX as u64;
+    let saved = &store.wakes_since(start).unwrap()[0];
+    assert_eq!(saved.usage.input_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.output_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.cache_read_tokens, largest_sqlite_integer);
+    assert_eq!(saved.usage.cache_write_tokens, largest_sqlite_integer);
+    assert_eq!(
+        store.current_day().unwrap().unwrap().context_tokens,
+        largest_sqlite_integer
+    );
 }
 
 #[test]
@@ -216,8 +260,12 @@ fn a_later_save_replaces_a_pending_message() {
     let turn = tool_turn();
     let pending = Message::user_text("cut off");
     store
-        .save_wake(id, 0, &[turn[0].clone(), pending], &record, 0)
+        .save_wake_with_pending(id, 0, &turn[..1], Some(&pending), &record, 0)
         .unwrap();
+    assert_eq!(
+        store.transcript(day.id).unwrap(),
+        [&turn[..1], &[pending]].concat()
+    );
     store.save_wake(id, 1, &turn[1..], &record, 0).unwrap();
     assert_eq!(store.transcript(day.id).unwrap(), turn);
     // A save can't leave a gap in the transcript.

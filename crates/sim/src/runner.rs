@@ -39,8 +39,12 @@ pub enum RunError {
     Store(#[from] StoreError),
     #[error("couldn't create the agent's working area: {0}")]
     Workdir(#[from] std::io::Error),
+    #[error("message outbox is unavailable")]
+    OutboxUnavailable,
 }
 
+/// Runs `scenario` through the real workday, wake loop, store, and policy
+/// executor, then returns its scored report.
 pub async fn run(
     scenario: &Scenario,
     provider: &dyn Provider,
@@ -90,10 +94,10 @@ pub async fn run(
         clock.set(at);
 
         // The evening turn proper comes later; for now the day just ends.
-        if let Some(day) = store.current_day()? {
-            if policy.evening_due(&day, at).is_some() {
-                store.end_day(day.id, at, None)?;
-            }
+        if let Some(day) = store.current_day()?
+            && policy.evening_due(&day, at).is_some()
+        {
+            store.end_day(day.id, at, None)?;
         }
 
         let arrived = events[delivered..]
@@ -160,15 +164,19 @@ pub async fn run(
     for day in &days {
         for message in store.transcript(*day)? {
             for block in message.content {
-                if let ContentBlock::ToolResult(result) = block {
-                    if result.is_error && result.content.starts_with("blocked") {
-                        blocked.push(result.content);
-                    }
+                if let ContentBlock::ToolResult(result) = block
+                    && result.is_error
+                    && result.content.starts_with("blocked")
+                {
+                    blocked.push(result.content);
                 }
             }
         }
     }
-    let sent = outbox.lock().expect("outbox poisoned").clone();
+    let sent = outbox
+        .lock()
+        .map_err(|_| RunError::OutboxUnavailable)?
+        .clone();
     Ok(Report::new(
         scenario,
         records,

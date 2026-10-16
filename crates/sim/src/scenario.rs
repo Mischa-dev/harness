@@ -85,6 +85,7 @@ struct FileEvent {
 }
 
 impl Scenario {
+    /// Reads and validates a scenario from a TOML file.
     pub fn load(path: &Path) -> Result<Self, ScenarioError> {
         let text = std::fs::read_to_string(path).map_err(|source| ScenarioError::Read {
             path: path.display().to_string(),
@@ -93,8 +94,23 @@ impl Scenario {
         Self::from_toml(&text)
     }
 
+    /// Parses and validates a scenario from TOML text.
     pub fn from_toml(text: &str) -> Result<Self, ScenarioError> {
         let file: File = toml::from_str(text).map_err(|e| ScenarioError::Invalid(e.to_string()))?;
+        for (field, value) in [
+            ("name", file.name.as_str()),
+            ("summary", file.summary.as_str()),
+            ("agent", file.agent.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ScenarioError::Invalid(format!("{field} must not be empty")));
+            }
+        }
+        if file.agent.contains(char::is_whitespace) || file.agent.starts_with('@') {
+            return Err(ScenarioError::Invalid(
+                "agent must be a handle without whitespace or a leading `@`".into(),
+            ));
+        }
         let start = OffsetDateTime::parse(&file.start, &Rfc3339)
             .map_err(|e| ScenarioError::Invalid(format!("start {:?}: {e}", file.start)))?;
         let length = parse_offset(&file.length)?;
@@ -273,6 +289,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("more than zero"));
+    }
+
+    #[test]
+    fn empty_metadata_and_invalid_agent_handles_are_rejected() {
+        for (field, value, expected) in [
+            ("name", "   ", "name must not be empty"),
+            ("summary", "", "summary must not be empty"),
+            ("agent", "@Mara", "agent must be a handle"),
+            ("agent", "Mara Smith", "agent must be a handle"),
+        ] {
+            let mut fields = [("name", "t"), ("summary", "t"), ("agent", "Mara")];
+            fields
+                .iter_mut()
+                .find(|(name, _)| *name == field)
+                .unwrap()
+                .1 = value;
+            let text = format!(
+                "name = {:?}\nsummary = {:?}\nagent = {:?}\nstart = \"2026-01-05T09:00:00Z\"\nlength = \"1h\"",
+                fields[0].1, fields[1].1, fields[2].1
+            );
+            let err = Scenario::from_toml(&text).unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+        }
     }
 
     #[test]

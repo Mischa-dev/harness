@@ -6,7 +6,12 @@ use std::sync::Mutex;
 
 use time::{Duration, OffsetDateTime};
 
+/// Supplies the current UTC time to runtime code.
+///
+/// Accepting this trait instead of reading the system clock keeps scheduling
+/// and budget behavior deterministic in tests and simulations.
 pub trait Clock: Send + Sync {
+    /// Returns the current instant in UTC.
     fn now(&self) -> OffsetDateTime;
 }
 
@@ -27,6 +32,7 @@ pub struct FakeClock {
 }
 
 impl FakeClock {
+    /// Creates a stopped clock at `start`.
     pub fn new(start: OffsetDateTime) -> Self {
         Self {
             now: Mutex::new(start),
@@ -38,11 +44,13 @@ impl FakeClock {
         Self::new(time::macros::datetime!(2026-01-05 09:00 UTC))
     }
 
+    /// Advances the clock by `by`.
     pub fn advance(&self, by: Duration) {
         let mut now = self.now.lock().expect("clock poisoned");
         *now += by;
     }
 
+    /// Moves the clock to `to`.
     pub fn set(&self, to: OffsetDateTime) {
         *self.now.lock().expect("clock poisoned") = to;
     }
