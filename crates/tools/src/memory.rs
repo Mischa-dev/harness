@@ -84,6 +84,11 @@ impl MemoryFiles {
             if std::fs::symlink_metadata(git_dir).is_ok_and(|m| !m.is_dir()) {
                 return false;
             }
+            // The history holds everything the agent remembered, so only
+            // the daemon's own user can open it.
+            if private_dir(git_dir).is_err() {
+                return false;
+            }
             // Safe on an existing repository; makes an empty folder one.
             if !git(git_dir, &real, &["init", "--quiet"]).is_ok_and(|ok| ok) {
                 return false;
@@ -104,11 +109,12 @@ impl MemoryFiles {
             )
             .is_ok_and(|ok| ok);
             if !started {
+                let journal = journal_files(&real);
                 let present: Vec<&str> = FILES
                     .iter()
                     .map(|(_, name, _)| *name)
-                    .chain(["journal"])
                     .filter(|name| real.join(name).exists())
+                    .chain(journal.iter().map(String::as_str))
                     .collect();
                 commit(git_dir, &real, &present, "Start the history", now, false);
             }
@@ -419,17 +425,52 @@ fn file(args: &Value) -> Result<(&'static str, usize), ToolError> {
         .ok_or_else(|| ToolError::InvalidArguments("file must be memory, user or handoff".into()))
 }
 
+/// Creates `dir` if needed and makes it readable by its owner alone.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Whether `text` is `YYYY-MM-DD`.
+fn is_date(text: &str) -> bool {
+    text.len() == 10
+        && text.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// The journal's day files, and nothing else that may be in its folder.
+fn journal_files(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root.join("journal")) else {
+        return Vec::new();
+    };
+    let mut files: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.strip_suffix(".md").is_some_and(is_date))
+        .map(|name| format!("journal/{name}"))
+        .collect();
+    files.sort();
+    files
+}
+
 /// `YYYY-MM-DD`, checked strictly so it can only name a journal file.
 fn journal_date(args: &Value) -> Result<Option<String>, ToolError> {
     let Some(date) = args.get("date").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let ok = date.len() == 10
-        && date.bytes().enumerate().all(|(i, b)| match i {
-            4 | 7 => b == b'-',
-            _ => b.is_ascii_digit(),
-        });
-    if !ok {
+    if !is_date(date) {
         return Err(ToolError::InvalidArguments(
             "date must be YYYY-MM-DD".into(),
         ));
@@ -853,6 +894,10 @@ mod tests {
         let dir = tmp.path().join("memory");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("MEMORY.md"), "- from before\n").unwrap();
+        // The journal's day files join the history; nothing else there does.
+        std::fs::create_dir(dir.join("journal")).unwrap();
+        std::fs::write(dir.join("journal/2026-01-04.md"), "- yesterday\n").unwrap();
+        std::fs::write(dir.join("journal/token.txt"), "not memory").unwrap();
         // Ignore rules and attributes in the folder don't keep memory out
         // of history or change it on the way in.
         std::fs::write(dir.join(".gitignore"), "*.md\n").unwrap();
@@ -875,6 +920,8 @@ mod tests {
             String::from_utf8(out.stdout).unwrap()
         };
         assert_eq!(show("HEAD:MEMORY.md"), "- from before\n");
+        assert_eq!(show("HEAD:journal/2026-01-04.md"), "- yesterday\n");
+        assert_eq!(show("HEAD:journal/token.txt"), "");
         files
             .save("MEMORY.md", "- now\n", false, "Update MEMORY.md", at)
             .unwrap();
@@ -945,10 +992,22 @@ mod tests {
         std::fs::write(dir.join("USER.md"), "Mischa\n").unwrap();
         let history = tmp.path().join("memory.git");
         std::fs::create_dir(&history).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&history, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let at = datetime!(2026-01-05 00:00 UTC);
         let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
         assert!(files.has_history());
         assert_eq!(commits(&history), 1);
+        // Whatever it was made with, only its owner can open it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&history).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
         // Opening it again adds nothing.
         drop(files);
         MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
