@@ -130,9 +130,17 @@ impl Usage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelResponse {
+    pub message: Message,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn usage_counters_saturate_on_untrusted_provider_values() {
@@ -153,19 +161,6 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, u64::MAX);
         assert_eq!(usage.cache_write_tokens, u64::MAX);
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelResponse {
-    pub message: Message,
-    pub stop_reason: StopReason,
-    pub usage: Usage,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
 
     #[test]
     fn tool_calls_select_only_calls_and_preserve_order() {
