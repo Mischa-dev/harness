@@ -37,6 +37,9 @@ charter_file = "/etc/harness/charter.md"
 # The owner's local hour when the day ends, and their offset from UTC.
 quiet_hour = 2
 utc_offset_hours = 0
+# The agent's own memory (MEMORY.md, USER.md, the handoff note, the journal),
+# kept in git. Leave it out for `memory` inside workdir.
+memory_dir = "/home/agent/memory"
 
 # Workspace's signed wakeups (inbox.available). Set the webhook URL on the
 # agent's Workspace connection to http://<listen>/wake; Workspace shows the

@@ -22,7 +22,7 @@ use harness_providers::{
 };
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
-use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_tools::{MemoryFiles, Policy, PolicyExecutor, SleepTool};
 use harness_workspace::Workspace;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -72,6 +72,11 @@ pub struct AgentConfig {
     /// the inbox polling fallback.
     #[serde(default)]
     pub workspace: Option<crate::polling::WorkspaceConfig>,
+    /// The agent's own memory: MEMORY.md, USER.md, the handoff note and the
+    /// journal, in a git repo. Defaults to `memory` in the work area, where
+    /// the path walls apply.
+    #[serde(default)]
+    pub memory_dir: Option<PathBuf>,
 }
 
 fn default_quiet_hour() -> u8 {
@@ -115,6 +120,8 @@ pub struct Agent {
     pub limits: WakeLimits,
     /// Shared by the agent's Workspace tools and the inbox poller.
     pub workspace: Option<Arc<Workspace>>,
+    /// The memory files; the snapshot of them starts each day.
+    pub memory: Option<Arc<MemoryFiles>>,
     /// Events not yet in a wake: optional news held for the next look, and
     /// whatever arrived too late to join the last wake.
     pub waiting: Vec<WakeEvent>,
@@ -155,6 +162,23 @@ impl Agent {
         let mut executor =
             PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
                 .with_tool(SleepTool);
+        let memory_dir = config
+            .memory_dir
+            .clone()
+            .unwrap_or_else(|| config.workdir.join("memory"));
+        let memory =
+            Arc::new(
+                MemoryFiles::open(memory_dir, offset).map_err(|source| AgentError::Read {
+                    field: "memory_dir",
+                    source,
+                })?,
+            );
+        if !memory.has_history() {
+            eprintln!("harness-daemon: git isn't available, so memory changes have no history");
+        }
+        for tool in harness_tools::memory::tools(memory.clone()) {
+            executor.register(tool);
+        }
         let workspace = match &config.workspace {
             Some(settings) => {
                 settings.poll_every()?;
@@ -187,6 +211,7 @@ impl Agent {
             rhythm,
             limits: WakeLimits::default(),
             workspace,
+            memory: Some(memory),
             waiting: Vec::new(),
         })
     }
@@ -270,6 +295,13 @@ impl Agent {
     ) -> Result<(), harness_store::StoreError> {
         let at = self.clock.now();
         self.rhythm.close_day_if_due(&self.store, at)?;
+        // A new day starts from what the agent remembers now; the snapshot
+        // then stays fixed all day, so the prompt cache keeps hitting.
+        if let Some(memory) = &self.memory
+            && self.store.current_day()?.is_none()
+        {
+            self.assembler.memory_snapshot = memory.snapshot();
+        }
         // If the process dies mid-wake, the restart waits this long rather
         // than wake straight away, so a crash can't become a loop of paid
         // wakes.

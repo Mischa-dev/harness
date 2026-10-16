@@ -174,7 +174,7 @@ records design decisions, milestones, and the behavioral exam.
 | --- | --- |
 | `crates/core` | Shared `Clock` implementations and wake reasons/urgency. |
 | `crates/providers` | Internal messages, capability profiles, provider trait, HTTP transport, Anthropic and OpenAI-compatible adapters, and recorded response fixtures. |
-| `crates/tools` | Tool interface, flat-schema validation, policy executor, safety walls, circuit breaker, and `sleep`. |
+| `crates/tools` | Tool interface, flat-schema validation, policy executor, safety walls, circuit breaker, `sleep`, and the agent's memory tools (`memory_read`, `memory_write`, `journal_write`) over a git-kept folder of Markdown. |
 | `crates/loop` | Cache-friendly context assembly, the per-wake model/tool loop, checkpointing, and durable workday orchestration. |
 | `crates/workspace` | The MCP client for Agent Workspace, and the agent's `briefing`, `reply_claim`, `reply_send`, `reply_pass` and `reply_release` tools, which run behind the policy executor. Also the inbox watch behind the daemon's polling fallback. |
 | `crates/store` | SQLite schema and APIs for workdays, transcripts, wake usage, spend, and evening policy. |

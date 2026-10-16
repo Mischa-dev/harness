@@ -100,10 +100,16 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         max_output_tokens: 1024,
         wakeups: None,
         workspace: None,
+        memory_dir: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    std::fs::write(
+        dir.path().join("memory/MEMORY.md"),
+        "- Mischa reviews PRs in the morning.",
+    )
+    .unwrap();
     // A restart doesn't wake it at once.
     assert_eq!(agent.rhythm.next_look(), start + time::Duration::minutes(5));
 
@@ -115,6 +121,8 @@ async fn the_agent_calls_its_model_through_the_proxy() {
     assert!(headers.get(CALLER_TOKEN_HEADER).is_none());
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains(CHARTER));
+    assert!(body.contains("Mischa reviews PRs in the morning."));
+    assert!(body.contains("\"memory_write\""));
     assert!(body.contains("the time you chose to look again"));
     assert_eq!(
         agent.rhythm.next_look(),
@@ -142,6 +150,7 @@ fn a_missing_charter_is_named_without_its_path() {
         max_output_tokens: 1024,
         wakeups: None,
         workspace: None,
+        memory_dir: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -184,6 +193,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         clock,
         limits: WakeLimits::default(),
         workspace: None,
+        memory: None,
         waiting: Vec::new(),
     }
 }
@@ -477,4 +487,75 @@ async fn events_that_need_a_look_wake_an_idle_agent() {
     let wakes = agent.store.wakes_since(start).unwrap();
     assert_eq!(wakes.len(), 1);
     assert!(wakes[0].reason.contains("ci-failed"), "{}", wakes[0].reason);
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_day_starts_from_what_the_agent_remembers() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().to_path_buf(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(dir.path().join("mind")),
+    };
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    // The agent saves a memory during its first wake, then sleeps.
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls(
+                "",
+                vec![(
+                    "memory_write",
+                    json!({"file": "memory", "content": "- Ship the memory tools."}),
+                )],
+            )
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
+
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n(empty)")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("mind/MEMORY.md")).unwrap(),
+        "- Ship the memory tools.\n"
+    );
+
+    // Later the same day, the snapshot hasn't moved, so the cache holds.
+    clock.advance(time::Duration::hours(2));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n(empty)")
+    );
+
+    // The next day starts with what it wrote.
+    clock.set(datetime!(2026-01-06 09:00 UTC));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n- Ship the memory tools."),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
 }
