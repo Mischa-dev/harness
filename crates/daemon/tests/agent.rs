@@ -89,7 +89,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig {
         state_dir: dir.path().join("state"),
-        workdir: dir.path().to_path_buf(),
+        workdir: dir.path().join("work"),
         profiles_file: write(dir.path(), "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: format!("http://{proxy}/anthropic"),
@@ -100,10 +100,16 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         max_output_tokens: 1024,
         wakeups: None,
         workspace: None,
+        memory_dir: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    std::fs::write(
+        dir.path().join("work/memory/MEMORY.md"),
+        "- Mischa reviews PRs in the morning.",
+    )
+    .unwrap();
     // A restart doesn't wake it at once.
     assert_eq!(agent.rhythm.next_look(), start + time::Duration::minutes(5));
 
@@ -115,6 +121,8 @@ async fn the_agent_calls_its_model_through_the_proxy() {
     assert!(headers.get(CALLER_TOKEN_HEADER).is_none());
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains(CHARTER));
+    assert!(body.contains("Mischa reviews PRs in the morning."));
+    assert!(body.contains("\"memory_write\""));
     assert!(body.contains("the time you chose to look again"));
     assert_eq!(
         agent.rhythm.next_look(),
@@ -131,7 +139,7 @@ fn a_missing_charter_is_named_without_its_path() {
     let dir = tempfile::tempdir().unwrap();
     let config = AgentConfig {
         state_dir: dir.path().join("state"),
-        workdir: dir.path().to_path_buf(),
+        workdir: dir.path().join("work"),
         profiles_file: write(dir.path(), "profiles.toml", PROFILES),
         profile: "main".into(),
         model_url: "http://127.0.0.1:8787/anthropic".into(),
@@ -142,6 +150,7 @@ fn a_missing_charter_is_named_without_its_path() {
         max_output_tokens: 1024,
         wakeups: None,
         workspace: None,
+        memory_dir: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -184,6 +193,8 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         clock,
         limits: WakeLimits::default(),
         workspace: None,
+        memory: None,
+        memory_settled: false,
         waiting: Vec::new(),
     }
 }
@@ -477,4 +488,297 @@ async fn events_that_need_a_look_wake_an_idle_agent() {
     let wakes = agent.store.wakes_since(start).unwrap();
     assert_eq!(wakes.len(), 1);
     assert!(wakes[0].reason.contains("ci-failed"), "{}", wakes[0].reason);
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_day_starts_from_what_the_agent_remembers() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(dir.path().join("work/mind")),
+    };
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    // The agent saves a memory during its first wake, then sleeps.
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls(
+                "",
+                vec![(
+                    "memory_write",
+                    json!({"file": "memory", "content": "- Ship the memory tools."}),
+                )],
+            )
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
+
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n(empty)")
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("work/mind/MEMORY.md")).unwrap(),
+        "- Ship the memory tools.\n"
+    );
+
+    // Later the same day, even after a restart, the snapshot hasn't moved,
+    // so the cache holds.
+    drop(agent);
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
+    clock.advance(time::Duration::hours(2));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n(empty)")
+    );
+
+    // The next day starts with what it wrote.
+    clock.set(datetime!(2026-01-06 09:00 UTC));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n- Ship the memory tools."),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_that_cant_be_read_is_tried_again_next_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(dir.path().join("work/mind")),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
+    // Something that exists but can't be read as a file.
+    let memory = dir.path().join("work/mind/MEMORY.md");
+    std::fs::create_dir(&memory).unwrap();
+
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent.assembler.memory_snapshot.contains("couldn't be read"),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
+    assert_eq!(agent.store.memory_snapshot().unwrap(), None);
+
+    std::fs::remove_dir(&memory).unwrap();
+    std::fs::write(&memory, "- Remember me.\n").unwrap();
+    clock.advance(time::Duration::hours(1));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n- Remember me."),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
+    assert!(agent.store.memory_snapshot().unwrap().is_some());
+}
+
+#[test]
+fn memory_must_live_inside_the_work_area() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("MEMORY.md"), "not the agent's").unwrap();
+    let workdir = dir.path().join("work");
+    std::fs::create_dir(&workdir).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir,
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(elsewhere.path().to_path_buf()),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a memory folder outside workdir was accepted");
+    };
+    assert!(err.to_string().contains("inside workdir"), "{err}");
+    // The error names the setting, not the path.
+    assert!(!err.to_string().contains("/"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_workdir_still_holds_the_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real-home");
+    std::fs::create_dir(&real).unwrap();
+    let linked = dir.path().join("home");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: linked,
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    if let Err(err) = Agent::from_config(&config, clock) {
+        panic!("{err}");
+    }
+    assert!(real.join("memory/journal").is_dir());
+}
+
+#[test]
+fn the_state_folder_stays_out_of_the_agents_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("work/.state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a state folder inside workdir was accepted");
+    };
+    assert!(err.to_string().contains("outside workdir"), "{err}");
+    assert!(!dir.path().join("work/.state/memory.git").exists());
+
+    // Nor can the work area be where the history would go.
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("state/memory.git"),
+        ..config
+    };
+    std::fs::create_dir_all(&config.state_dir).unwrap();
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a workdir at the history's place was accepted");
+    };
+    assert!(err.to_string().contains("outside workdir"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, work.join("out")).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: work.clone(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(work.join("out/memory")),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    assert!(Agent::from_config(&config, clock).is_err());
+    assert!(
+        !elsewhere.join("memory").exists(),
+        "nothing was made outside"
+    );
+    assert!(!dir.path().join("state/memory.git").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("home")).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("home/agent"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    if let Err(err) = Agent::from_config(&config, clock) {
+        panic!("{err}");
+    }
+    assert!(real.join("agent/memory/journal").is_dir());
 }

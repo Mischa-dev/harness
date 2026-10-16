@@ -449,6 +449,29 @@ impl Store {
         Ok(())
     }
 
+    /// The memory snapshot the current day started from, if one was saved.
+    pub fn memory_snapshot(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT memory_snapshot FROM rhythm WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Saves the memory snapshot a new day starts from, or clears it.
+    pub fn set_memory_snapshot(&self, snapshot: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rhythm (id, memory_snapshot) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET memory_snapshot = excluded.memory_snapshot",
+            params![snapshot],
+        )?;
+        Ok(())
+    }
+
     /// Records the breaker that paused the agent, or clears it with `None`.
     pub fn set_paused(&self, breaker: Option<&str>) -> Result<()> {
         self.conn.execute(

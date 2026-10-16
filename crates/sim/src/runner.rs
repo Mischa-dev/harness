@@ -10,6 +10,7 @@ use harness_core::{Clock, FakeClock, WakeReason};
 use harness_loop::{AfterWake, ContextAssembler, Rhythm, WakeLimits, Workday};
 use harness_providers::{CapabilityProfile, ContentBlock, Message, Provider};
 use harness_store::{Store, StoreError, WorkdayPolicy};
+use harness_tools::memory::MemoryFiles;
 use harness_tools::{Policy, PolicyExecutor, SleepTool};
 
 use crate::report::Report;
@@ -48,20 +49,33 @@ pub async fn run(
 ) -> Result<Report, RunError> {
     let clock = Arc::new(FakeClock::new(scenario.start));
     let workdir = tempfile::tempdir()?;
+    let state_dir = tempfile::tempdir()?;
     let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
     let mut executor = PolicyExecutor::new(Policy::conservative(workdir.path()), clock.clone())
         .with_tool(SleepTool)
         .with_tool(MessageSend {
             outbox: outbox.clone(),
         });
+    // Memory as the daemon wires it: the tools, and a snapshot that each
+    // new day starts from.
+    let policy = WorkdayPolicy::default();
+    let memory = Arc::new(MemoryFiles::open(
+        workdir.path().join("memory"),
+        Some(state_dir.path().join("memory.git")),
+        policy.offset,
+        scenario.start,
+    )?);
+    for tool in harness_tools::memory::tools(memory.clone()) {
+        executor.register(tool);
+    }
     let mut store = Store::open_in_memory()?;
-    let assembler = ContextAssembler {
+    let mut assembler = ContextAssembler {
         profile: profile_name.into(),
         static_prefix: static_prefix(scenario),
         memory_snapshot: String::new(),
         max_output_tokens: 4096,
     };
-    let mut rhythm = Rhythm::new(WorkdayPolicy::default(), scenario.start);
+    let mut rhythm = Rhythm::new(policy, scenario.start);
 
     let events = &scenario.events;
     let mut delivered = 0;
@@ -88,6 +102,9 @@ pub async fn run(
         clock.set(at);
 
         rhythm.close_day_if_due(&store, at)?;
+        if store.current_day()?.is_none() {
+            assembler.memory_snapshot = memory.snapshot()?;
+        }
 
         let arrived = events[delivered..]
             .iter()

@@ -22,7 +22,7 @@ use harness_providers::{
 };
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
-use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, SleepTool};
 use harness_workspace::Workspace;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -38,6 +38,9 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The store's file inside `state_dir`.
 const STORE_FILE: &str = "harness.sqlite3";
+/// The git repository that keeps the memory folder's history, inside
+/// `state_dir`, out of the agent's reach.
+const MEMORY_HISTORY: &str = "memory.git";
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +75,11 @@ pub struct AgentConfig {
     /// the inbox polling fallback.
     #[serde(default)]
     pub workspace: Option<crate::polling::WorkspaceConfig>,
+    /// The agent's own memory: MEMORY.md, USER.md, the handoff note and the
+    /// journal, in a git repo. Defaults to `memory` in the work area, where
+    /// the path walls apply.
+    #[serde(default)]
+    pub memory_dir: Option<PathBuf>,
 }
 
 fn default_quiet_hour() -> u8 {
@@ -115,6 +123,11 @@ pub struct Agent {
     pub limits: WakeLimits,
     /// Shared by the agent's Workspace tools and the inbox poller.
     pub workspace: Option<Arc<Workspace>>,
+    /// The memory files; the snapshot of them starts each day.
+    pub memory: Option<Arc<MemoryFiles>>,
+    /// Whether today's memory snapshot is in the prompt. Until it is, each
+    /// wake tries again.
+    pub memory_settled: bool,
     /// Events not yet in a wake: optional news held for the next look, and
     /// whatever arrived too late to join the last wake.
     pub waiting: Vec<WakeEvent>,
@@ -152,9 +165,83 @@ impl Agent {
             source,
         })?;
         let store = Store::open(&config.state_dir.join(STORE_FILE))?;
+        // Absolute, so the walls compare like with like.
+        let workdir = std::path::absolute(&config.workdir).map_err(|source| AgentError::Read {
+            field: "workdir",
+            source,
+        })?;
         let mut executor =
-            PolicyExecutor::new(Policy::conservative(&config.workdir), clock.clone())
-                .with_tool(SleepTool);
+            PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
+        let memory_dir = config
+            .memory_dir
+            .clone()
+            .unwrap_or_else(|| workdir.join("memory"));
+        let memory_dir = std::path::absolute(&memory_dir).map_err(|source| AgentError::Read {
+            field: "memory_dir",
+            source,
+        })?;
+        // The snapshot goes straight into every request, so the folder has
+        // to be one the walls let the agent use anyway.
+        let inside = |root: &Path, dir: &Path| {
+            matches!(
+                Policy::conservative(root).check(&Effect::WritePath(dir.to_path_buf())),
+                Decision::Allow
+            )
+        };
+        let outside = || {
+            AgentError::Invalid(
+                "memory_dir must be inside workdir, where the agent's walls allow it".into(),
+            )
+        };
+        // Where workdir really is, in case it's reached through a link.
+        let real_workdir = std::fs::create_dir_all(&workdir)
+            .and_then(|()| workdir.canonicalize())
+            .map_err(|source| AgentError::Read {
+                field: "workdir",
+                source,
+            })?;
+        if !inside(&workdir, &memory_dir) {
+            return Err(outside());
+        }
+        // Only the runtime may write the history's git config, or a filter
+        // set there would run on the next save: it can't be where the
+        // agent's tools reach.
+        let state_dir = config
+            .state_dir
+            .canonicalize()
+            .map_err(|source| AgentError::Read {
+                field: "state_dir",
+                source,
+            })?;
+        // The history can't hold the work area either: workdir at or under
+        // it would put the repository's own files within reach.
+        let history = state_dir.join(MEMORY_HISTORY);
+        let reachable = [&real_workdir, &workdir].iter().any(|work| {
+            state_dir.starts_with(work) || history.starts_with(work) || work.starts_with(&history)
+        });
+        if reachable {
+            return Err(AgentError::Invalid(
+                "state_dir must be outside workdir, where the agent's tools can't reach it".into(),
+            ));
+        }
+        let memory = Arc::new(
+            MemoryFiles::open(memory_dir.clone(), Some(history), offset, clock.now()).map_err(
+                |source| AgentError::Read {
+                    field: "memory_dir",
+                    source,
+                },
+            )?,
+        );
+        // Where it really is, now that it exists.
+        if !inside(&real_workdir, memory.location()) {
+            return Err(outside());
+        }
+        if !memory.has_history() {
+            eprintln!("harness-daemon: git isn't available, so memory changes have no history");
+        }
+        for tool in harness_tools::memory::tools(memory.clone()) {
+            executor.register(tool);
+        }
         let workspace = match &config.workspace {
             Some(settings) => {
                 settings.poll_every()?;
@@ -187,6 +274,8 @@ impl Agent {
             rhythm,
             limits: WakeLimits::default(),
             workspace,
+            memory: Some(memory),
+            memory_settled: false,
             waiting: Vec::new(),
         })
     }
@@ -270,6 +359,38 @@ impl Agent {
     ) -> Result<(), harness_store::StoreError> {
         let at = self.clock.now();
         self.rhythm.close_day_if_due(&self.store, at)?;
+        // A new day starts from what the agent remembers now; the snapshot
+        // then stays fixed all day, so the prompt cache keeps hitting. It's
+        // saved, so a restart mid-day picks up the same one.
+        // If the files can't be read, the wake goes ahead with a note saying
+        // so, nothing is saved, and the next wake tries again.
+        if let Some(memory) = &self.memory {
+            let new_day = self.store.current_day()?.is_none();
+            if new_day {
+                self.store.set_memory_snapshot(None)?;
+                self.memory_settled = false;
+            }
+            if !self.memory_settled {
+                let snapshot = match self.store.memory_snapshot()? {
+                    Some(saved) => Ok(saved),
+                    None => memory.snapshot(),
+                };
+                match snapshot {
+                    Ok(snapshot) => {
+                        self.store.set_memory_snapshot(Some(&snapshot))?;
+                        self.assembler.memory_snapshot = snapshot;
+                        self.memory_settled = true;
+                    }
+                    Err(e) => {
+                        eprintln!("harness-daemon: memory snapshot failed: {e}");
+                        self.assembler.memory_snapshot = format!(
+                            "(Your memory files couldn't be read at the start of this wake: {e}. \
+                             They'll be read again next wake.)"
+                        );
+                    }
+                }
+            }
+        }
         // If the process dies mid-wake, the restart waits this long rather
         // than wake straight away, so a crash can't become a loop of paid
         // wakes.
