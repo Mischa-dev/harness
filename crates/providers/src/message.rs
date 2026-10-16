@@ -130,9 +130,17 @@ impl Usage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelResponse {
+    pub message: Message,
+    pub stop_reason: StopReason,
+    pub usage: Usage,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn usage_counters_saturate_on_untrusted_provider_values() {
@@ -153,11 +161,75 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, u64::MAX);
         assert_eq!(usage.cache_write_tokens, u64::MAX);
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelResponse {
-    pub message: Message,
-    pub stop_reason: StopReason,
-    pub usage: Usage,
+    #[test]
+    fn tool_calls_select_only_calls_and_preserve_order() {
+        let first = ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({"path": "README.md"}),
+        };
+        let second = ToolCall {
+            id: "2".into(),
+            name: "sleep".into(),
+            arguments: json!({"minutes": 60}),
+        };
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "I'll check.".into(),
+                },
+                ContentBlock::ToolCall(first.clone()),
+                ContentBlock::Opaque {
+                    provider: "test".into(),
+                    data: json!({"token": 1}),
+                },
+                ContentBlock::ToolCall(second.clone()),
+            ],
+        };
+
+        assert_eq!(
+            message.tool_calls().cloned().collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn usage_add_accumulates_every_token_class() {
+        let mut total = Usage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_read_tokens: 3,
+            cache_write_tokens: 4,
+        };
+        total.add(Usage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: 30,
+            cache_write_tokens: 40,
+        });
+        assert_eq!(
+            total,
+            Usage {
+                input_tokens: 11,
+                output_tokens: 22,
+                cache_read_tokens: 33,
+                cache_write_tokens: 44
+            }
+        );
+    }
+
+    #[test]
+    fn internal_messages_round_trip_without_losing_opaque_blocks() {
+        let message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Opaque {
+                provider: "anthropic".into(),
+                data: json!({"type": "thinking", "signature": "scrubbed"}),
+            }],
+        };
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&encoded).unwrap(), message);
+    }
 }
