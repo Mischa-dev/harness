@@ -7,11 +7,10 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use harness_core::{Clock, FakeClock, WakeReason};
-use harness_loop::{ContextAssembler, WakeEnd, WakeLimits, Workday};
+use harness_loop::{AfterWake, ContextAssembler, Rhythm, WakeLimits, Workday};
 use harness_providers::{CapabilityProfile, ContentBlock, Message, Provider};
 use harness_store::{Store, StoreError, WorkdayPolicy};
 use harness_tools::{Policy, PolicyExecutor, SleepTool};
-use time::Duration;
 
 use crate::report::Report;
 use crate::scenario::Scenario;
@@ -19,10 +18,6 @@ use crate::world::{MessageSend, Outbox, wake_message};
 
 /// A safety net against a runaway agent or a bug in the runner.
 const MAX_WAKES: usize = 2_000;
-
-/// When the agent ends a wake without choosing a next look, the runner picks
-/// one, as the daemon will.
-const DEFAULT_NEXT_LOOK: Duration = Duration::hours(1);
 
 /// Placeholder until the charter lands in `prompts/` (M1).
 fn static_prefix(scenario: &Scenario) -> String {
@@ -66,14 +61,12 @@ pub async fn run(
         memory_snapshot: String::new(),
         max_output_tokens: 4096,
     };
-    let policy = WorkdayPolicy::default();
+    let mut rhythm = Rhythm::new(WorkdayPolicy::default(), scenario.start);
 
     let events = &scenario.events;
     let mut delivered = 0;
-    let mut next_look = scenario.start;
     let mut days = BTreeSet::new();
     let mut errors = Vec::new();
-    let mut paused = None;
     let mut wakes = 0;
 
     loop {
@@ -81,6 +74,7 @@ pub async fn run(
             .iter()
             .find(|e| e.addressed)
             .map(|e| e.at);
+        let next_look = rhythm.next_look();
         let at = next_addressed.map_or(next_look, |t| t.min(next_look));
         if at >= scenario.end {
             break;
@@ -93,12 +87,7 @@ pub async fn run(
         }
         clock.set(at);
 
-        // The evening turn proper comes later; for now the day just ends.
-        if let Some(day) = store.current_day()?
-            && policy.evening_due(&day, at).is_some()
-        {
-            store.end_day(day.id, at, None)?;
-        }
+        rhythm.close_day_if_due(&store, at)?;
 
         let arrived = events[delivered..]
             .iter()
@@ -139,24 +128,11 @@ pub async fn run(
             days.insert(day.id);
         }
 
-        next_look = match result {
-            Ok(outcome) => match outcome.end {
-                WakeEnd::Slept { until } => until,
-                WakeEnd::Paused { breaker } => {
-                    paused = Some(breaker);
-                    break;
-                }
-                other => {
-                    // The wake didn't end with a chosen next look.
-                    errors.push(format!("wake at {at} ended {}", other.label()));
-                    clock.now() + DEFAULT_NEXT_LOOK
-                }
-            },
-            Err(err) => {
-                errors.push(err.to_string());
-                clock.now() + DEFAULT_NEXT_LOOK
-            }
-        };
+        match rhythm.after(&result, clock.now()) {
+            AfterWake::Slept => {}
+            AfterWake::Paused { .. } => break,
+            AfterWake::Fallback { problem } => errors.push(format!("wake at {at}: {problem}")),
+        }
     }
 
     let records = store.wakes_since(scenario.start)?;
@@ -183,7 +159,7 @@ pub async fn run(
         sent,
         blocked,
         errors,
-        paused,
+        rhythm.paused().map(str::to_string),
         days.len(),
     ))
 }

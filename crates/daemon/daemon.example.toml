@@ -20,3 +20,20 @@ name = "openrouter"
 upstream = "https://openrouter.ai/api"
 auth = "bearer"
 key_file = "/run/credentials/harness-daemon.service/openrouter"
+
+# The wake loop: `harness-daemon run --config <path>`. Run it as its own
+# service, separate from the proxy, with only the caller token as a
+# credential; it never sees a provider key.
+[agent]
+state_dir = "/var/lib/harness"
+workdir = "/home/agent"
+profiles_file = "/etc/harness/profiles.toml"
+# A profile name from profiles_file; the model itself is set there.
+profile = "main"
+# The proxy route for that profile's provider. Must be on loopback.
+model_url = "http://127.0.0.1:8787/anthropic"
+caller_token_file = "/run/credentials/harness-agent.service/caller-token"
+charter_file = "/etc/harness/charter.md"
+# The owner's local hour when the day ends, and their offset from UTC.
+quiet_hour = 2
+utc_offset_hours = 0

@@ -44,6 +44,23 @@ impl WakeReason {
             _ => Urgency::Queued,
         }
     }
+
+    /// One line for the wake message, saying why the agent is awake.
+    pub fn describe(&self) -> String {
+        match self {
+            WakeReason::Workspace { summary, .. } => summary.clone(),
+            WakeReason::Trigger { name } => format!("the trigger {name} fired"),
+            WakeReason::FollowUp { note, .. } => format!("your follow-up came due: {note}"),
+            WakeReason::WorkerFinished { worker_id } => format!("worker {worker_id} finished"),
+            WakeReason::Claim {
+                claim_id,
+                importance,
+            } => format!("claim {claim_id} scored {importance} in your area"),
+            WakeReason::Blocked { reason } => format!("one of your actions was blocked: {reason}"),
+            WakeReason::Filter { reason } => reason.clone(),
+            WakeReason::NextLook => "the time you chose to look again".into(),
+        }
+    }
 }
 
 #[cfg(test)]
