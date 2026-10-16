@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/sim",
     "crates/workspace",
+    "crates/workers",
     "crates/daemon",
 ]
 
@@ -34,6 +35,7 @@ harness-tools = { path = "crates/tools" }
 harness-store = { path = "crates/store" }
 harness-loop = { path = "crates/loop" }
 harness-workspace = { path = "crates/workspace" }
+harness-workers = { path = "crates/workers" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

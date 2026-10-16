@@ -4,6 +4,7 @@
 pub mod schedule;
 mod schema;
 pub mod workday;
+pub mod workers;
 
 use std::path::Path;
 
@@ -13,6 +14,7 @@ use time::OffsetDateTime;
 
 pub use schedule::{Repeat, ScheduleBook, Scheduled};
 pub use workday::{EveningReason, WorkdayPolicy};
+pub use workers::{LockConflict, LockPath, NewWorker, WorkerBook, WorkerRecord, WorkerState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
