@@ -120,6 +120,10 @@ impl MemoryFiles {
             )
             .is_ok_and(|ok| ok);
             if !started {
+                // Nothing staged before now goes into the first commit.
+                if !git(git_dir, &real, &["read-tree", "--empty"]).is_ok_and(|ok| ok) {
+                    return false;
+                }
                 let journal = journal_files(&real);
                 let present: Vec<&str> = FILES
                     .iter()
@@ -485,8 +489,9 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// Whether anything under `dir` is other than a regular file or a real
-/// folder (a link, a FIFO, a device), looking without following.
+/// Whether anything under `dir` is other than a real folder or a regular
+/// file of its own (a link, a FIFO, a device, a hard link), looking
+/// without following.
 fn has_odd_entries(dir: &Path) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -494,7 +499,8 @@ fn has_odd_entries(dir: &Path) -> std::io::Result<bool> {
         let odd = if kind.is_dir() {
             has_odd_entries(&entry.path())?
         } else {
-            !kind.is_file()
+            // A hard-linked file would carry git's writes to its other name.
+            !lone_file(&entry.metadata()?)
         };
         if odd {
             return Ok(true);
@@ -969,7 +975,19 @@ mod tests {
             "*.md working-tree-encoding=UTF-16 eol=crlf\n",
         )
         .unwrap();
+        // Something staged in a history with no commits yet stays out.
         let history = tmp.path().join("memory.git");
+        std::fs::write(dir.join(".env"), "TOKEN=x").unwrap();
+        for args in [&["init", "--quiet"][..], &["add", "--force", ".env"]] {
+            let status = Command::new("git")
+                .env("GIT_DIR", &history)
+                .env("GIT_WORK_TREE", &dir)
+                .current_dir(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
         let at = datetime!(2026-01-05 00:00 UTC);
         let files = MemoryFiles::open(&dir, Some(history.clone()), offset!(-7), at).unwrap();
         assert_eq!(commits(&history), 1);
@@ -985,6 +1003,7 @@ mod tests {
         assert_eq!(show("HEAD:MEMORY.md"), "- from before\n");
         assert_eq!(show("HEAD:journal/2026-01-04.md"), "- yesterday\n");
         assert_eq!(show("HEAD:journal/token.txt"), "");
+        assert_eq!(show("HEAD:.env"), "");
         files
             .save("MEMORY.md", "- now\n", false, "Update MEMORY.md", at)
             .unwrap();
@@ -1079,7 +1098,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn links_or_fifos_in_the_history_turn_it_off() {
+    fn odd_files_in_the_history_turn_it_off() {
         let tmp = tempfile::tempdir().unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
@@ -1095,6 +1114,22 @@ mod tests {
         .unwrap();
         assert!(!files.has_history());
         assert!(!outside.join("attributes").exists());
+
+        // Nor does a file with another name outside.
+        let history = tmp.path().join("linked.git");
+        std::fs::create_dir(&history).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::write(&elsewhere, "outside").unwrap();
+        std::fs::hard_link(&elsewhere, history.join("HEAD")).unwrap();
+        let files = MemoryFiles::open(
+            tmp.path().join("memory"),
+            Some(history),
+            offset!(-7),
+            datetime!(2026-01-05 00:00 UTC),
+        )
+        .unwrap();
+        assert!(!files.has_history());
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "outside");
 
         // Nor does a FIFO where git would read.
         let history = tmp.path().join("fifo.git");
