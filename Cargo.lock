@@ -451,6 +451,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-workers"
+version = "0.1.0"
+dependencies = [
+ "harness-store",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "harness-workspace"
 version = "0.1.0"
 dependencies = [

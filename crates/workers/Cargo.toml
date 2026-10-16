@@ -1,0 +1,18 @@
+[package]
+name = "harness-workers"
+description = "Workers the agent hands work to: their git worktrees, and the paths they may change."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+harness-store.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

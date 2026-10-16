@@ -62,6 +62,30 @@ const MIGRATIONS: &[&str] = &[
          cost_usd REAL NOT NULL
      );
      CREATE INDEX helper_calls_at ON helper_calls(at);",
+    // 6: workers the agent spawned, and the paths each one holds. A lock
+    // counts only until its lease runs out, so a crash can't hold a path
+    // for ever.
+    "CREATE TABLE workers (
+         id INTEGER PRIMARY KEY,
+         kind TEXT NOT NULL,
+         repo TEXT NOT NULL,
+         base TEXT NOT NULL,
+         branch TEXT NOT NULL,
+         worktree TEXT NOT NULL,
+         brief TEXT NOT NULL,
+         state TEXT NOT NULL CHECK (state IN ('running', 'finished', 'failed', 'stopped')),
+         started_at INTEGER NOT NULL,
+         ended_at INTEGER,
+         summary TEXT
+     );
+     CREATE TABLE path_locks (
+         worker_id INTEGER NOT NULL REFERENCES workers(id) ON DELETE CASCADE,
+         repo TEXT NOT NULL,
+         path TEXT NOT NULL,
+         lease_until INTEGER NOT NULL,
+         PRIMARY KEY (worker_id, path)
+     );
+     CREATE INDEX path_locks_repo ON path_locks(repo, lease_until);",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
