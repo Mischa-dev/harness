@@ -357,9 +357,10 @@ fn plain_file(path: &Path) -> bool {
 /// big the file has grown.
 fn read_capped(path: &Path, limit: usize) -> std::io::Result<String> {
     let mut bytes = Vec::new();
-    // A character is at most 4 bytes, so one more byte than that shows
-    // whether there is more.
-    let most = limit as u64 * 4 + 1;
+    // A character is at most 4 bytes; the slack past that covers the
+    // trailing whitespace a file ends with, so reading all of `most` means
+    // there really is more.
+    let most = limit as u64 * 4 + 64;
     match open_file(path, OpenOptions::new().read(true)) {
         Ok(file) => file.take(most).read_to_end(&mut bytes)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -1224,17 +1225,19 @@ mod tests {
         let (_tmp, files) = open();
         let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
         let write = tools(files.clone()).remove(1);
-        let full = "x".repeat(6_000);
-        run(
-            write.as_ref(),
-            json!({"file": "memory", "content": format!("{full}\n\n")}),
-            &clock,
-        )
-        .await
-        .unwrap();
-        let snapshot = files.snapshot().unwrap();
-        assert!(snapshot.contains(&full));
-        assert!(!snapshot.contains("[cut at"));
+        // Including when every character takes four bytes.
+        for full in ["x".repeat(6_000), "🦀".repeat(6_000)] {
+            run(
+                write.as_ref(),
+                json!({"file": "memory", "content": format!("{full}\n\n")}),
+                &clock,
+            )
+            .await
+            .unwrap();
+            let snapshot = files.snapshot().unwrap();
+            assert!(snapshot.contains(&full));
+            assert!(!snapshot.contains("[cut at"));
+        }
     }
 
     #[tokio::test]
