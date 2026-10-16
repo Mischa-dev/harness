@@ -2,11 +2,13 @@
 //! tool call through the policy executor, and repeats until the agent calls
 //! `sleep`.
 
+pub mod charter;
 pub mod context;
 pub mod day;
 pub mod rhythm;
 pub mod wake;
 
+pub use charter::CharterValues;
 pub use context::ContextAssembler;
 pub use day::{DayError, Workday};
 pub use rhythm::{AfterWake, FALLBACK_NEXT_LOOK, Rhythm};

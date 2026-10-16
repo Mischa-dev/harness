@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use harness_core::{Clock, Urgency, WakeReason};
 use harness_loop::{
-    AfterWake, ContextAssembler, FALLBACK_NEXT_LOOK, Interrupts, NoInterrupts, Rhythm, WakeLimits,
-    WakeOutcome, Workday,
+    AfterWake, CharterValues, ContextAssembler, FALLBACK_NEXT_LOOK, Interrupts, NoInterrupts,
+    Rhythm, WakeLimits, WakeOutcome, Workday,
 };
 use harness_providers::{
     CapabilityProfile, Message, Profiles, Provider, ReqwestTransport, adapters,
@@ -57,8 +57,12 @@ pub struct AgentConfig {
     pub model_url: String,
     /// The same file the proxy reads. Workers never get it.
     pub caller_token_file: PathBuf,
-    /// The charter and SOUL: the fixed start of every request.
+    /// The charter and SOUL: the fixed start of every request. Its
+    /// `{{agent_name}}`, `{{owner_name}}` and `{{responsibilities}}` come
+    /// from `identity`.
     pub charter_file: PathBuf,
+    #[serde(default)]
+    pub identity: IdentityConfig,
     /// The owner's local hour (0–23) when the day ends.
     #[serde(default = "default_quiet_hour")]
     pub quiet_hour: u8,
@@ -85,11 +89,44 @@ pub struct AgentConfig {
     pub shell: Option<ShellConfig>,
 }
 
+/// Who the agent is and who it works for, for the charter.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityConfig {
+    pub name: Option<String>,
+    /// The person it works for: the only one who can authorize anything
+    /// behind a wall.
+    pub owner: Option<String>,
+    /// What it owns, from its declaration: two to five, one line each.
+    #[serde(default)]
+    pub responsibilities: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellConfig {
     /// Bubblewrap, which builds the sandbox, such as `/usr/bin/bwrap`.
     pub bwrap: PathBuf,
+}
+
+/// The charter with its placeholders filled in. One with no values to
+/// fill is used as it is, so a charter written out in full needs no
+/// identity.
+fn render_charter(template: &str, identity: &IdentityConfig) -> Result<String, AgentError> {
+    let rendered = match (&identity.name, &identity.owner) {
+        (Some(name), Some(owner)) => CharterValues {
+            agent_name: name.clone(),
+            owner_name: owner.clone(),
+            responsibilities: identity.responsibilities.clone(),
+        }
+        .render(template),
+        _ => harness_loop::charter::render(template, &[]),
+    };
+    rendered.map_err(|e| {
+        AgentError::Invalid(format!(
+            "charter_file: {e}; [agent.identity] needs name and owner"
+        ))
+    })
 }
 
 fn default_quiet_hour() -> u8 {
@@ -166,7 +203,10 @@ impl Agent {
         .map_err(|e| AgentError::Invalid(format!("model_url or caller_token_file: {e}")))?;
         let provider = adapters::for_profile(&profile, &config.model_url, Arc::new(transport))
             .map_err(|e| AgentError::Invalid(e.to_string()))?;
-        let charter = read("charter_file", &config.charter_file)?;
+        let charter = render_charter(
+            &read("charter_file", &config.charter_file)?,
+            &config.identity,
+        )?;
         if config.quiet_hour > 23 {
             return Err(AgentError::Invalid("quiet_hour must be 0–23".into()));
         }

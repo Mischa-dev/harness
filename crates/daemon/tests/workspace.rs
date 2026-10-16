@@ -113,6 +113,7 @@ fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
         max_output_tokens: 1024,
         wakeups: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
         workspace: Some(WorkspaceConfig {
             url: format!("http://{workspace}/api/v1/mcp"),

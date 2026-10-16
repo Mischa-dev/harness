@@ -101,6 +101,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
@@ -152,6 +153,7 @@ fn a_missing_charter_is_named_without_its_path() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -510,6 +512,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(dir.path().join("work/mind")),
+        identity: Default::default(),
         shell: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
@@ -590,6 +593,7 @@ async fn memory_that_cant_be_read_is_tried_again_next_wake() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(dir.path().join("work/mind")),
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -647,6 +651,7 @@ fn memory_must_live_inside_the_work_area() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(elsewhere.path().to_path_buf()),
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -680,6 +685,7 @@ fn a_linked_workdir_still_holds_the_memory() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -706,6 +712,7 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -753,6 +760,7 @@ async fn the_file_tools_stay_where_workdir_was_at_startup() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -791,6 +799,7 @@ fn credentials_stay_out_of_the_work_area() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -843,6 +852,7 @@ fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(work.join("out/memory")),
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -875,6 +885,7 @@ fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -927,6 +938,7 @@ async fn the_shell_works_in_the_work_area_and_leaves_memory_alone() {
         wakeups: None,
         workspace: None,
         memory_dir: Some(work.join("mind")),
+        identity: Default::default(),
         shell: Some(ShellConfig { bwrap }),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
@@ -967,6 +979,7 @@ fn the_shell_needs_bubblewraps_full_path() {
         wakeups: None,
         workspace: None,
         memory_dir: None,
+        identity: Default::default(),
         shell: Some(ShellConfig {
             bwrap: "bwrap".into(),
         }),
@@ -976,4 +989,44 @@ fn the_shell_needs_bubblewraps_full_path() {
         panic!("a bare program name was accepted");
     };
     assert!(err.to_string().contains("shell.bwrap"), "{err}");
+}
+
+#[test]
+fn the_charter_is_filled_in_from_the_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let template = "<!-- for editors -->\nYou are {{agent_name}}, working for {{owner_name}}.\n\
+                    {{responsibilities}}";
+    let mut config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", template),
+        identity: Default::default(),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+        shell: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock.clone()) else {
+        panic!("a charter with unfilled placeholders was accepted");
+    };
+    assert!(err.to_string().contains("{{agent_name}}"), "{err}");
+
+    config.identity = harness_daemon::agent::IdentityConfig {
+        name: Some("Mara".into()),
+        owner: Some("Mischa".into()),
+        responsibilities: vec!["keep CI green".into()],
+    };
+    let agent = Agent::from_config(&config, clock).unwrap();
+    assert_eq!(
+        agent.assembler.static_prefix,
+        "You are Mara, working for Mischa.\n- keep CI green"
+    );
 }

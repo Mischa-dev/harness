@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use harness_core::{Clock, FakeClock, WakeReason};
-use harness_loop::{AfterWake, ContextAssembler, Rhythm, WakeLimits, Workday};
+use harness_loop::{AfterWake, CharterValues, ContextAssembler, Rhythm, WakeLimits, Workday};
 use harness_providers::{CapabilityProfile, ContentBlock, Message, Provider};
 use harness_store::{Store, StoreError, WorkdayPolicy};
 use harness_tools::memory::MemoryFiles;
@@ -20,13 +20,18 @@ use crate::world::{MessageSend, Outbox, wake_message};
 /// A safety net against a runaway agent or a bug in the runner.
 const MAX_WAKES: usize = 2_000;
 
-/// Placeholder until the charter lands in `prompts/` (M1).
+/// The real charter, so a real-model run is judged on what the agent will
+/// actually be told.
+const CHARTER: &str = include_str!("../../../prompts/teammate-charter.md");
+
 fn static_prefix(scenario: &Scenario) -> String {
-    format!(
-        "You are {}, a teammate on a small software team. Answer what is addressed \
-         to you, stay quiet otherwise, and end every wake by calling `sleep`.",
-        scenario.agent
-    )
+    CharterValues {
+        agent_name: scenario.agent.clone(),
+        owner_name: "Mischa".into(),
+        responsibilities: vec![],
+    }
+    .render(CHARTER)
+    .expect("the charter's placeholders are all filled")
 }
 
 #[derive(Debug, thiserror::Error)]
