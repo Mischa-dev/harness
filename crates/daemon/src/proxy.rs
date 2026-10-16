@@ -90,7 +90,7 @@ impl Route {
     /// `key` is used as given; for tests and for keys from other sources.
     pub fn new(name: &str, upstream: &str, auth: Auth, key: &str) -> Result<Self, ConfigError> {
         validate_name(name)?;
-        validate_upstream(upstream)?;
+        validate_upstream(name, upstream)?;
         let key = key.trim();
         if key.is_empty() || HeaderValue::from_str(key).is_err() {
             return Err(ConfigError::Invalid(format!(
@@ -165,11 +165,13 @@ fn validate_name(name: &str) -> Result<(), ConfigError> {
     }
 }
 
-/// Keys only travel over HTTPS, except to a server on this machine.
-fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
+/// Keys only travel over HTTPS, except to a server on this machine. The
+/// error names the route, not the URL, which may hold a credential.
+fn validate_upstream(name: &str, upstream: &str) -> Result<(), ConfigError> {
     let invalid = || {
         ConfigError::Invalid(format!(
-            "upstream {upstream:?}: use https://, or http:// only for localhost"
+            "route {name:?}: the upstream must be https://, or http:// only for localhost, \
+             with no credentials, query or fragment"
         ))
     };
     let url = reqwest::Url::parse(upstream).map_err(|_| invalid())?;
@@ -352,7 +354,7 @@ mod tests {
             "http://localhost:9000/v1",
             "http://[::1]:9000",
         ] {
-            assert!(validate_upstream(ok).is_ok(), "{ok}");
+            assert!(validate_upstream("r", ok).is_ok(), "{ok}");
         }
         for bad in [
             "http://api.anthropic.com",
@@ -363,7 +365,8 @@ mod tests {
             "https://example.com/?a=b",
             "not a url",
         ] {
-            assert!(validate_upstream(bad).is_err(), "{bad}");
+            let err = validate_upstream("r", bad).unwrap_err().to_string();
+            assert!(!err.contains("secret") && !err.contains("user@"), "{err}");
         }
     }
 
