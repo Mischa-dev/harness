@@ -296,11 +296,23 @@ impl Agent {
         let at = self.clock.now();
         self.rhythm.close_day_if_due(&self.store, at)?;
         // A new day starts from what the agent remembers now; the snapshot
-        // then stays fixed all day, so the prompt cache keeps hitting.
-        if let Some(memory) = &self.memory
-            && self.store.current_day()?.is_none()
-        {
-            self.assembler.memory_snapshot = memory.snapshot();
+        // then stays fixed all day, so the prompt cache keeps hitting. It's
+        // saved, so a restart mid-day picks up the same one.
+        if let Some(memory) = &self.memory {
+            if self.store.current_day()?.is_none() {
+                self.assembler.memory_snapshot = memory.snapshot();
+                self.store
+                    .set_memory_snapshot(&self.assembler.memory_snapshot)?;
+            } else if self.assembler.memory_snapshot.is_empty() {
+                self.assembler.memory_snapshot = match self.store.memory_snapshot()? {
+                    Some(saved) => saved,
+                    None => {
+                        let snapshot = memory.snapshot();
+                        self.store.set_memory_snapshot(&snapshot)?;
+                        snapshot
+                    }
+                };
+            }
         }
         // If the process dies mid-wake, the restart waits this long rather
         // than wake straight away, so a crash can't become a loop of paid

@@ -5,8 +5,13 @@
 //! "Memory").
 //!
 //! The folder lives in the agent's work area, so the policy executor's
-//! path walls apply to every read and write like any other file.
+//! path walls apply to every read and write like any other file. Files are
+//! opened without following a symlink at the last step: the walls may judge
+//! only the journal folder, and a link planted in a restored or edited repo
+//! mustn't lead outside it.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -69,15 +74,16 @@ impl MemoryFiles {
     }
 
     /// `MEMORY.md`, `USER.md` and the handoff note, for the start of a day.
+    /// Each is held to its cap, even if it was edited outside the tools.
     pub fn snapshot(&self) -> String {
         FILES
             .iter()
-            .map(|(_, name, _)| {
-                let text = std::fs::read_to_string(self.dir.join(name)).unwrap_or_default();
-                let text = text.trim();
+            .map(|(_, name, cap)| {
+                let text = read_file(&self.dir.join(name)).unwrap_or_default();
+                let text = cut(text.trim(), *cap);
                 format!(
                     "## {name}\n{}",
-                    if text.is_empty() { "(empty)" } else { text }
+                    if text.is_empty() { "(empty)" } else { &text }
                 )
             })
             .collect::<Vec<_>>()
@@ -104,16 +110,14 @@ impl MemoryFiles {
     ) -> Result<(), ToolError> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.dir.join(relative);
-        let result = if append {
-            use std::io::Write;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .and_then(|mut file| file.write_all(text.as_bytes()))
+        let mut options = OpenOptions::new();
+        if append {
+            options.create(true).append(true);
         } else {
-            std::fs::write(&path, text)
-        };
+            options.create(true).write(true).truncate(true);
+        }
+        let result =
+            open_file(&path, &mut options).and_then(|mut file| file.write_all(text.as_bytes()));
         result.map_err(|e| ToolError::Failed(format!("couldn't save {relative}: {}", e.kind())))?;
         // A failed commit loses history, not the change, so it doesn't fail
         // the write.
@@ -136,6 +140,38 @@ impl MemoryFiles {
             );
         }
         Ok(())
+    }
+}
+
+/// Opens `path` without following a symlink at its last step.
+fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::other("the file is a symlink"));
+    }
+    options.open(path)
+}
+
+/// The file's text, or empty if it doesn't exist yet.
+fn read_file(path: &Path) -> std::io::Result<String> {
+    let mut text = String::new();
+    match open_file(path, OpenOptions::new().read(true)) {
+        Ok(mut file) => file.read_to_string(&mut text).map(|_| text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(text),
+        Err(e) => Err(e),
+    }
+}
+
+/// `text` within `limit` characters, saying so if it was cut.
+fn cut(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        None => text.to_string(),
+        Some((at, _)) => format!("{}\n[cut at {limit} characters]", &text[..at]),
     }
 }
 
@@ -228,20 +264,12 @@ impl Tool for MemoryRead {
 
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let path = self.path(args, Some(ctx.clock.now()))?;
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(ToolError::Failed(format!("couldn't read it: {}", e.kind()))),
-        };
+        let text = read_file(&path)
+            .map_err(|e| ToolError::Failed(format!("couldn't read it: {}", e.kind())))?;
         if text.trim().is_empty() {
             return Ok(ToolOutput::text("(empty)"));
         }
-        Ok(ToolOutput::text(
-            match text.char_indices().nth(MAX_READ_CHARS) {
-                None => text,
-                Some((cut, _)) => format!("{}\n[cut at {MAX_READ_CHARS} characters]", &text[..cut]),
-            },
-        ))
+        Ok(ToolOutput::text(cut(&text, MAX_READ_CHARS)))
     }
 }
 
@@ -534,6 +562,53 @@ mod tests {
                 .is_err()
         );
         assert!(files.snapshot().matches("(empty)").count() == 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn links_planted_in_the_folder_lead_nowhere() {
+        let (tmp, files) = open();
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let [read, write, journal] = <[Box<dyn Tool>; 3]>::try_from(tools(files.clone()))
+            .ok()
+            .unwrap();
+        let secret = tmp.path().join("secret.txt");
+        std::fs::write(&secret, "outside").unwrap();
+        let link =
+            |name: &str| std::os::unix::fs::symlink(&secret, files.dir().join(name)).unwrap();
+        link("journal/2026-01-05.md");
+        link("USER.md");
+
+        assert!(
+            run(read.as_ref(), json!({"file": "journal"}), &clock)
+                .await
+                .is_err()
+        );
+        assert!(
+            run(journal.as_ref(), json!({"entry": "hello"}), &clock)
+                .await
+                .is_err()
+        );
+        assert!(
+            run(
+                write.as_ref(),
+                json!({"file": "user", "content": "overwritten"}),
+                &clock
+            )
+            .await
+            .is_err()
+        );
+        assert!(!files.snapshot().contains("outside"));
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "outside");
+    }
+
+    #[test]
+    fn the_snapshot_keeps_to_the_caps() {
+        let (_tmp, files) = open();
+        std::fs::write(files.dir().join("MEMORY.md"), "x".repeat(50_000)).unwrap();
+        let snapshot = files.snapshot();
+        assert!(snapshot.contains("[cut at 6000 characters]"));
+        assert!(snapshot.chars().count() < 6_200);
     }
 
     #[test]

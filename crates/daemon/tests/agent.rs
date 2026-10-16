@@ -537,7 +537,15 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         "- Ship the memory tools.\n"
     );
 
-    // Later the same day, the snapshot hasn't moved, so the cache holds.
+    // Later the same day, even after a restart, the snapshot hasn't moved,
+    // so the cache holds.
+    drop(agent);
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
     clock.advance(time::Duration::hours(2));
     agent.wake(Vec::new()).await.unwrap();
     assert!(

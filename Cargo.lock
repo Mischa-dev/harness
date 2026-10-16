@@ -440,6 +440,7 @@ dependencies = [
  "async-trait",
  "harness-core",
  "harness-providers",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

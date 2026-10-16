@@ -41,6 +41,9 @@ const MIGRATIONS: &[&str] = &[
          next_look INTEGER,
          paused TEXT
      );",
+    // 3: the memory snapshot the current day started from, so a restart
+    // mid-day keeps the same prompt.
+    "ALTER TABLE rhythm ADD COLUMN memory_snapshot TEXT;",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
