@@ -712,20 +712,25 @@ fn search_file(
         found.large += 1;
         return;
     }
-    if found.bytes + size > MAX_SEARCH_BYTES {
-        found.stopped = Some("too much to read");
-        return;
-    }
-    found.bytes += size;
+    // Only what's actually read counts against the budget: the start of
+    // a binary file, or all of a text one.
     let reader = match text_reader(file) {
         Ok(Some(reader)) => reader,
         // Binary, so not searched, by design.
-        Ok(None) => return,
+        Ok(None) => {
+            found.bytes += size.min(SNIFF_BYTES as u64);
+            return;
+        }
         Err(_) => {
             found.unreadable += 1;
             return;
         }
     };
+    if found.bytes + size > MAX_SEARCH_BYTES {
+        found.stopped = Some("too much to read");
+        return;
+    }
+    found.bytes += size;
     let name = shown(policy, path);
     // Whole lines are read (the file is small), so a match late in a long
     // line is still found.
@@ -1172,6 +1177,23 @@ mod tests {
             far,
             "minified.js is too big to read that far: line 2 isn't in its first 64 MiB."
         );
+    }
+
+    #[test]
+    fn binary_files_cost_only_what_was_looked_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // More binary bytes than the whole budget, sorted before the source.
+        let blob = [b"\0".as_slice(), &vec![b'x'; (1 << 20) - 1]].concat();
+        for i in 0..(MAX_SEARCH_BYTES >> 20) + 2 {
+            std::fs::write(root.join(format!("a{i:03}.bin")), &blob).unwrap();
+        }
+        std::fs::write(root.join("z.rs"), "needle\n").unwrap();
+        let policy = Policy::conservative(&root);
+        let mut found = Search::default();
+        walk(&policy, root.clone(), "needle", false, &mut found);
+        assert_eq!(found.stopped, None);
+        assert_eq!(found.matches, ["z.rs:1: needle\n"]);
     }
 
     #[tokio::test]
