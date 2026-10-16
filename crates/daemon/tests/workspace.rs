@@ -195,11 +195,13 @@ async fn the_poller_wakes_the_agent_for_requests_it_missed() {
     ]);
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
-    let agent = Agent::from_config(&config(dir.path(), addr), clock).unwrap();
+    let agent = Agent::from_config(&config(dir.path(), addr), clock.clone()).unwrap();
     let (send, mut events) = tokio::sync::mpsc::channel(8);
+    let every = Duration::from_secs(300);
     let poller = tokio::spawn(polling::poll(
         agent.workspace.clone().unwrap(),
-        Duration::from_millis(20),
+        clock.clone(),
+        every,
         send,
     ));
 
@@ -210,21 +212,38 @@ async fn the_poller_wakes_the_agent_for_requests_it_missed() {
         WakeReason::Workspace { urgent: true, .. }
     ));
     assert!(first.text.contains("1 new reply request"));
-    // An optional group request arrives later; it can wait for a look.
+    // An optional group request arrives later. The poller looks again when
+    // the runtime clock says five minutes have passed, not the wall clock.
     fake.inbox
         .lock()
         .unwrap()
         .push(request("r-3", "pending", false, 1));
-    let second = events.recv().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(events.try_recv().is_err(), "polled before it was due");
+    clock.advance(time::Duration::seconds(300));
+    let second = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("polled once it was due")
+        .unwrap();
+    // It can wait for the agent's next look.
     assert!(matches!(
         second.reason,
         WakeReason::Workspace { urgent: false, .. }
     ));
     // Nothing from the requests themselves reaches the event.
     assert!(!format!("{first:?}{second:?}").contains("proxy merged"));
-    // Nothing new: no more events, however many looks.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Nothing new: no more events at the next look either.
+    clock.advance(time::Duration::seconds(300));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(events.try_recv().is_err());
+    let polls = fake
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(name, _)| name == "inbox_list")
+        .count();
+    assert_eq!(polls, 3);
 
     drop(events);
     tokio::time::timeout(Duration::from_secs(5), poller)

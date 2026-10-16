@@ -75,7 +75,7 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let secret = std::fs::read_to_string(&wakeups.secret_file)
             .map_err(|e| format!("couldn't read wakeups.secret_file: {e}"))?;
         let secret = WebhookSecret::new(&secret)?;
-        let router = wakeup::router(&wakeups.agent_id, secret, clock, events_in.clone());
+        let router = wakeup::router(&wakeups.agent_id, secret, clock.clone(), events_in.clone());
         let listener = tokio::net::TcpListener::bind(wakeups.listen).await?;
         eprintln!("wakeups on {}", listener.local_addr()?);
         tokio::spawn(async move {
@@ -87,7 +87,7 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let (Some(settings), Some(workspace)) = (&config.workspace, agent.workspace.clone()) {
         let every = settings.poll_every()?;
         eprintln!("looking at the Workspace inbox every {}s", every.as_secs());
-        tokio::spawn(polling::poll(workspace, every, events_in.clone()));
+        tokio::spawn(polling::poll(workspace, clock, every, events_in.clone()));
     }
     // With neither, nothing sends, and the agent wakes only at the looks it
     // chooses.

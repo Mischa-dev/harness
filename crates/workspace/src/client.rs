@@ -152,6 +152,13 @@ impl McpClient {
         if !result.is_object() {
             return Err(McpError::Protocol("initialize had no result"));
         }
+        // The client speaks one version; a server that picks another would
+        // read every later call under rules this client doesn't follow.
+        if result.get("protocolVersion").and_then(Value::as_str) != Some(PROTOCOL_VERSION) {
+            return Err(McpError::Protocol(
+                "Workspace chose an MCP protocol version this client doesn't speak",
+            ));
+        }
         self.send("notifications/initialized", None, id.as_ref())
             .await?;
         *session = Session { open: true, id };

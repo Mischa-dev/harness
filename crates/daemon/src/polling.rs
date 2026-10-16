@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness_core::WakeReason;
+use harness_core::{Clock, WakeReason};
 use harness_workspace::{AccessToken, InboxWatch, McpClient, McpError, NewRequests, Workspace};
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -54,12 +54,29 @@ impl WorkspaceConfig {
     }
 }
 
-/// Looks at the inbox now and every `every` after, sending a wake event for
-/// requests the agent hasn't heard about. Ends when the agent stops
-/// listening.
-pub async fn poll(workspace: Arc<Workspace>, every: Duration, events: mpsc::Sender<WakeEvent>) {
+/// How often a waiting poller rereads the clock.
+const TICK: Duration = Duration::from_secs(1);
+
+/// Looks at the inbox now and every `every` after, by `clock`, sending a
+/// wake event for requests the agent hasn't heard about. Ends when the agent
+/// stops listening.
+pub async fn poll(
+    workspace: Arc<Workspace>,
+    clock: Arc<dyn Clock>,
+    every: Duration,
+    events: mpsc::Sender<WakeEvent>,
+) {
     let mut watch = InboxWatch::default();
+    let mut next = clock.now();
     loop {
+        let now = clock.now();
+        if now < next {
+            if events.is_closed() {
+                return;
+            }
+            tokio::time::sleep((next - now).unsigned_abs().min(TICK)).await;
+            continue;
+        }
         let mut wait = every;
         match watch.check(&workspace).await {
             Ok(Some(new)) => {
@@ -78,10 +95,7 @@ pub async fn poll(workspace: Arc<Workspace>, every: Duration, events: mpsc::Send
                 }
             }
         }
-        if events.is_closed() {
-            return;
-        }
-        tokio::time::sleep(wait).await;
+        next = clock.now() + wait;
     }
 }
 

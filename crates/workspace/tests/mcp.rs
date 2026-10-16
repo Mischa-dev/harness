@@ -32,6 +32,8 @@ struct Fake {
     limit_next: AtomicBool,
     /// Keep no sessions, as a stateless server may.
     stateless: AtomicBool,
+    /// Answer initialize with another protocol version.
+    other_version: AtomicBool,
     /// Where to redirect tool calls, if anywhere.
     redirect_to: Mutex<Option<String>>,
 }
@@ -74,6 +76,12 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
     match message["method"].as_str().unwrap() {
         "initialize" => {
             assert_eq!(message["params"]["protocolVersion"], "2025-06-18");
+            if fake.other_version.load(Ordering::SeqCst) {
+                return axum::Json(json!({"jsonrpc": "2.0", "id": message["id"], "result": {
+                    "protocolVersion": "2025-03-26", "capabilities": {"tools": {}}
+                }}))
+                .into_response();
+            }
             let n = fake.initializes.fetch_add(1, Ordering::SeqCst);
             let id = format!("session-{n}");
             fake.sessions.lock().unwrap().push(id.clone());
@@ -436,4 +444,15 @@ async fn a_stateless_server_still_hears_the_protocol_version() {
     workspace.inbox(50).await.unwrap();
     assert_eq!(fake.initializes.load(Ordering::SeqCst), 1);
     assert_eq!(fake.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn another_protocol_version_is_refused() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    fake.other_version.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        workspace.briefing().await.unwrap_err(),
+        McpError::Protocol(_)
+    ));
+    assert!(fake.calls().is_empty());
 }
