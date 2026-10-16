@@ -9,7 +9,8 @@ use harness_tools::PolicyExecutor;
 
 use crate::context::ContextAssembler;
 use crate::wake::{
-    Checkpoint, CheckpointError, LoopError, Progress, WakeLimits, WakeOutcome, run_wake,
+    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeLimits,
+    WakeOutcome, run_wake_interruptible,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,17 @@ impl Workday<'_> {
         reason: &WakeReason,
         wake_message: Message,
     ) -> Result<WakeOutcome, DayError> {
+        self.wake_interruptible(reason, wake_message, &mut NoInterrupts)
+            .await
+    }
+
+    /// [`Self::wake`], taking urgent messages from `interrupts` as it goes.
+    pub async fn wake_interruptible(
+        &mut self,
+        reason: &WakeReason,
+        wake_message: Message,
+        interrupts: &mut dyn Interrupts,
+    ) -> Result<WakeOutcome, DayError> {
         let started_at = self.clock.now();
         let day = match self.store.current_day()? {
             Some(day) => day,
@@ -73,7 +85,7 @@ impl Workday<'_> {
             saved: transcript.len(),
         };
 
-        let result = run_wake(
+        let result = run_wake_interruptible(
             self.provider,
             self.executor,
             self.assembler,
@@ -82,6 +94,7 @@ impl Workday<'_> {
             wake_message,
             self.limits,
             &mut saver,
+            interrupts,
         )
         .await;
 
@@ -98,7 +111,9 @@ impl Workday<'_> {
             Err(err) => ("error", *err.progress()),
         };
         saver.record.end = end.into();
-        saver.write(&transcript, None, &progress)?;
+        // A pause was saved with the trip itself. Saving it again here could
+        // undo an owner's resume that landed in between.
+        saver.write(&transcript, None, &progress, None)?;
         Ok(result?)
     }
 }
@@ -120,20 +135,31 @@ impl Saver<'_> {
         transcript: &[Message],
         pending: Option<&Message>,
         progress: &Progress,
+        paused: Option<&str>,
     ) -> Result<(), StoreError> {
         self.record.ended_at = self.clock.now();
         self.record.turns = progress.turns as u32;
         self.record.usage = progress.usage;
         self.record.cost_usd = progress.cost_usd;
         // Starting at `saved` replaces the last pending message, if any.
-        self.store.save_wake_with_pending(
-            self.wake_id,
-            self.saved,
-            &transcript[self.saved..],
-            pending,
-            &self.record,
-            progress.context_tokens,
-        )?;
+        match paused {
+            Some(breaker) => self.store.save_wake_paused(
+                self.wake_id,
+                self.saved,
+                &transcript[self.saved..],
+                &self.record,
+                progress.context_tokens,
+                breaker,
+            )?,
+            None => self.store.save_wake_with_pending(
+                self.wake_id,
+                self.saved,
+                &transcript[self.saved..],
+                pending,
+                &self.record,
+                progress.context_tokens,
+            )?,
+        }
         self.saved = transcript.len();
         Ok(())
     }
@@ -146,6 +172,15 @@ impl Checkpoint for Saver<'_> {
         pending: Option<&Message>,
         progress: &Progress,
     ) -> Result<(), CheckpointError> {
-        Ok(self.write(transcript, pending, progress)?)
+        Ok(self.write(transcript, pending, progress, None)?)
+    }
+
+    fn save_paused(
+        &mut self,
+        transcript: &[Message],
+        progress: &Progress,
+        breaker: &str,
+    ) -> Result<(), CheckpointError> {
+        Ok(self.write(transcript, None, progress, Some(breaker))?)
     }
 }

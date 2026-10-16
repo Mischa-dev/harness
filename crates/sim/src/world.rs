@@ -101,11 +101,7 @@ pub const TO_YOU: &str = ", to you";
 /// stand-in for the state view, which comes in M2.
 pub fn wake_message(now: OffsetDateTime, reason: &WakeReason, new: &[&Event]) -> String {
     let when = now.format(&Rfc3339).unwrap_or_else(|_| now.to_string());
-    let why = match reason {
-        WakeReason::Workspace { summary, .. } => summary.clone(),
-        WakeReason::NextLook => "the time you chose to look again".into(),
-        other => format!("{other:?}"),
-    };
+    let why = reason.describe();
     let mut text = format!("Wake at {when}. Why: {why}.\n");
     if new.is_empty() {
         text.push_str("Nothing new since you last looked.");

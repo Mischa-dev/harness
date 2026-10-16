@@ -253,6 +253,43 @@ impl Store {
         wake: &WakeRecord,
         context_tokens: u64,
     ) -> Result<()> {
+        self.save_wake_tx(wake_id, from, messages, pending, wake, context_tokens, None)
+    }
+
+    /// Like [`Store::save_wake`], for the save that records a breaker
+    /// tripping: the pause is saved in the same transaction, so no crash can
+    /// keep the record of the trip and lose the pause.
+    pub fn save_wake_paused(
+        &mut self,
+        wake_id: i64,
+        from: usize,
+        messages: &[Message],
+        wake: &WakeRecord,
+        context_tokens: u64,
+        breaker: &str,
+    ) -> Result<()> {
+        self.save_wake_tx(
+            wake_id,
+            from,
+            messages,
+            None,
+            wake,
+            context_tokens,
+            Some(breaker),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_wake_tx(
+        &mut self,
+        wake_id: i64,
+        from: usize,
+        messages: &[Message],
+        pending: Option<&Message>,
+        wake: &WakeRecord,
+        context_tokens: u64,
+        paused: Option<&str>,
+    ) -> Result<()> {
         let from_sql = i64::try_from(from)
             .map_err(|_| StoreError::Corrupt("transcript position is too large".into()))?;
         let usage = usage_to_sql(&wake.usage);
@@ -306,6 +343,13 @@ impl Store {
             "UPDATE days SET context_tokens = MAX(context_tokens, ?2) WHERE id = ?1",
             params![wake.day_id, context_tokens],
         )?;
+        if let Some(breaker) = paused {
+            tx.execute(
+                "INSERT INTO rhythm (id, paused) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET paused = excluded.paused",
+                params![breaker],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -362,6 +406,57 @@ impl Store {
             params![since.unix_timestamp()],
             |row| row.get(0),
         )?)
+    }
+}
+
+/// The wake loop's state between wakes, as last saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RhythmState {
+    /// When the agent chose to look next.
+    pub next_look: Option<OffsetDateTime>,
+    /// The breaker that paused the agent. Only the owner clears it.
+    pub paused: Option<String>,
+}
+
+impl Store {
+    pub fn rhythm_state(&self) -> Result<RhythmState> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT next_look, paused FROM rhythm WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((next_look, paused)) = row else {
+            return Ok(RhythmState::default());
+        };
+        let next_look = next_look
+            .map(|ts| {
+                OffsetDateTime::from_unix_timestamp(ts)
+                    .map_err(|_| StoreError::Corrupt("next look is out of range".into()))
+            })
+            .transpose()?;
+        Ok(RhythmState { next_look, paused })
+    }
+
+    pub fn set_next_look(&self, at: OffsetDateTime) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rhythm (id, next_look) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET next_look = excluded.next_look",
+            params![at.unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Records the breaker that paused the agent, or clears it with `None`.
+    pub fn set_paused(&self, breaker: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rhythm (id, paused) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET paused = excluded.paused",
+            params![breaker],
+        )?;
+        Ok(())
     }
 }
 
@@ -474,4 +569,30 @@ fn day_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Day>> {
             context_tokens: nonnegative(context_tokens, "context_tokens")?,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn the_rhythm_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let at = datetime!(2026-01-05 12:00 UTC);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.rhythm_state().unwrap(), RhythmState::default());
+            store.set_next_look(at).unwrap();
+            store.set_paused(Some("spend")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let state = store.rhythm_state().unwrap();
+        assert_eq!(state.next_look, Some(at));
+        assert_eq!(state.paused.as_deref(), Some("spend"));
+        store.set_paused(None).unwrap();
+        assert_eq!(store.rhythm_state().unwrap().paused, None);
+        assert_eq!(store.rhythm_state().unwrap().next_look, Some(at));
+    }
 }

@@ -6,6 +6,9 @@ use harness_providers::{
     ToolCallStyle, ToolResult, Usage,
 };
 use harness_tools::{Control, Decision, ExecOutcome, PolicyExecutor};
+use std::future::Future;
+use std::pin::Pin;
+
 use time::OffsetDateTime;
 
 use crate::context::ContextAssembler;
@@ -85,6 +88,43 @@ pub trait Checkpoint {
         pending: Option<&Message>,
         progress: &Progress,
     ) -> Result<(), CheckpointError>;
+
+    /// The save that records `breaker` tripping. The pause must be saved
+    /// with the transcript, in one write, so a restart can't lose it.
+    fn save_paused(
+        &mut self,
+        transcript: &[Message],
+        progress: &Progress,
+        breaker: &str,
+    ) -> Result<(), CheckpointError> {
+        let _ = breaker;
+        self.save(transcript, None, progress)
+    }
+}
+
+/// Urgent events that arrive while a wake runs. The wake takes them at its
+/// safe points: before each model call, and by cancelling a model call in
+/// flight. A running tool is never interrupted.
+pub trait Interrupts: Send {
+    /// The urgent messages waiting now, without blocking.
+    fn take(&mut self) -> Vec<Message>;
+
+    /// Resolves once an urgent message is waiting. Dropping it before then
+    /// must lose nothing.
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// For callers with nothing that can interrupt a wake.
+pub struct NoInterrupts;
+
+impl Interrupts for NoInterrupts {
+    fn take(&mut self) -> Vec<Message> {
+        Vec::new()
+    }
+
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
 }
 
 /// For callers that keep the wake in memory only.
@@ -132,6 +172,10 @@ impl LoopError {
 const SLEEP_REMINDER: &str =
     "(runtime) End the wake by calling `sleep` with when you want to look again.";
 
+/// What a call says when urgent news arrived before it could run.
+const URGENT_FIRST: &str = "not run: urgent news arrived first (below). \
+     Decide again with it in mind.";
+
 /// What a saved call says until it reports back. If the process dies, this is
 /// what the agent finds after the restart.
 const CUT_OFF: &str = "cut off: the wake stopped before this call reported back. \
@@ -152,6 +196,33 @@ pub async fn run_wake(
     wake_message: Message,
     limits: WakeLimits,
     checkpoint: &mut dyn Checkpoint,
+) -> Result<WakeOutcome, LoopError> {
+    run_wake_interruptible(
+        provider,
+        executor,
+        assembler,
+        profile,
+        transcript,
+        wake_message,
+        limits,
+        checkpoint,
+        &mut NoInterrupts,
+    )
+    .await
+}
+
+/// [`run_wake`], taking urgent messages from `interrupts` at its safe points.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_wake_interruptible(
+    provider: &dyn Provider,
+    executor: &mut PolicyExecutor,
+    assembler: &ContextAssembler,
+    profile: &CapabilityProfile,
+    transcript: &mut Vec<Message>,
+    wake_message: Message,
+    limits: WakeLimits,
+    checkpoint: &mut dyn Checkpoint,
+    interrupts: &mut dyn Interrupts,
 ) -> Result<WakeOutcome, LoopError> {
     transcript.push(wake_message);
     let mut usage = Usage::default();
@@ -189,8 +260,29 @@ pub async fn run_wake(
         }
         turns += 1;
 
+        // A safe point: no tool is running. Urgent news joins the
+        // conversation before the agent's next thought.
+        let urgent = interrupts.take();
+        if !urgent.is_empty() {
+            transcript.extend(urgent);
+            save(
+                checkpoint,
+                transcript,
+                None,
+                progress(turns, usage, context_tokens),
+            )?;
+        }
+
         let request = assembler.assemble(executor.specs(), transcript);
-        let response = match provider.complete(&request).await {
+        let call = provider.complete(&request);
+        let result = tokio::select! {
+            biased;
+            result = call => result,
+            // The call's answer would be stale; drop it and think again with
+            // the news. The cancelled call still counts as a turn.
+            () = interrupts.wait() => continue,
+        };
+        let response = match result {
             Ok(response) => response,
             Err(source) => {
                 return Err(LoopError::Provider {
@@ -237,9 +329,19 @@ pub async fn run_wake(
         let mut sleep_until = None;
         let mut paused = None;
         let mut malformed = false;
+        // Urgent news taken in between calls. Calls after it don't run: the
+        // agent decides again with the news in front of it.
+        let mut news = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             if paused.is_some() {
                 results.push(error(call, "not run: the agent is paused"));
+                continue;
+            }
+            if news.is_empty() {
+                news = interrupts.take();
+            }
+            if !news.is_empty() {
+                results.push(error(call, URGENT_FIRST));
                 continue;
             }
             if i > 0 && profile.tool_calls == ToolCallStyle::Sequential {
@@ -298,18 +400,33 @@ pub async fn run_wake(
                 .map(|r| r.content.len().div_ceil(BYTES_PER_TOKEN) as u64)
                 .fold(0_u64, u64::saturating_add),
         );
+        if paused.is_none() && news.is_empty() {
+            news = interrupts.take();
+        }
         transcript.push(results_message(results));
-        save(
-            checkpoint,
-            transcript,
-            None,
-            progress(turns, usage, context_tokens),
-        )?;
+        // News that arrived during the batch comes right after its results.
+        let interrupted = !news.is_empty();
+        transcript.extend(news);
+        if let Some(breaker) = &paused {
+            let progress = progress(turns, usage, context_tokens);
+            checkpoint
+                .save_paused(transcript, &progress, breaker)
+                .map_err(|source| LoopError::Checkpoint { source, progress })?;
+        } else {
+            save(
+                checkpoint,
+                transcript,
+                None,
+                progress(turns, usage, context_tokens),
+            )?;
+        }
 
         if let Some(breaker) = paused {
             break WakeEnd::Paused { breaker };
         }
-        if let Some(until) = sleep_until {
+        if let Some(until) = sleep_until
+            && !interrupted
+        {
             break WakeEnd::Slept { until };
         }
         if malformed && malformed_last_turn {

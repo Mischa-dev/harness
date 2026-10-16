@@ -507,15 +507,15 @@ fn config_names_key_files_and_never_holds_keys() {
     .unwrap();
 
     let config = harness_daemon::config::Config::load(&config).unwrap();
-    let routes = config.proxy.load_routes().unwrap();
+    let routes = config.proxy.as_ref().unwrap().load_routes().unwrap();
     assert_eq!(routes[0].name, "anthropic");
     assert!(!format!("{routes:?}").contains("sk-ant-from-file"));
-    let loaded = config.proxy.load_caller_token().unwrap();
+    let loaded = config.proxy.as_ref().unwrap().load_caller_token().unwrap();
     assert!(!format!("{loaded:?}").contains(TOKEN));
 
     std::fs::remove_file(&key).unwrap();
     assert!(
-        config.proxy.load_routes().is_err(),
+        config.proxy.as_ref().unwrap().load_routes().is_err(),
         "a missing key file stops startup"
     );
 }

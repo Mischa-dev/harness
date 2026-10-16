@@ -4,12 +4,15 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::agent::AgentConfig;
 use crate::proxy::{ConfigError, ProxyConfig};
 
+/// One file for both services; each reads its own section.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub proxy: ProxyConfig,
+    pub proxy: Option<ProxyConfig>,
+    pub agent: Option<AgentConfig>,
 }
 
 impl Config {
@@ -65,6 +68,14 @@ mod tests {
     fn read_errors_never_echo_the_path() {
         let err = Config::load(Path::new("sk-super-secret")).unwrap_err();
         assert!(!err.to_string().contains("sk-super"), "{err}");
+    }
+
+    #[test]
+    fn the_example_config_parses() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("daemon.example.toml");
+        let config = Config::load(&path).unwrap();
+        assert!(config.proxy.is_some());
+        assert!(config.agent.is_some());
     }
 
     #[test]

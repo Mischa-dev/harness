@@ -35,6 +35,12 @@ const MIGRATIONS: &[&str] = &[
          cost_usd REAL NOT NULL
      );
      CREATE INDEX wakes_started_at ON wakes(started_at);",
+    // 2: the wake loop's state between wakes, so a restart keeps it.
+    "CREATE TABLE rhythm (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         next_look INTEGER,
+         paused TEXT
+     );",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
