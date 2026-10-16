@@ -106,6 +106,13 @@ impl Workspace {
         self.call("reply_release", arguments).await
     }
 
+    /// Posts `text` in a conversation as the agent. Only shadow mode uses
+    /// it, to post in its channel.
+    pub async fn post(&self, conversation_id: &str, text: &str) -> Result<Outcome, McpError> {
+        let arguments = json!({ "conversationId": conversation_id, "text": text });
+        self.call("message_send", arguments).await
+    }
+
     async fn call(&self, tool: &str, arguments: Value) -> Result<Outcome, McpError> {
         let mut content = self.client.call_tool(tool, arguments).await?;
         outcome(&mut content)

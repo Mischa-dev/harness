@@ -2,9 +2,11 @@
 //! signed wakeup was lost or the daemon was down when it came.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::api::{InboxEntry, Workspace};
 use crate::client::McpError;
+use crate::shadow::Shadow;
 
 /// Workspace's largest inbox page.
 pub const INBOX_LIMIT: u16 = 50;
@@ -23,9 +25,19 @@ pub struct NewRequests {
 #[derive(Debug, Default)]
 pub struct InboxWatch {
     reported: HashSet<(String, i32)>,
+    /// In shadow mode, requests already answered in the shadow channel
+    /// never wake the agent again.
+    shadow: Option<Arc<Shadow>>,
 }
 
 impl InboxWatch {
+    pub fn with_shadow(shadow: Option<Arc<Shadow>>) -> Self {
+        Self {
+            reported: HashSet::new(),
+            shadow,
+        }
+    }
+
     pub async fn check(&mut self, workspace: &Workspace) -> Result<Option<NewRequests>, McpError> {
         let entries = workspace.inbox(INBOX_LIMIT).await?;
         Ok(self.update(&entries))
@@ -34,7 +46,15 @@ impl InboxWatch {
     /// What's new in this page of the inbox. Only the pending requests
     /// still listed are remembered, so the memory stays one page long.
     pub fn update(&mut self, entries: &[InboxEntry]) -> Option<NewRequests> {
-        let pending: Vec<&InboxEntry> = entries.iter().filter(|e| e.status == "pending").collect();
+        let answered = |entry: &InboxEntry| {
+            self.shadow
+                .as_ref()
+                .is_some_and(|shadow| shadow.is_shadowed(&entry.request_id))
+        };
+        let pending: Vec<&InboxEntry> = entries
+            .iter()
+            .filter(|e| e.status == "pending" && !answered(e))
+            .collect();
         let mut new = NewRequests {
             count: 0,
             pressing: 0,
@@ -115,5 +135,23 @@ mod tests {
         );
         // Claimed requests never wake the agent.
         assert_eq!(watch.update(&[entry("d", 1, "claimed", true)]), None);
+    }
+
+    #[test]
+    fn requests_answered_in_shadow_never_wake_the_agent() {
+        let shadow = Arc::new(Shadow::new("shadow-1", &[]).unwrap());
+        shadow.mark("a");
+        let mut watch = InboxWatch::with_shadow(Some(shadow));
+        let page = [
+            entry("a", 2, "pending", true),
+            entry("b", 1, "pending", false),
+        ];
+        assert_eq!(
+            watch.update(&page),
+            Some(NewRequests {
+                count: 1,
+                pressing: 0
+            })
+        );
     }
 }

@@ -87,7 +87,17 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if let (Some(settings), Some(workspace)) = (&config.workspace, agent.workspace.clone()) {
         let every = settings.poll_every()?;
         eprintln!("looking at the Workspace inbox every {}s", every.as_secs());
-        tokio::spawn(polling::poll(workspace, clock, every, events_in.clone()));
+        if agent.shadow.is_some() {
+            eprintln!("shadow mode: replies outside the live conversations go to the channel");
+        }
+        let shadow = agent.shadow.clone();
+        tokio::spawn(polling::poll(
+            workspace,
+            clock,
+            every,
+            shadow,
+            events_in.clone(),
+        ));
     }
     // With neither, nothing sends, and the agent wakes only at the looks it
     // chooses.

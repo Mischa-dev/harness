@@ -23,7 +23,7 @@ use harness_providers::{
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
 use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, SleepTool};
-use harness_workspace::Workspace;
+use harness_workspace::{Shadow, Workspace};
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -133,6 +133,8 @@ pub struct Agent {
     pub limits: WakeLimits,
     /// Shared by the agent's Workspace tools and the inbox poller.
     pub workspace: Option<Arc<Workspace>>,
+    /// Shadow mode, shared by the reply tools and the inbox poller.
+    pub shadow: Option<Arc<Shadow>>,
     /// The memory files; the snapshot of them starts each day.
     pub memory: Option<Arc<MemoryFiles>>,
     /// Whether today's memory snapshot is in the prompt. Until it is, each
@@ -330,16 +332,17 @@ impl Agent {
             .read_only(memory_rel);
             executor.register(Box::new(tool));
         }
-        let workspace = match &config.workspace {
+        let (workspace, shadow) = match &config.workspace {
             Some(settings) => {
                 settings.poll_every()?;
+                let shadow = settings.shadow()?;
                 let workspace = settings.connect()?;
-                for tool in harness_workspace::tools(workspace.clone()) {
+                for tool in harness_workspace::tools_with(workspace.clone(), shadow.clone()) {
                     executor.register(tool);
                 }
-                Some(workspace)
+                (Some(workspace), shadow)
             }
-            None => None,
+            None => (None, None),
         };
         let policy = WorkdayPolicy {
             offset,
@@ -362,6 +365,7 @@ impl Agent {
             rhythm,
             limits: WakeLimits::default(),
             workspace,
+            shadow,
             memory: Some(memory),
             memory_settled: false,
             waiting: Vec::new(),
