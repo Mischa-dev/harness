@@ -159,11 +159,15 @@ async fn raw_get_as(proxy: SocketAddr, path: &str, host: &str, extra: &str) -> S
 async fn unknown_routes_and_dot_dot_go_nowhere() {
     let (proxy, log) = setup().await;
     let unknown = local_client()
-        .post(format!("http://{proxy}/openai/v1/chat/completions"))
+        .post(format!(
+            "http://{proxy}/sk-pasted-secret/v1/chat/completions"
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(unknown.status(), 404);
+    let body = unknown.text().await.unwrap();
+    assert!(!body.contains("secret"), "{body}");
     for path in [
         "/openrouter/../anthropic/v1/messages",
         "/openrouter/v1/%2E%2E/%2e%2e/admin",

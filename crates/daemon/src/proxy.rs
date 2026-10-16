@@ -271,7 +271,8 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let path = uri.path().trim_start_matches('/');
     let (name, rest) = path.split_once('/').unwrap_or((path, ""));
     let Some(route) = proxy.routes.iter().find(|r| r.name == name) else {
-        return (StatusCode::NOT_FOUND, format!("no route {name:?}\n")).into_response();
+        // Not echoed: the caller's base URL could hold a misplaced key.
+        return (StatusCode::NOT_FOUND, "no such route\n").into_response();
     };
     // Model APIs need only these. Others, TRACE above all (it echoes the
     // request back, key included), never reach a provider.
