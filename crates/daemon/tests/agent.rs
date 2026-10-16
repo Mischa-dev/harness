@@ -98,6 +98,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         quiet_hour: 2,
         utc_offset_hours: 0,
         max_output_tokens: 1024,
+        wakeups: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -138,6 +139,7 @@ fn a_missing_charter_is_named_without_its_path() {
         quiet_hour: 2,
         utc_offset_hours: 0,
         max_output_tokens: 1024,
+        wakeups: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();

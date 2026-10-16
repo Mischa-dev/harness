@@ -3,8 +3,8 @@
 //! forwarding proxy with the caller token; the runtime never holds a
 //! provider key.
 //!
-//! Events reach the loop on a channel. The signed webhook receiver and the
-//! Agent OS triggers feed it in later slices.
+//! Events reach the loop on a channel, fed by the signed webhook receiver
+//! (`wakeup`). Agent OS triggers will feed it too.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,10 @@ pub struct AgentConfig {
     pub utc_offset_hours: i8,
     #[serde(default = "default_max_output_tokens")]
     pub max_output_tokens: u32,
+    /// Workspace's signed wakeups. Without them, the agent wakes only at the
+    /// looks it chooses.
+    #[serde(default)]
+    pub wakeups: Option<crate::wakeup::WakeupConfig>,
 }
 
 fn default_quiet_hour() -> u8 {

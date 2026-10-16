@@ -178,7 +178,7 @@ records design decisions, milestones, and the behavioral exam.
 | `crates/loop` | Cache-friendly context assembly, the per-wake model/tool loop, checkpointing, and durable workday orchestration. |
 | `crates/store` | SQLite schema and APIs for workdays, transcripts, wake usage, spend, and evening policy. |
 | `crates/sim` | Scenario parser, deterministic world, fake teammate, runner, scoring report, and `sim` CLI. |
-| `crates/daemon` | The daemon binary, as two services. `proxy` is the forwarding proxy: adapters call it without credentials and it adds each provider's key, read from a file at startup. `run` is the wake loop: the agent wakes at the look it chose or when an event arrives, and calls its model through the proxy. See `crates/daemon/daemon.example.toml`. |
+| `crates/daemon` | The daemon binary, as two services. `proxy` is the forwarding proxy: adapters call it without credentials and it adds each provider's key, read from a file at startup. `run` is the wake loop: the agent wakes at the look it chose or when Workspace's signed `inbox.available` webhook arrives, and calls its model through the proxy. See `crates/daemon/daemon.example.toml`. |
 | `crates/sim/scenarios` | Human-readable behavioral scenarios used by the simulator. |
 | `prompts` | Product prompts. Prompt changes are behavior changes and require scenario evidence. |
 | `.github/workflows/ci.yml` | Formatting, build, lint, test, and rustdoc checks. |
