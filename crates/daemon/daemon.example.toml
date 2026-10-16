@@ -110,3 +110,25 @@ spend_per_day_usd = 15.0
 # Where the runtime tells you a breaker tripped: a Workspace conversation
 # id, such as your direct message with the agent. Needs [agent.workspace].
 # notify = "your-dm-conversation-id"
+
+# Coding workers the agent can hand well-defined tasks to: Claude Code or
+# Codex, each run in a git worktree of its own under your CLI login, with no
+# team credentials and only the paths it locked. Leave the section out and
+# the agent has no worker tools.
+# [agent.workers]
+# # The most workers at once (the concurrent workers breaker).
+# max_running = 4
+# # Where worktrees go; defaults to `worktrees` in state_dir.
+# # worktrees_dir = "/var/lib/harness/worktrees"
+#
+# [agent.workers.repos]
+# harness = "/home/agent/src/harness"
+#
+# [agent.workers.claude_code]
+# program = "claude"
+# timeout_minutes = 60
+# max_budget_usd = 5.0
+#
+# [agent.workers.codex]
+# program = "codex"
+# timeout_minutes = 60

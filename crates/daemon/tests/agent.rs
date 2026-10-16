@@ -106,6 +106,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -160,6 +161,7 @@ fn a_missing_charter_is_named_without_its_path() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -219,6 +221,8 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         waiting: Vec::new(),
         filter: None,
         breakers: Default::default(),
+        workers: None,
+        worker_reports: None,
         unjudged: false,
     }
 }
@@ -634,6 +638,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -717,6 +722,7 @@ async fn memory_that_cant_be_read_is_tried_again_next_wake() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
@@ -777,6 +783,7 @@ fn memory_must_live_inside_the_work_area() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -813,6 +820,7 @@ fn a_linked_workdir_still_holds_the_memory() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
@@ -842,6 +850,7 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -892,6 +901,7 @@ async fn the_file_tools_stay_where_workdir_was_at_startup() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock).unwrap();
@@ -933,6 +943,7 @@ fn credentials_stay_out_of_the_work_area() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -988,6 +999,7 @@ fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     assert!(Agent::from_config(&config, clock).is_err());
@@ -1023,6 +1035,7 @@ fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
@@ -1078,6 +1091,7 @@ async fn the_shell_works_in_the_work_area_and_leaves_memory_alone() {
         shell: Some(ShellConfig { bwrap }),
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock).unwrap();
@@ -1123,6 +1137,7 @@ fn the_shell_needs_bubblewraps_full_path() {
         }),
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -1154,6 +1169,7 @@ fn the_charter_is_filled_in_from_the_identity() {
         shell: None,
         filter: None,
         breakers: Default::default(),
+        workers: None,
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock.clone()) else {

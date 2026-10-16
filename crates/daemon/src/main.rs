@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use harness_core::SystemClock;
+use harness_core::{SystemClock, WakeReason};
 use harness_daemon::agent::{Agent, WakeEvent};
 use harness_daemon::config::Config;
 use harness_daemon::wakeup::{self, WebhookSecret};
@@ -101,8 +101,29 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
             events_in.clone(),
         ));
     }
-    // With neither, nothing sends, and the agent wakes only at the looks it
-    // chooses.
+    if let (Some(workers), Some(mut reports)) = (agent.workers.clone(), agent.worker_reports.take())
+    {
+        let events_in = events_in.clone();
+        tokio::spawn(async move {
+            while let Some(finished) = reports.recv().await {
+                let event = WakeEvent {
+                    text: finished.line,
+                    reason: WakeReason::WorkerFinished {
+                        worker_id: finished.id.to_string(),
+                    },
+                };
+                if events_in.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let orphans = workers.recover()?;
+        if orphans > 0 {
+            eprintln!("ended {orphans} workers left running by the last run");
+        }
+    }
+    // With none of these, nothing sends, and the agent wakes only at the
+    // looks it chooses.
     drop(events_in);
     eprintln!("agent running; first look at {}", agent.rhythm.next_look());
     agent.run(&mut events, shutdown()).await?;
