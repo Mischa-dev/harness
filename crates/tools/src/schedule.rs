@@ -15,6 +15,9 @@ use crate::tool::{Effect, Tool, ToolContext, ToolError, ToolOutput};
 
 /// How many follow-ups and routines it can keep at once.
 pub const MAX_SCHEDULED: usize = 30;
+/// How many of those can be routines: the routines circuit breaker
+/// (ARCHITECTURE.md), enforced here as a refusal.
+pub const MAX_ROUTINES: usize = 20;
 /// One note's limit, in characters.
 pub const MAX_NOTE_CHARS: usize = 300;
 /// How far ahead it can schedule.
@@ -156,9 +159,16 @@ impl Tool for ScheduleTool {
         let now = ctx.clock.now();
         let request = self.request(args, now)?;
         let book = &self.0.book;
-        if book.list().map_err(failed)?.len() >= MAX_SCHEDULED {
+        let scheduled = book.list().map_err(failed)?;
+        if scheduled.len() >= MAX_SCHEDULED {
             return Err(ToolError::Failed(format!(
                 "you already have {MAX_SCHEDULED} things scheduled; unschedule one first"
+            )));
+        }
+        let routines = scheduled.iter().filter(|e| e.repeat.is_some()).count();
+        if request.repeat.is_some() && routines >= MAX_ROUTINES {
+            return Err(ToolError::Failed(format!(
+                "you already have {MAX_ROUTINES} routines; unschedule one first"
             )));
         }
         let entry = book
@@ -310,6 +320,27 @@ mod tests {
         }
         let full = call(set.as_ref(), json!({"note": "x", "in_minutes": 5}), &clock).await;
         assert!(matches!(full, Err(ToolError::Failed(_))), "{full:?}");
+    }
+
+    #[tokio::test]
+    async fn routines_have_a_lower_cap() {
+        let (schedule, clock) = schedule();
+        let [set, _] = <[Box<dyn Tool>; 2]>::try_from(tools(schedule.clone()))
+            .ok()
+            .unwrap();
+        let routine = json!({"note": "x", "in_minutes": 5, "repeat": "daily"});
+        for _ in 0..MAX_ROUTINES {
+            call(set.as_ref(), routine.clone(), &clock).await.unwrap();
+        }
+        let full = call(set.as_ref(), routine, &clock).await;
+        assert!(
+            matches!(&full, Err(ToolError::Failed(why)) if why.contains("routines")),
+            "{full:?}"
+        );
+        // A one-off follow-up still fits.
+        call(set.as_ref(), json!({"note": "x", "in_minutes": 5}), &clock)
+            .await
+            .unwrap();
     }
 
     #[test]

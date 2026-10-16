@@ -97,6 +97,9 @@ pub struct AgentConfig {
     /// wait always waits for the agent's next look.
     #[serde(default)]
     pub filter: Option<crate::filter::FilterConfig>,
+    /// The circuit breakers' limits, and where to say when one trips.
+    #[serde(default)]
+    pub breakers: crate::breakers::BreakerConfig,
 }
 
 /// Who the agent is and who it works for, for the charter.
@@ -199,6 +202,7 @@ pub struct Agent {
     pub filter: Option<crate::filter::WakeFilter>,
     /// Whether something in `waiting` arrived since the filter last looked.
     pub unjudged: bool,
+    pub breakers: crate::breakers::BreakerConfig,
 }
 
 impl Agent {
@@ -245,8 +249,10 @@ impl Agent {
             field: "workdir",
             source,
         })?;
-        let mut executor =
-            PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
+        config.breakers.check().map_err(AgentError::Invalid)?;
+        let mut policy = Policy::conservative(&workdir);
+        policy.breakers.messages_per_hour = config.breakers.messages_per_hour;
+        let mut executor = PolicyExecutor::new(policy, clock.clone()).with_tool(SleepTool);
         let memory_dir = config
             .memory_dir
             .clone()
@@ -447,6 +453,7 @@ impl Agent {
             waiting: Vec::new(),
             filter,
             unjudged: false,
+            breakers: config.breakers.clone(),
         })
     }
 
@@ -511,6 +518,11 @@ impl Agent {
             }
             while let Ok(event) = events.try_recv() {
                 self.waiting.push(event);
+            }
+            // What's waiting stays waiting, for after the owner resumes it.
+            if let Some(tripped) = self.check_breakers(self.clock.now())? {
+                self.trip(tripped).await?;
+                continue;
             }
             let batch = std::mem::take(&mut self.waiting);
             let mut inbox = Inbox {
@@ -609,7 +621,11 @@ impl Agent {
             AfterWake::Slept => eprintln!("wake {summary}; next look {}", self.rhythm.next_look()),
             // The wake saved the pause along with the trip, so a restart
             // doesn't lift it.
-            AfterWake::Paused { breaker } => eprintln!("wake {summary}; paused by {breaker}"),
+            AfterWake::Paused { breaker } => {
+                eprintln!("wake {summary}; paused by {breaker}");
+                self.tell_owner_paused(&breaker, "one of its actions went over the limit")
+                    .await;
+            }
             AfterWake::Fallback { problem } => eprintln!(
                 "wake {summary}: {problem}; next look {}",
                 self.rhythm.next_look()

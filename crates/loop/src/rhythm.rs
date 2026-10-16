@@ -48,6 +48,11 @@ impl Rhythm {
         self
     }
 
+    /// Pauses the agent for a breaker the daemon tripped outside a wake.
+    pub fn pause(&mut self, breaker: &str) {
+        self.paused = Some(breaker.to_string());
+    }
+
     /// Lifts the pause, once the owner says so.
     pub fn resume(&mut self) {
         self.paused = None;

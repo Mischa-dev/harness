@@ -105,6 +105,7 @@ async fn the_agent_calls_its_model_through_the_proxy() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -158,6 +159,7 @@ fn a_missing_charter_is_named_without_its_path() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let err = Agent::from_config(&config, clock.clone()).err().unwrap();
@@ -216,6 +218,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         memory_settled: false,
         waiting: Vec::new(),
         filter: None,
+        breakers: Default::default(),
         unjudged: false,
     }
 }
@@ -328,6 +331,60 @@ async fn a_follow_up_wakes_the_agent_before_its_next_look() {
     );
     // A follow-up fires once.
     assert!(agent.schedule.book.list().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn too_many_wakes_in_an_hour_pause_the_agent() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let model = ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 5}))]);
+    let mut agent = scripted(clock.clone(), model);
+    agent.breakers.wakes_per_hour = 1;
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(dm("[dm] Mischa: one")).await.unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+
+    // A second DM in the same hour trips the breaker instead of waking it.
+    clock.advance(time::Duration::minutes(10));
+    send.send(dm("[dm] Mischa: two")).await.unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+    assert_eq!(agent.rhythm.paused(), Some("wakes_per_hour"));
+    assert_eq!(agent.executor.paused(), Some("wakes_per_hour"));
+    assert_eq!(
+        agent.store.rhythm_state().unwrap().paused.as_deref(),
+        Some("wakes_per_hour")
+    );
+    // The DM is still there for after the owner resumes it.
+    assert_eq!(agent.waiting.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_days_spend_over_the_limit_pauses_the_agent() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = scripted(clock.clone(), ScriptedProvider::new());
+    agent.breakers.spend_per_day_usd = 1.0;
+    // Yesterday's spend doesn't count.
+    agent
+        .store
+        .record_helper_call(start - time::Duration::hours(10), "wake_filter", 5.0)
+        .unwrap();
+    assert_eq!(agent.check_breakers(start).unwrap(), None);
+    agent
+        .store
+        .record_helper_call(start - time::Duration::hours(1), "wake_filter", 1.25)
+        .unwrap();
+    let tripped = agent.check_breakers(start).unwrap().unwrap();
+    assert_eq!(tripped.breaker, "spend_per_day");
+    assert!(tripped.detail.contains("$1.25"), "{}", tripped.detail);
 }
 
 /// A model that, on its first call, has `event` arrive from outside, then
@@ -576,6 +633,7 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let start = datetime!(2026-01-05 09:00 UTC);
     let clock = Arc::new(FakeClock::new(start));
@@ -658,6 +716,7 @@ async fn memory_that_cant_be_read_is_tried_again_next_wake() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
@@ -717,6 +776,7 @@ fn memory_must_live_inside_the_work_area() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -752,6 +812,7 @@ fn a_linked_workdir_still_holds_the_memory() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
@@ -780,6 +841,7 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -829,6 +891,7 @@ async fn the_file_tools_stay_where_workdir_was_at_startup() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock).unwrap();
@@ -869,6 +932,7 @@ fn credentials_stay_out_of_the_work_area() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -923,6 +987,7 @@ fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     assert!(Agent::from_config(&config, clock).is_err());
@@ -957,6 +1022,7 @@ fn a_new_workdir_behind_a_link_is_made_where_the_link_leads() {
         identity: Default::default(),
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     if let Err(err) = Agent::from_config(&config, clock) {
@@ -1011,6 +1077,7 @@ async fn the_shell_works_in_the_work_area_and_leaves_memory_alone() {
         identity: Default::default(),
         shell: Some(ShellConfig { bwrap }),
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let mut agent = Agent::from_config(&config, clock).unwrap();
@@ -1055,6 +1122,7 @@ fn the_shell_needs_bubblewraps_full_path() {
             bwrap: "bwrap".into(),
         }),
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock) else {
@@ -1085,6 +1153,7 @@ fn the_charter_is_filled_in_from_the_identity() {
         memory_dir: None,
         shell: None,
         filter: None,
+        breakers: Default::default(),
     };
     let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
     let Err(err) = Agent::from_config(&config, clock.clone()) else {

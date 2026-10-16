@@ -7,6 +7,7 @@
 //! on the helper model whether news can wait for the agent's next look.
 
 pub mod agent;
+pub mod breakers;
 pub mod config;
 pub mod filter;
 pub mod polling;
