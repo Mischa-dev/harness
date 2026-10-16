@@ -457,8 +457,12 @@ fn file(args: &Value) -> Result<(&'static str, usize), ToolError> {
         .ok_or_else(|| ToolError::InvalidArguments("file must be memory, user or handoff".into()))
 }
 
-/// Creates `dir` if needed and makes it readable by its owner alone.
+/// Creates `dir` if needed and makes it readable by its owner alone. A
+/// link or anything else in its place is refused, not followed.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| !m.is_dir()) {
+        return Err(std::io::Error::other("it isn't a real folder"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -1058,6 +1062,25 @@ mod tests {
         assert!(
             MemoryFiles::open(&link, None, offset!(-7), datetime!(2026-01-05 00:00 UTC)).is_err()
         );
+
+        // Nor can the journal inside it.
+        let journaled = tmp.path().join("journaled");
+        std::fs::create_dir(&journaled).unwrap();
+        std::os::unix::fs::symlink(&outside, journaled.join("journal")).unwrap();
+        assert!(
+            MemoryFiles::open(
+                &journaled,
+                None,
+                offset!(-7),
+                datetime!(2026-01-05 00:00 UTC)
+            )
+            .is_err()
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+            assert_ne!(mode, 0o700);
+        }
 
         // Nor can it be swapped for one after it's opened.
         let dir = tmp.path().join("memory");
