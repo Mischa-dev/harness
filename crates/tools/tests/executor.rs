@@ -284,9 +284,16 @@ async fn credential_and_repository_metadata_paths_are_protected() {
 async fn ordinary_nested_files_near_secret_names_are_not_denied() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = harness(dir.path());
-    for path in ["services/api/config.toml", "src/environment.rs", "docs/npmrc.md"] {
+    for path in [
+        "services/api/config.toml",
+        "src/environment.rs",
+        "docs/npmrc.md",
+    ] {
         let out = h.exec.execute(&call("read", json!({"path": path}))).await;
-        assert!(!is_deny(&out), "read {path} should not be denied, got {out:?}");
+        assert!(
+            !is_deny(&out),
+            "read {path} should not be denied, got {out:?}"
+        );
     }
 }
 
