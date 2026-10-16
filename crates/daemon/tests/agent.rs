@@ -721,6 +721,53 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
     assert!(err.to_string().contains("outside workdir"), "{err}");
 }
 
+#[test]
+fn credentials_stay_out_of_the_work_area() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: work.clone(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(&work, "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a caller token inside workdir was accepted");
+    };
+    assert!(
+        err.to_string()
+            .contains("caller_token_file must be outside workdir"),
+        "{err}"
+    );
+
+    // Nor through a link that leads there.
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("token-link");
+        std::os::unix::fs::symlink(work.join("caller-token"), &link).unwrap();
+        let config = AgentConfig {
+            caller_token_file: link,
+            ..config
+        };
+        let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+        let Err(err) = Agent::from_config(&config, clock) else {
+            panic!("a caller token linked from inside workdir was accepted");
+        };
+        assert!(err.to_string().contains("outside workdir"), "{err}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_link_out_of_the_work_area_is_refused_before_anything_is_made() {

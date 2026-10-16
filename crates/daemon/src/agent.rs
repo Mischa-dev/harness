@@ -206,6 +206,31 @@ impl Agent {
         if !inside(&workdir, &memory_dir) {
             return Err(outside());
         }
+        // The file tools read anything in the work area the walls don't
+        // name, so no credential the runtime is given may live there.
+        let credentials = [
+            ("caller_token_file", Some(&config.caller_token_file)),
+            (
+                "wakeups.secret_file",
+                config.wakeups.as_ref().map(|w| &w.secret_file),
+            ),
+            (
+                "workspace.token_file",
+                config.workspace.as_ref().map(|w| &w.token_file),
+            ),
+        ];
+        for (field, path) in credentials {
+            let Some(path) = path else { continue };
+            let named =
+                std::path::absolute(path).map_err(|source| AgentError::Read { field, source })?;
+            let real = named.canonicalize().unwrap_or_else(|_| named.clone());
+            let within = |p: &Path| p.starts_with(&workdir) || p.starts_with(&real_workdir);
+            if within(&named) || within(&real) {
+                return Err(AgentError::Invalid(format!(
+                    "{field} must be outside workdir, where the agent's tools can't read it"
+                )));
+            }
+        }
         // Only the runtime may write the history's git config, or a filter
         // set there would run on the next save: it can't be where the
         // agent's tools reach.

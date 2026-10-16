@@ -35,6 +35,9 @@ pub const MAX_FILES: usize = 20_000;
 pub const MAX_SEARCH_BYTES: u64 = 64 << 20;
 /// A search skips files bigger than this; a read can still open them.
 pub const MAX_SEARCH_FILE_BYTES: u64 = 1 << 20;
+/// A read looks through no more of a file than this, however far in its
+/// lines start or however long they run.
+pub const MAX_READ_SCAN_BYTES: u64 = 64 << 20;
 /// A search stops after meeting this many folder entries, files or not.
 pub const MAX_WALK_ENTRIES: usize = 100_000;
 /// A listing looks at no more than this many entries.
@@ -420,11 +423,12 @@ fn read(
     let failed = |e: std::io::Error| ToolError::Failed(format!("couldn't read {name}: {e}"));
     let file = open_regular(&real).map_err(failed)?;
     let size = file.metadata().map_err(failed)?.len();
-    let Some(mut reader) = text_reader(file).map_err(failed)? else {
+    let Some(reader) = text_reader(file).map_err(failed)? else {
         return Ok(ToolOutput::text(format!(
             "{name} looks binary ({size} bytes), so it isn't shown."
         )));
     };
+    let mut reader = reader.take(MAX_READ_SCAN_BYTES);
     // A line is cut at MAX_LINE_CHARS characters, which is at most four
     // bytes each.
     let keep = MAX_LINE_CHARS * 4;
@@ -453,11 +457,23 @@ fn read(
         out.push_str(&entry);
         shown_lines += 1;
     }
+    let scanned = MAX_READ_SCAN_BYTES >> 20;
+    let stopped = !more && reader.limit() == 0 && size > MAX_READ_SCAN_BYTES;
     if number == 0 {
         return Ok(ToolOutput::text(format!("{name} is empty.")));
     }
+    if shown_lines == 0 && stopped {
+        return Ok(ToolOutput::text(format!(
+            "{name} is too big to read that far: line {offset} isn't in its first {scanned} MiB."
+        )));
+    }
     if shown_lines == 0 {
         return Ok(ToolOutput::text(format!("{name} has only {number} lines.")));
+    }
+    if stopped {
+        out.push_str(&format!(
+            "(Stopped after the first {scanned} MiB of {name}; the rest can't be read here.)\n"
+        ));
     }
     if more {
         out.push_str(&format!(
@@ -1060,6 +1076,39 @@ mod tests {
         assert_eq!(found.entries, MAX_WALK_ENTRIES);
         assert_eq!(found.files, 10);
         assert_eq!(found.stopped, Some("too many files"));
+    }
+
+    #[tokio::test]
+    async fn reads_look_through_only_so_much_of_a_file() {
+        let mut f = fixture();
+        // One line longer than the whole budget, then a short one.
+        let path = f.root.join("minified.js");
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            let chunk = vec![b'x'; 1 << 20];
+            for _ in 0..(MAX_READ_SCAN_BYTES >> 20) + 1 {
+                file.write_all(&chunk).unwrap();
+            }
+            file.write_all(b"\nlast\n").unwrap();
+        }
+        let first = f.text("read_file", json!({"path": "minified.js"})).await;
+        assert!(
+            first.contains(" …(line cut)"),
+            "{}",
+            &first[first.len() - 200..]
+        );
+        assert!(
+            first.ends_with("the rest can't be read here.)\n"),
+            "{first:.100}"
+        );
+        let far = f
+            .text("read_file", json!({"path": "minified.js", "offset": 2}))
+            .await;
+        assert_eq!(
+            far,
+            "minified.js is too big to read that far: line 2 isn't in its first 64 MiB."
+        );
     }
 
     #[tokio::test]
