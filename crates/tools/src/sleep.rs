@@ -42,11 +42,14 @@ impl Tool for SleepTool {
             .get("minutes")
             .and_then(Value::as_i64)
             .ok_or_else(|| ToolError::InvalidArguments("minutes must be an integer".into()))?;
-        let wanted = Duration::minutes(minutes);
-        let chosen = wanted.clamp(MIN_SLEEP, MAX_SLEEP);
+        // Clamp the integer before constructing a `Duration`. `Duration::minutes`
+        // multiplies its argument by 60, so an extreme (but valid JSON i64)
+        // value can otherwise overflow and panic the runtime.
+        let chosen_minutes = minutes.clamp(MIN_SLEEP.whole_minutes(), MAX_SLEEP.whole_minutes());
+        let chosen = Duration::minutes(chosen_minutes);
         let until = ctx.clock.now() + chosen;
         let mut content = format!("Sleeping until {until}.");
-        if chosen != wanted {
+        if chosen_minutes != minutes {
             content.push_str(&format!(
                 " (Adjusted from {minutes} minutes to stay between {} minutes and {} hours.)",
                 MIN_SLEEP.whole_minutes(),
@@ -102,5 +105,19 @@ mod tests {
             })
         );
         assert!(long.content.contains("Adjusted"));
+    }
+
+    #[tokio::test]
+    async fn extreme_minutes_do_not_overflow() {
+        let clock = FakeClock::at_default_start();
+        for (minutes, duration) in [(i64::MIN, MIN_SLEEP), (i64::MAX, MAX_SLEEP)] {
+            let out = sleep_for(minutes, &clock).await;
+            assert_eq!(
+                out.control,
+                Some(Control::Sleep {
+                    until: clock.now() + duration
+                })
+            );
+        }
     }
 }

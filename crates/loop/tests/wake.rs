@@ -229,6 +229,25 @@ async fn one_malformed_turn_is_forgiven_two_end_the_wake() {
 }
 
 #[tokio::test]
+async fn a_text_turn_breaks_a_malformed_streak() {
+    let mut w = world();
+    let provider = ScriptedProvider::new()
+        .then_calls("", vec![("sleep", json!({}))])
+        .then_text("Let me reconsider.")
+        .then_calls("", vec![("sleep", json!({}))])
+        .then_calls("", vec![("sleep", json!({}))]);
+    let out = w
+        .wake(&provider, ToolCallStyle::Parallel, WakeLimits::default())
+        .await;
+
+    assert_eq!(out.end, WakeEnd::Malformed);
+    assert_eq!(
+        out.turns, 4,
+        "only consecutive malformed turns should end a wake"
+    );
+}
+
+#[tokio::test]
 async fn a_wake_that_never_sleeps_gets_one_reminder() {
     let mut w = world();
     let provider = ScriptedProvider::new()

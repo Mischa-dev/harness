@@ -98,7 +98,9 @@ impl OpenAiCompatAdapter {
                 let raw = call
                     .pointer("/function/arguments")
                     .and_then(Value::as_str)
-                    .unwrap_or("{}");
+                    .ok_or_else(|| {
+                        ProviderError::Parse("tool call without string arguments".into())
+                    })?;
                 let arguments = if raw.trim().is_empty() {
                     json!({})
                 } else {
@@ -379,6 +381,15 @@ mod tests {
                 cache_write_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn rejects_tool_calls_without_arguments() {
+        let missing = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"sleep"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert!(matches!(
+            OpenAiCompatAdapter::parse_response(missing),
+            Err(ProviderError::Parse(problem)) if problem.contains("arguments")
+        ));
     }
 
     #[test]

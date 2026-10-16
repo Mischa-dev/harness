@@ -202,8 +202,9 @@ fn env_variant(path: &Path, protected: &Path) -> bool {
             .is_some_and(|name| name.starts_with(".env."))
 }
 
-/// Git accepts long options with `=`, combined short flags, and options before
-/// the subcommand. Match those forms rather than relying on exact argv items.
+/// Git accepts long options with `=`, combined short flags, options before
+/// the subcommand, and `+` refspecs. Match those forms rather than relying on
+/// exact argv items, which the generic command rules deliberately do.
 fn is_dangerous_git_push(program: &str, args: &[String]) -> bool {
     if program_name(program) != "git" {
         return false;
@@ -212,13 +213,13 @@ fn is_dangerous_git_push(program: &str, args: &[String]) -> bool {
         return false;
     };
     args[push_at + 1..].iter().any(|arg| {
-        arg == "--force"
-            || arg.starts_with("--force=")
-            || arg == "--force-with-lease"
-            || arg.starts_with("--force-with-lease=")
+        // Covers --force, --force=<bool>, --force-with-lease[=...] and
+        // --force-if-includes.
+        arg.starts_with("--force")
             || (arg.starts_with('-')
                 && !arg.starts_with("--")
                 && arg[1..].chars().any(|flag| flag == 'f'))
+            || (arg.starts_with('+') && arg.len() > 1)
     })
 }
 

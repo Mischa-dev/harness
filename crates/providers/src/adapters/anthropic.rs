@@ -122,11 +122,20 @@ impl AnthropicAdapter {
                 Some("text") => content.push(ContentBlock::Text {
                     text: str_field(block, "text")?.to_string(),
                 }),
-                Some("tool_use") => content.push(ContentBlock::ToolCall(ToolCall {
-                    id: str_field(block, "id")?.to_string(),
-                    name: str_field(block, "name")?.to_string(),
-                    arguments: block.get("input").cloned().unwrap_or(json!({})),
-                })),
+                Some("tool_use") => {
+                    let arguments = block
+                        .get("input")
+                        .filter(|input| input.is_object())
+                        .cloned()
+                        .ok_or_else(|| {
+                            ProviderError::Parse("tool_use block is missing object `input`".into())
+                        })?;
+                    content.push(ContentBlock::ToolCall(ToolCall {
+                        id: str_field(block, "id")?.to_string(),
+                        name: str_field(block, "name")?.to_string(),
+                        arguments,
+                    }));
+                }
                 _ => content.push(ContentBlock::Opaque {
                     provider: PROVIDER.into(),
                     data: block.clone(),
@@ -458,6 +467,12 @@ mod tests {
         assert!(matches!(
             AnthropicAdapter::parse_response(r#"{"content":[{"type":"tool_use","name":"x"}]}"#),
             Err(ProviderError::Parse(_))
+        ));
+        assert!(matches!(
+            AnthropicAdapter::parse_response(
+                r#"{"content":[{"type":"tool_use","id":"1","name":"x","input":null}]}"#
+            ),
+            Err(ProviderError::Parse(problem)) if problem.contains("input")
         ));
     }
 

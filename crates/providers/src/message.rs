@@ -117,8 +117,8 @@ pub struct Usage {
 
 impl Usage {
     pub fn add(&mut self, other: Usage) {
-        // Usage is supplied by a remote provider. Never let a malicious or
-        // broken counter wrap and make budget accounting look smaller.
+        // Usage is provider-controlled data. Saturate instead of allowing a
+        // bogus counter to panic debug builds or wrap release builds.
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.cache_read_tokens = self
@@ -132,19 +132,26 @@ impl Usage {
 
 #[cfg(test)]
 mod tests {
-    use super::Usage;
+    use super::*;
 
     #[test]
-    fn usage_counters_cannot_wrap() {
+    fn usage_counters_saturate_on_untrusted_provider_values() {
         let mut usage = Usage {
             input_tokens: u64::MAX,
-            ..Usage::default()
+            output_tokens: u64::MAX,
+            cache_read_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
         };
         usage.add(Usage {
             input_tokens: 1,
-            ..Usage::default()
+            output_tokens: 1,
+            cache_read_tokens: 1,
+            cache_write_tokens: 1,
         });
         assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.output_tokens, u64::MAX);
+        assert_eq!(usage.cache_read_tokens, u64::MAX);
+        assert_eq!(usage.cache_write_tokens, u64::MAX);
     }
 }
 

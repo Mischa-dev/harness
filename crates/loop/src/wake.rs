@@ -217,6 +217,8 @@ pub async fn run_wake(
         transcript.push(response.message);
 
         if calls.is_empty() {
+            // A text-only turn breaks a run of malformed tool-call turns.
+            malformed_last_turn = false;
             if reminded {
                 break WakeEnd::NoSleep;
             }
