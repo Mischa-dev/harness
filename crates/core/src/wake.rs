@@ -63,7 +63,9 @@ impl WakeReason {
         match self {
             WakeReason::Workspace { summary, .. } => summary.clone(),
             WakeReason::Trigger { name } => format!("the trigger {name} fired"),
-            WakeReason::FollowUp { note, .. } => format!("your follow-up came due: {note}"),
+            WakeReason::FollowUp { schedule_id, note } => {
+                format!("#{schedule_id} on your schedule came due: {note}")
+            }
             WakeReason::WorkerFinished { worker_id } => format!("worker {worker_id} finished"),
             WakeReason::Claim {
                 claim_id,

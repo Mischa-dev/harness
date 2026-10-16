@@ -26,8 +26,13 @@ pub struct StateFacts {
     /// Earlier wakes today, and what they cost.
     pub wakes_today: usize,
     pub spend_today: f64,
+    /// Its follow-ups and routines, soonest first, one line each.
+    pub schedule: Vec<String>,
     pub shadow: bool,
 }
+
+/// How much of the schedule the view lists.
+const SCHEDULE_SHOWN: usize = 5;
 
 impl StateFacts {
     pub fn render(&self) -> String {
@@ -52,6 +57,18 @@ impl StateFacts {
             "- Today so far: {wakes} · ${:.2} of model spend",
             self.spend_today
         ));
+        match self.schedule.len() {
+            0 => lines.push("- Your schedule: nothing set".into()),
+            n => {
+                lines.push(format!("- Your schedule ({n}):"));
+                for entry in self.schedule.iter().take(SCHEDULE_SHOWN) {
+                    lines.push(format!("  - {entry}"));
+                }
+                if n > SCHEDULE_SHOWN {
+                    lines.push(format!("  - and {} more", n - SCHEDULE_SHOWN));
+                }
+            }
+        }
         if self.shadow {
             lines.push(
                 "- Shadow mode is on: what you say outside your live conversations goes to \
@@ -123,6 +140,7 @@ mod tests {
             })),
             wakes_today: 4,
             spend_today: 0.4234,
+            schedule: vec![],
             shadow: false,
         }
     }
@@ -134,8 +152,23 @@ mod tests {
             "State, Sat 2026-10-17 00:24 (Mischa's time)\n\
              - Workspace: 2 reply requests (1 needing an answer) · 1 @mention · 3 tasks · \
              1 thread that changed lately\n\
-             - Today so far: 4 earlier wakes · $0.42 of model spend"
+             - Today so far: 4 earlier wakes · $0.42 of model spend\n\
+             - Your schedule: nothing set"
         );
+    }
+
+    #[test]
+    fn the_view_lists_the_soonest_of_the_schedule() {
+        let busy = StateFacts {
+            schedule: (1..=7)
+                .map(|i| format!("#{i} at some time: check {i}"))
+                .collect(),
+            ..facts()
+        };
+        let shown = busy.render();
+        assert!(shown.contains("- Your schedule (7):\n  - #1 at some time: check 1\n"));
+        assert!(shown.contains("  - #5 at some time: check 5\n  - and 2 more"));
+        assert!(!shown.contains("#6"));
     }
 
     #[test]

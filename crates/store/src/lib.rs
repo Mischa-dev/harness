@@ -1,6 +1,7 @@
 //! The agent's runtime state in SQLite (WAL), kept in its Agent OS state
 //! folder: workdays, each day's transcript, and a record of every wake.
 
+pub mod schedule;
 mod schema;
 pub mod workday;
 
@@ -10,6 +11,7 @@ use harness_providers::{Message, Usage};
 use rusqlite::{Connection, OptionalExtension, params};
 use time::OffsetDateTime;
 
+pub use schedule::{Repeat, ScheduleBook, Scheduled};
 pub use workday::{EveningReason, WorkdayPolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -62,14 +64,7 @@ pub struct Store {
 impl Store {
     /// Opens or creates a store at `path` and applies schema migrations.
     pub fn open(path: &Path) -> Result<Self> {
-        secure_state_file(path)?;
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
-        let conn = Connection::open_with_flags(path, flags)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        Self::init(conn)
+        Self::init(open_file(path)?)
     }
 
     /// Creates an in-memory store, primarily for tests and simulations.
@@ -78,9 +73,9 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Self> {
-        conn.pragma_update(None, "foreign_keys", true)?;
-        schema::migrate(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: prepare(conn)?,
+        })
     }
 
     /// The day in progress, if one has started and not ended.
@@ -481,6 +476,25 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Opens the state file in WAL mode, so several handles can share it.
+fn open_file(path: &Path) -> Result<Connection> {
+    secure_state_file(path)?;
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+fn prepare(conn: Connection) -> Result<Connection> {
+    conn.pragma_update(None, "foreign_keys", true)?;
+    schema::migrate(&conn)?;
+    Ok(conn)
 }
 
 /// Transcripts can contain private conversation and tool output. Ensure the

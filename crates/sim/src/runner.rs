@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use harness_core::{Clock, FakeClock, WakeReason};
 use harness_loop::{AfterWake, CharterValues, ContextAssembler, Rhythm, WakeLimits, Workday};
 use harness_providers::{CapabilityProfile, ContentBlock, Message, Provider};
-use harness_store::{Store, StoreError, WorkdayPolicy};
+use harness_store::{ScheduleBook, Store, StoreError, WorkdayPolicy};
 use harness_tools::memory::MemoryFiles;
-use harness_tools::{Policy, PolicyExecutor, SleepTool};
+use harness_tools::{Policy, PolicyExecutor, Schedule, SleepTool};
 
 use crate::report::Report;
 use crate::scenario::Scenario;
@@ -76,6 +76,13 @@ pub async fn run(
     for tool in harness_tools::files::tools(Policy::conservative(workdir.path())) {
         executor.register(tool);
     }
+    let schedule = Arc::new(Schedule {
+        book: Arc::new(ScheduleBook::open_in_memory()?),
+        offset: policy.offset,
+    });
+    for tool in harness_tools::schedule::tools(schedule.clone()) {
+        executor.register(tool);
+    }
     let mut store = Store::open_in_memory()?;
     let mut assembler = ContextAssembler {
         profile: profile_name.into(),
@@ -96,7 +103,10 @@ pub async fn run(
             .iter()
             .find(|e| e.addressed)
             .map(|e| e.at);
-        let next_look = rhythm.next_look();
+        let next_look = match schedule.book.next_due()? {
+            Some(due) => due.min(rhythm.next_look()),
+            None => rhythm.next_look(),
+        };
         let at = next_addressed.map_or(next_look, |t| t.min(next_look));
         if at >= scenario.end {
             break;
@@ -120,6 +130,7 @@ pub async fn run(
             .collect::<Vec<_>>();
         delivered += arrived.len();
         let for_agent = arrived.iter().filter(|e| e.addressed).count();
+        let due = schedule.book.take_due(at, schedule.offset)?;
         let reason = if for_agent > 0 {
             WakeReason::Workspace {
                 summary: format!(
@@ -130,9 +141,22 @@ pub async fn run(
                     .iter()
                     .any(|e| e.addressed && e.conversation == "dm"),
             }
+        } else if let Some(first) = due.first() {
+            WakeReason::FollowUp {
+                schedule_id: first.id.to_string(),
+                note: first.note.clone(),
+            }
         } else {
             WakeReason::NextLook
         };
+        let mut message = wake_message(at, &reason, &arrived);
+        if !due.is_empty() {
+            message.push_str("\nCame due on your schedule:");
+            for entry in &due {
+                let line = harness_tools::schedule::describe(entry, schedule.offset);
+                message.push_str(&format!("\n- {line}"));
+            }
+        }
 
         let result = Workday {
             store: &mut store,
@@ -143,10 +167,7 @@ pub async fn run(
             clock: clock.as_ref(),
             limits: WakeLimits::default(),
         }
-        .wake(
-            &reason,
-            Message::user_text(wake_message(at, &reason, &arrived)),
-        )
+        .wake(&reason, Message::user_text(message))
         .await;
         wakes += 1;
         if let Some(day) = store.current_day()? {

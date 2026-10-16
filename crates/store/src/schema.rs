@@ -44,6 +44,15 @@ const MIGRATIONS: &[&str] = &[
     // 3: the memory snapshot the current day started from, so a restart
     // mid-day keeps the same prompt.
     "ALTER TABLE rhythm ADD COLUMN memory_snapshot TEXT;",
+    // 4: the agent's own follow-ups and routines.
+    "CREATE TABLE schedules (
+         id INTEGER PRIMARY KEY,
+         note TEXT NOT NULL,
+         due_at INTEGER NOT NULL,
+         repeat TEXT CHECK (repeat IN ('daily', 'weekdays', 'weekly')),
+         created_at INTEGER NOT NULL
+     );
+     CREATE INDEX schedules_due_at ON schedules(due_at);",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
