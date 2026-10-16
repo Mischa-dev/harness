@@ -451,3 +451,30 @@ async fn a_paused_agent_waits_for_its_owner() {
         .unwrap();
     assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
 }
+
+#[tokio::test(start_paused = true)]
+async fn events_that_need_a_look_wake_an_idle_agent() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let model = ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 60}))]);
+    let mut agent = scripted(clock.clone(), model);
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    // A trigger doesn't interrupt a running wake, but it doesn't wait
+    // three hours for the next look either.
+    send.send(WakeEvent {
+        reason: WakeReason::Trigger {
+            name: "ci-failed".into(),
+        },
+        text: "Agent OS: CI failed on main.".into(),
+    })
+    .await
+    .unwrap();
+
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert!(wakes[0].reason.contains("ci-failed"), "{}", wakes[0].reason);
+}

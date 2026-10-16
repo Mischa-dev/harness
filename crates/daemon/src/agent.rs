@@ -115,7 +115,8 @@ pub struct Agent {
     pub limits: WakeLimits,
     /// Shared by the agent's Workspace tools and the inbox poller.
     pub workspace: Option<Arc<Workspace>>,
-    /// Events that can wait, held for the agent's next look.
+    /// Events not yet in a wake: optional news held for the next look, and
+    /// whatever arrived too late to join the last wake.
     pub waiting: Vec<WakeEvent>,
 }
 
@@ -190,9 +191,9 @@ impl Agent {
         })
     }
 
-    /// Wakes at each chosen look and on each urgent event, until `shutdown`
-    /// resolves. Events that can wait are held for the next look. Urgent
-    /// events that arrive mid-wake join it at its next safe point. A wake in progress finishes
+    /// Wakes at each chosen look and on each event, until `shutdown`
+    /// resolves, except optional news, which is held for the next look.
+    /// Urgent events that arrive mid-wake join it at its next safe point. A wake in progress finishes
     /// before shutdown; it saves as it goes, so a hard stop loses at most the
     /// turn in flight.
     pub async fn run(
@@ -218,14 +219,14 @@ impl Agent {
                 }
                 continue;
             }
-            // Urgent news wakes the agent now; everything else waits for
-            // the look it chose.
-            let urgent = self
+            // Optional news waits for the look the agent chose; anything
+            // else wakes it now.
+            let due = self
                 .waiting
                 .iter()
-                .any(|e| e.reason.urgency() == Urgency::Now);
+                .any(|e| !e.reason.can_wait_for_next_look());
             let wait = self.rhythm.next_look() - self.clock.now();
-            if !urgent && wait.is_positive() {
+            if !due && wait.is_positive() {
                 let nap = wait.unsigned_abs().min(TICK);
                 tokio::select! {
                     () = &mut shutdown => return Ok(()),

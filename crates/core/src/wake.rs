@@ -45,6 +45,19 @@ impl WakeReason {
         }
     }
 
+    /// Whether an idle agent can leave this until its next look instead of
+    /// waking for it. Only what ARCHITECTURE.md lists under "Waits for its
+    /// next look" can: optional Workspace replies and low-importance news.
+    /// Triggers, follow-ups, finished workers and the filter's "look now"
+    /// wake it, though they don't interrupt a wake already running.
+    pub fn can_wait_for_next_look(&self) -> bool {
+        match self {
+            WakeReason::Workspace { urgent, .. } => !urgent,
+            WakeReason::Claim { importance, .. } => *importance < 8,
+            _ => false,
+        }
+    }
+
     /// One line for the wake message, saying why the agent is awake.
     pub fn describe(&self) -> String {
         match self {
@@ -90,5 +103,38 @@ mod tests {
         assert_eq!(big_claim.urgency(), Urgency::Now);
         assert_eq!(small_claim.urgency(), Urgency::Queued);
         assert_eq!(WakeReason::NextLook.urgency(), Urgency::Queued);
+    }
+
+    #[test]
+    fn only_optional_news_waits_for_the_next_look() {
+        let mention = WakeReason::Workspace {
+            summary: "optional group reply".into(),
+            urgent: false,
+        };
+        let small_claim = WakeReason::Claim {
+            claim_id: "c2".into(),
+            importance: 5,
+        };
+        assert!(mention.can_wait_for_next_look());
+        assert!(small_claim.can_wait_for_next_look());
+        for wakes in [
+            WakeReason::Trigger { name: "ci".into() },
+            WakeReason::FollowUp {
+                schedule_id: "s".into(),
+                note: "n".into(),
+            },
+            WakeReason::WorkerFinished {
+                worker_id: "w".into(),
+            },
+            WakeReason::Filter {
+                reason: "look".into(),
+            },
+            WakeReason::Workspace {
+                summary: "DM".into(),
+                urgent: true,
+            },
+        ] {
+            assert!(!wakes.can_wait_for_next_look(), "{wakes:?}");
+        }
     }
 }
