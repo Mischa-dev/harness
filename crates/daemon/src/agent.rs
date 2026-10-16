@@ -8,10 +8,14 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 
 use harness_core::{Clock, Urgency, WakeReason};
-use harness_loop::{AfterWake, ContextAssembler, Rhythm, WakeLimits, WakeOutcome, Workday};
+use harness_loop::{
+    AfterWake, ContextAssembler, FALLBACK_NEXT_LOOK, Interrupts, NoInterrupts, Rhythm, WakeLimits,
+    WakeOutcome, Workday,
+};
 use harness_providers::{
     CapabilityProfile, Message, Profiles, Provider, ReqwestTransport, adapters,
 };
@@ -102,8 +106,8 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Builds the agent from its config. The first look comes a few minutes
-    /// after startup, so a crash loop can't turn into a wake loop.
+    /// Builds the agent from its config, picking up the next look and any
+    /// pause saved before a restart.
     pub fn from_config(config: &AgentConfig, clock: Arc<dyn Clock>) -> Result<Self, AgentError> {
         let read = |field, path: &Path| {
             std::fs::read_to_string(path).map_err(|source| AgentError::Read { field, source })
@@ -140,7 +144,7 @@ impl Agent {
             quiet_hour: config.quiet_hour,
             ..WorkdayPolicy::default()
         };
-        let first_look = clock.now() + MIN_SLEEP;
+        let rhythm = restore_rhythm(&store, policy, clock.now())?;
         Ok(Self {
             store,
             provider,
@@ -153,14 +157,16 @@ impl Agent {
             },
             profile,
             clock,
-            rhythm: Rhythm::new(policy, first_look),
+            rhythm,
             limits: WakeLimits::default(),
         })
     }
 
     /// Wakes at each chosen look and on each event, until `shutdown`
-    /// resolves. A wake in progress finishes first; it saves as it goes, so
-    /// a hard stop loses at most the turn in flight.
+    /// resolves. Urgent events that arrive mid-wake join it at its next safe
+    /// point; the rest wait for it to end. A wake in progress finishes
+    /// before shutdown; it saves as it goes, so a hard stop loses at most the
+    /// turn in flight.
     pub async fn run(
         &mut self,
         events: &mut mpsc::Receiver<WakeEvent>,
@@ -168,16 +174,26 @@ impl Agent {
     ) -> Result<(), harness_store::StoreError> {
         let mut shutdown = std::pin::pin!(shutdown);
         let mut events_open = true;
+        let mut held = Vec::new();
         loop {
             if let Some(breaker) = self.rhythm.paused() {
-                // Resuming is the owner's call; until then, nothing wakes it.
-                eprintln!("agent paused by the {breaker} breaker; waiting for a restart");
-                shutdown.await;
-                return Ok(());
+                eprintln!(
+                    "agent paused by the {breaker} breaker; waiting for the owner to resume it"
+                );
+                tokio::select! {
+                    () = &mut shutdown => return Ok(()),
+                    () = tokio::time::sleep(TICK) => {}
+                }
+                if self.store.rhythm_state()?.paused.is_none() {
+                    eprintln!("agent resumed");
+                    self.rhythm.resume();
+                    self.executor.resume();
+                }
+                continue;
             }
-            let mut batch = Vec::new();
+            let mut batch = std::mem::take(&mut held);
             let wait = self.rhythm.next_look() - self.clock.now();
-            if wait.is_positive() {
+            if batch.is_empty() && wait.is_positive() {
                 let nap = wait.unsigned_abs().min(TICK);
                 tokio::select! {
                     () = &mut shutdown => return Ok(()),
@@ -195,14 +211,37 @@ impl Agent {
             while let Ok(event) = events.try_recv() {
                 batch.push(event);
             }
-            self.wake(batch).await?;
+            let mut inbox = Inbox {
+                events,
+                clock: self.clock.clone(),
+                urgent: Vec::new(),
+                queued: Vec::new(),
+            };
+            self.wake_with(batch, &mut inbox).await?;
+            // What arrived during the wake and wasn't taken in: urgent news
+            // after its last safe point, and everything that could wait.
+            held = inbox.urgent;
+            held.append(&mut inbox.queued);
         }
     }
 
-    /// One wake, for the events in `batch`, or for the next look if it's empty.
+    /// One wake, for the events in `batch`, or for the next look if it's
+    /// empty. Nothing interrupts it.
     pub async fn wake(&mut self, batch: Vec<WakeEvent>) -> Result<(), harness_store::StoreError> {
+        self.wake_with(batch, &mut NoInterrupts).await
+    }
+
+    async fn wake_with(
+        &mut self,
+        batch: Vec<WakeEvent>,
+        interrupts: &mut dyn Interrupts,
+    ) -> Result<(), harness_store::StoreError> {
         let at = self.clock.now();
         self.rhythm.close_day_if_due(&self.store, at)?;
+        // If the process dies mid-wake, the restart waits this long rather
+        // than wake straight away, so a crash can't become a loop of paid
+        // wakes.
+        self.store.set_next_look(at + FALLBACK_NEXT_LOOK)?;
         let reason = batch
             .iter()
             .find(|e| e.reason.urgency() == Urgency::Now)
@@ -218,18 +257,92 @@ impl Agent {
             clock: self.clock.as_ref(),
             limits: self.limits,
         }
-        .wake(&reason, message)
+        .wake_interruptible(&reason, message, interrupts)
         .await;
         let summary = summarize(&result);
-        match self.rhythm.after(&result, self.clock.now()) {
+        let after = self.rhythm.after(&result, self.clock.now());
+        self.store.set_next_look(self.rhythm.next_look())?;
+        match after {
             AfterWake::Slept => eprintln!("wake {summary}; next look {}", self.rhythm.next_look()),
-            AfterWake::Paused { breaker } => eprintln!("wake {summary}; paused by {breaker}"),
+            AfterWake::Paused { breaker } => {
+                // Saved, so a restart doesn't lift it.
+                self.store.set_paused(Some(&breaker))?;
+                eprintln!("wake {summary}; paused by {breaker}");
+            }
             AfterWake::Fallback { problem } => eprintln!(
                 "wake {summary}: {problem}; next look {}",
                 self.rhythm.next_look()
             ),
         }
         Ok(())
+    }
+}
+
+/// The rhythm saved before a restart. A look already past is due now; with
+/// none saved, the first look comes a few minutes after startup.
+pub fn restore_rhythm(
+    store: &Store,
+    policy: WorkdayPolicy,
+    now: OffsetDateTime,
+) -> Result<Rhythm, harness_store::StoreError> {
+    let saved = store.rhythm_state()?;
+    let first_look = saved.next_look.map_or(now + MIN_SLEEP, |at| at.max(now));
+    Ok(Rhythm::new(policy, first_look).with_pause(saved.paused))
+}
+
+/// Lifts a breaker's pause: the owner's call, made with
+/// `harness-daemon resume`. A running agent notices within a minute.
+/// Returns the breaker that had paused it, if any.
+pub fn resume(config: &AgentConfig) -> Result<Option<String>, AgentError> {
+    let store = Store::open(&config.state_dir.join(STORE_FILE))?;
+    let paused = store.rhythm_state()?.paused;
+    store.set_paused(None)?;
+    Ok(paused)
+}
+
+/// Events arriving while a wake runs. Urgent ones are handed to the wake at
+/// its safe points; the rest wait for the next wake.
+struct Inbox<'a> {
+    events: &'a mut mpsc::Receiver<WakeEvent>,
+    clock: Arc<dyn Clock>,
+    urgent: Vec<WakeEvent>,
+    queued: Vec<WakeEvent>,
+}
+
+impl Inbox<'_> {
+    fn sort(&mut self, event: WakeEvent) {
+        match event.reason.urgency() {
+            Urgency::Now => self.urgent.push(event),
+            Urgency::Queued => self.queued.push(event),
+        }
+    }
+}
+
+impl Interrupts for Inbox<'_> {
+    fn take(&mut self) -> Vec<Message> {
+        while let Ok(event) = self.events.try_recv() {
+            self.sort(event);
+        }
+        if self.urgent.is_empty() {
+            return Vec::new();
+        }
+        let urgent = std::mem::take(&mut self.urgent);
+        vec![Message::user_text(interrupt_message(
+            self.clock.now(),
+            &urgent,
+        ))]
+    }
+
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            while self.urgent.is_empty() {
+                match self.events.recv().await {
+                    Some(event) => self.sort(event),
+                    // Nothing more can arrive.
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        })
     }
 }
 
@@ -246,21 +359,38 @@ fn summarize(result: &Result<WakeOutcome, harness_loop::DayError>) -> String {
     }
 }
 
-/// The message that opens a wake: when, why, and what arrived. Each event is
-/// one line, so an event's text can't pose as another event.
+/// The message that opens a wake: when, why, and what arrived.
 pub fn wake_message(at: OffsetDateTime, reason: &WakeReason, batch: &[WakeEvent]) -> String {
-    let when = at.format(&Rfc3339).unwrap_or_else(|_| at.to_string());
-    let mut text = format!("Wake at {when}. Why: {}.\n", reason.describe());
+    let mut text = format!("Wake at {}. Why: {}.\n", rfc3339(at), reason.describe());
     if batch.is_empty() {
         text.push_str("Nothing new since you last looked.");
     } else {
         text.push_str("New since you last looked:");
-        for event in batch {
-            let line = event.text.split_whitespace().collect::<Vec<_>>().join(" ");
-            text.push_str(&format!("\n- {line}"));
-        }
+        push_lines(&mut text, batch);
     }
     text
+}
+
+/// The message that brings urgent news into a wake already running.
+pub fn interrupt_message(at: OffsetDateTime, urgent: &[WakeEvent]) -> String {
+    let mut text = format!(
+        "(runtime) Urgent, arrived at {} while you were working:",
+        rfc3339(at)
+    );
+    push_lines(&mut text, urgent);
+    text
+}
+
+fn rfc3339(at: OffsetDateTime) -> String {
+    at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
+}
+
+/// One line per event, so an event's text can't pose as another event.
+fn push_lines(text: &mut String, events: &[WakeEvent]) {
+    for event in events {
+        let line = event.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        text.push_str(&format!("\n- {line}"));
+    }
 }
 
 #[cfg(test)]

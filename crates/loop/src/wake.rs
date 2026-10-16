@@ -6,6 +6,9 @@ use harness_providers::{
     ToolCallStyle, ToolResult, Usage,
 };
 use harness_tools::{Control, Decision, ExecOutcome, PolicyExecutor};
+use std::future::Future;
+use std::pin::Pin;
+
 use time::OffsetDateTime;
 
 use crate::context::ContextAssembler;
@@ -87,6 +90,31 @@ pub trait Checkpoint {
     ) -> Result<(), CheckpointError>;
 }
 
+/// Urgent events that arrive while a wake runs. The wake takes them at its
+/// safe points: before each model call, and by cancelling a model call in
+/// flight. A running tool is never interrupted.
+pub trait Interrupts: Send {
+    /// The urgent messages waiting now, without blocking.
+    fn take(&mut self) -> Vec<Message>;
+
+    /// Resolves once an urgent message is waiting. Dropping it before then
+    /// must lose nothing.
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// For callers with nothing that can interrupt a wake.
+pub struct NoInterrupts;
+
+impl Interrupts for NoInterrupts {
+    fn take(&mut self) -> Vec<Message> {
+        Vec::new()
+    }
+
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::pending())
+    }
+}
+
 /// For callers that keep the wake in memory only.
 pub struct NoCheckpoint;
 
@@ -153,6 +181,33 @@ pub async fn run_wake(
     limits: WakeLimits,
     checkpoint: &mut dyn Checkpoint,
 ) -> Result<WakeOutcome, LoopError> {
+    run_wake_interruptible(
+        provider,
+        executor,
+        assembler,
+        profile,
+        transcript,
+        wake_message,
+        limits,
+        checkpoint,
+        &mut NoInterrupts,
+    )
+    .await
+}
+
+/// [`run_wake`], taking urgent messages from `interrupts` at its safe points.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_wake_interruptible(
+    provider: &dyn Provider,
+    executor: &mut PolicyExecutor,
+    assembler: &ContextAssembler,
+    profile: &CapabilityProfile,
+    transcript: &mut Vec<Message>,
+    wake_message: Message,
+    limits: WakeLimits,
+    checkpoint: &mut dyn Checkpoint,
+    interrupts: &mut dyn Interrupts,
+) -> Result<WakeOutcome, LoopError> {
     transcript.push(wake_message);
     let mut usage = Usage::default();
     let mut reminded = false;
@@ -189,8 +244,29 @@ pub async fn run_wake(
         }
         turns += 1;
 
+        // A safe point: no tool is running. Urgent news joins the
+        // conversation before the agent's next thought.
+        let urgent = interrupts.take();
+        if !urgent.is_empty() {
+            transcript.extend(urgent);
+            save(
+                checkpoint,
+                transcript,
+                None,
+                progress(turns, usage, context_tokens),
+            )?;
+        }
+
         let request = assembler.assemble(executor.specs(), transcript);
-        let response = match provider.complete(&request).await {
+        let call = provider.complete(&request);
+        let result = tokio::select! {
+            biased;
+            result = call => result,
+            // The call's answer would be stale; drop it and think again with
+            // the news. The cancelled call still counts as a turn.
+            () = interrupts.wait() => continue,
+        };
+        let response = match result {
             Ok(response) => response,
             Err(source) => {
                 return Err(LoopError::Provider {

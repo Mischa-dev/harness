@@ -365,6 +365,57 @@ impl Store {
     }
 }
 
+/// The wake loop's state between wakes, as last saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RhythmState {
+    /// When the agent chose to look next.
+    pub next_look: Option<OffsetDateTime>,
+    /// The breaker that paused the agent. Only the owner clears it.
+    pub paused: Option<String>,
+}
+
+impl Store {
+    pub fn rhythm_state(&self) -> Result<RhythmState> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT next_look, paused FROM rhythm WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((next_look, paused)) = row else {
+            return Ok(RhythmState::default());
+        };
+        let next_look = next_look
+            .map(|ts| {
+                OffsetDateTime::from_unix_timestamp(ts)
+                    .map_err(|_| StoreError::Corrupt("next look is out of range".into()))
+            })
+            .transpose()?;
+        Ok(RhythmState { next_look, paused })
+    }
+
+    pub fn set_next_look(&self, at: OffsetDateTime) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rhythm (id, next_look) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET next_look = excluded.next_look",
+            params![at.unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Records the breaker that paused the agent, or clears it with `None`.
+    pub fn set_paused(&self, breaker: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO rhythm (id, paused) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET paused = excluded.paused",
+            params![breaker],
+        )?;
+        Ok(())
+    }
+}
+
 /// Transcripts can contain private conversation and tool output. Ensure the
 /// database isn't created using a permissive process umask, and refuse a
 /// final-component symlink so an attacker cannot redirect state writes.
@@ -474,4 +525,30 @@ fn day_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Day>> {
             context_tokens: nonnegative(context_tokens, "context_tokens")?,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    #[test]
+    fn the_rhythm_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        let at = datetime!(2026-01-05 12:00 UTC);
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.rhythm_state().unwrap(), RhythmState::default());
+            store.set_next_look(at).unwrap();
+            store.set_paused(Some("spend")).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let state = store.rhythm_state().unwrap();
+        assert_eq!(state.next_look, Some(at));
+        assert_eq!(state.paused.as_deref(), Some("spend"));
+        store.set_paused(None).unwrap();
+        assert_eq!(store.rhythm_state().unwrap().paused, None);
+        assert_eq!(store.rhythm_state().unwrap().next_look, Some(at));
+    }
 }

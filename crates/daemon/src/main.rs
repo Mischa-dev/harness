@@ -12,7 +12,8 @@ use harness_daemon::proxy;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
 const USAGE: &str = "usage: harness-daemon proxy --config <path>
-       harness-daemon run --config <path>";
+       harness-daemon run --config <path>
+       harness-daemon resume --config <path>";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,6 +25,7 @@ async fn main() -> ExitCode {
     let result = match command {
         "proxy" => run_proxy(&config).await,
         "run" => run_agent(&config).await,
+        "resume" => resume_agent(&config),
         _ => return usage(),
     };
     match result {
@@ -71,6 +73,20 @@ async fn run_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let (_events_in, mut events) = tokio::sync::mpsc::channel::<WakeEvent>(64);
     eprintln!("agent running; first look at {}", agent.rhythm.next_look());
     agent.run(&mut events, shutdown()).await?;
+    Ok(())
+}
+
+/// The owner lifting a breaker's pause.
+fn resume_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load(path)?
+        .agent
+        .ok_or("the config has no [agent] section")?;
+    match harness_daemon::agent::resume(&config)? {
+        Some(breaker) => {
+            eprintln!("lifted the {breaker} pause; a running agent resumes within a minute")
+        }
+        None => eprintln!("the agent wasn't paused"),
+    }
     Ok(())
 }
 

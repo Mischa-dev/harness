@@ -9,7 +9,8 @@ use harness_tools::PolicyExecutor;
 
 use crate::context::ContextAssembler;
 use crate::wake::{
-    Checkpoint, CheckpointError, LoopError, Progress, WakeLimits, WakeOutcome, run_wake,
+    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeLimits,
+    WakeOutcome, run_wake_interruptible,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +49,17 @@ impl Workday<'_> {
         reason: &WakeReason,
         wake_message: Message,
     ) -> Result<WakeOutcome, DayError> {
+        self.wake_interruptible(reason, wake_message, &mut NoInterrupts)
+            .await
+    }
+
+    /// [`Self::wake`], taking urgent messages from `interrupts` as it goes.
+    pub async fn wake_interruptible(
+        &mut self,
+        reason: &WakeReason,
+        wake_message: Message,
+        interrupts: &mut dyn Interrupts,
+    ) -> Result<WakeOutcome, DayError> {
         let started_at = self.clock.now();
         let day = match self.store.current_day()? {
             Some(day) => day,
@@ -73,7 +85,7 @@ impl Workday<'_> {
             saved: transcript.len(),
         };
 
-        let result = run_wake(
+        let result = run_wake_interruptible(
             self.provider,
             self.executor,
             self.assembler,
@@ -82,6 +94,7 @@ impl Workday<'_> {
             wake_message,
             self.limits,
             &mut saver,
+            interrupts,
         )
         .await;
 

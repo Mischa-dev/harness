@@ -42,6 +42,17 @@ impl Rhythm {
         }
     }
 
+    /// Restores a pause saved before a restart. Only the owner lifts it.
+    pub fn with_pause(mut self, breaker: Option<String>) -> Self {
+        self.paused = breaker;
+        self
+    }
+
+    /// Lifts the pause, once the owner says so.
+    pub fn resume(&mut self) {
+        self.paused = None;
+    }
+
     pub fn next_look(&self) -> OffsetDateTime {
         self.next_look
     }

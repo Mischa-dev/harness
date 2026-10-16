@@ -27,6 +27,7 @@ toml.workspace = true
 url = "2"
 
 [dev-dependencies]
+async-trait.workspace = true
 futures-core = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true

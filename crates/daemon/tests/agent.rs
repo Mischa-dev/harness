@@ -246,3 +246,188 @@ async fn the_agent_wakes_when_its_look_comes_due() {
     assert_eq!(wakes.len(), 1);
     assert!(wakes[0].reason.contains("next_look"), "{}", wakes[0].reason);
 }
+
+/// A model that, on its first call, has `event` arrive from outside, then
+/// either hangs (as a slow model would) or goes back to sleep.
+struct EventDuringCall {
+    send: tokio::sync::mpsc::Sender<WakeEvent>,
+    event: Mutex<Option<WakeEvent>>,
+    hang: bool,
+    then: ScriptedProvider,
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl harness_providers::Provider for EventDuringCall {
+    async fn complete(
+        &self,
+        request: &harness_providers::ModelRequest,
+    ) -> Result<harness_providers::ModelResponse, harness_providers::ProviderError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push(serde_json::to_string(&request.messages).unwrap());
+        let event = self.event.lock().unwrap().take();
+        if let Some(event) = event {
+            self.send.send(event).await.unwrap();
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+        }
+        self.then.complete(request).await
+    }
+}
+
+fn dm(text: &str) -> WakeEvent {
+    WakeEvent {
+        reason: WakeReason::Workspace {
+            summary: "a DM".into(),
+            urgent: true,
+        },
+        text: text.into(),
+    }
+}
+
+fn mention(text: &str) -> WakeEvent {
+    WakeEvent {
+        reason: WakeReason::Workspace {
+            summary: "an @mention".into(),
+            urgent: false,
+        },
+        text: text.into(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_urgent_event_interrupts_a_slow_model_call() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    let model = Arc::new(EventDuringCall {
+        send: send.clone(),
+        event: Mutex::new(Some(dm("[dm] Mischa: prod is down"))),
+        hang: true,
+        then: ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+        seen: Mutex::default(),
+    });
+    let mut agent = scripted(clock.clone(), ScriptedProvider::new());
+    agent.provider = Box::new(Shared(model.clone()));
+    send.send(mention("[#general] Ari: @Tamsin standup notes?"))
+        .await
+        .unwrap();
+
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "the hung call gave way to the urgent DM");
+    assert!(seen[1].contains("Urgent, arrived at"), "{}", seen[1]);
+    assert!(seen[1].contains("- [dm] Mischa: prod is down"));
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 1, "the DM joined the wake already running");
+}
+
+#[tokio::test(start_paused = true)]
+async fn events_that_can_wait_get_the_next_wake() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    let model = Arc::new(EventDuringCall {
+        send: send.clone(),
+        event: Mutex::new(Some(mention("[#general] Ari: @Tamsin lunch?"))),
+        hang: false,
+        then: ScriptedProvider::new()
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+        seen: Mutex::default(),
+    });
+    let mut agent = scripted(clock.clone(), ScriptedProvider::new());
+    agent.provider = Box::new(Shared(model.clone()));
+    send.send(dm("[dm] Mischa: hi")).await.unwrap();
+
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 2);
+    assert!(
+        wakes[1].reason.contains("an @mention"),
+        "{}",
+        wakes[1].reason
+    );
+    let seen = model.seen.lock().unwrap();
+    assert!(seen[1].contains("- [#general] Ari: @Tamsin lunch?"));
+}
+
+/// Lets a test keep a handle on the model it gives the agent.
+struct Shared(Arc<EventDuringCall>);
+
+#[async_trait::async_trait]
+impl harness_providers::Provider for Shared {
+    async fn complete(
+        &self,
+        request: &harness_providers::ModelRequest,
+    ) -> Result<harness_providers::ModelResponse, harness_providers::ProviderError> {
+        self.0.complete(request).await
+    }
+}
+
+#[test]
+fn the_next_look_and_a_pause_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let now = datetime!(2026-01-05 09:00 UTC);
+    let policy = WorkdayPolicy::default();
+    let fresh = Store::open(&path).unwrap();
+    assert_eq!(
+        harness_daemon::agent::restore_rhythm(&fresh, policy, now)
+            .unwrap()
+            .next_look(),
+        now + time::Duration::minutes(5)
+    );
+    let later = now + time::Duration::hours(20);
+    fresh.set_next_look(later).unwrap();
+    fresh.set_paused(Some("spend")).unwrap();
+    drop(fresh);
+
+    let store = Store::open(&path).unwrap();
+    let rhythm = harness_daemon::agent::restore_rhythm(&store, policy, now).unwrap();
+    assert_eq!(rhythm.next_look(), later);
+    assert_eq!(rhythm.paused(), Some("spend"));
+    // A look missed while the daemon was down is due now.
+    let rhythm =
+        harness_daemon::agent::restore_rhythm(&store, policy, later + time::Duration::hours(1))
+            .unwrap();
+    assert_eq!(rhythm.next_look(), later + time::Duration::hours(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_paused_agent_waits_for_its_owner() {
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let model = ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 60}))]);
+    let mut agent = scripted(clock.clone(), model);
+    agent.store.set_paused(Some("spend")).unwrap();
+    agent.rhythm = agent.rhythm.clone().with_pause(Some("spend".into()));
+    clock.advance(time::Duration::hours(3));
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(dm("[dm] Mischa: you there?")).await.unwrap();
+
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert!(agent.store.wakes_since(start).unwrap().is_empty());
+
+    // The owner lifts the pause; the agent notices and wakes.
+    agent.store.set_paused(None).unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+}

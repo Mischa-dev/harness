@@ -11,6 +11,6 @@ pub use context::ContextAssembler;
 pub use day::{DayError, Workday};
 pub use rhythm::{AfterWake, FALLBACK_NEXT_LOOK, Rhythm};
 pub use wake::{
-    Checkpoint, CheckpointError, LoopError, NoCheckpoint, Progress, WakeEnd, WakeLimits,
-    WakeOutcome, run_wake,
+    Checkpoint, CheckpointError, Interrupts, LoopError, NoCheckpoint, NoInterrupts, Progress,
+    WakeEnd, WakeLimits, WakeOutcome, run_wake, run_wake_interruptible,
 };
