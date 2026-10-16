@@ -27,7 +27,7 @@ status and roadmap.
 
 ## Prerequisites
 
-- Rust **1.85 or newer** (edition 2024). The checked-in
+- Rust **1.88 or newer** (edition 2024). The checked-in
   [`rust-toolchain.toml`](rust-toolchain.toml) asks rustup for the stable
   toolchain plus `clippy` and `rustfmt`.
 - A C toolchain supported by Rust. SQLite is built from the bundled source, so
