@@ -19,4 +19,4 @@ pub use profile::{
 pub use provider::{Provider, ProviderError};
 #[cfg(feature = "http")]
 pub use transport::ReqwestTransport;
-pub use transport::{HttpResponse, Transport, TransportError};
+pub use transport::{CALLER_TOKEN_HEADER, HttpResponse, Transport, TransportError};
