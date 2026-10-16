@@ -14,7 +14,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use harness_core::{FakeClock, WakeReason};
 use harness_daemon::agent::{Agent, AgentConfig};
+use harness_daemon::filter::WakeFilter;
 use harness_daemon::polling::{self, WorkspaceConfig};
+use harness_loop::filter::FilterAgent;
 use harness_providers::ScriptedProvider;
 use serde_json::{Value, json};
 use time::macros::datetime;
@@ -62,7 +64,9 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
                     "request": request("r-1", "claimed", true, 2),
                     "recentMessages": [{"author": "Mischa", "text": "Is the proxy merged?"}]
                 }),
-                "reply_send" => json!({"requestId": arguments["requestId"], "status": "answered"}),
+                "reply_send" | "reply_pass" => {
+                    json!({"requestId": arguments["requestId"], "status": "answered"})
+                }
                 other => panic!("unexpected tool {other}"),
             };
             let content = json!({"outcome": "ok", "value": value});
@@ -115,6 +119,7 @@ fn config(dir: &Path, workspace: SocketAddr) -> AgentConfig {
         memory_dir: None,
         identity: Default::default(),
         shell: None,
+        filter: None,
         workspace: Some(WorkspaceConfig {
             url: format!("http://{workspace}/api/v1/mcp"),
             token_file: write(dir, "workspace-token", &format!("{WORKSPACE_TOKEN}\n")),
@@ -279,4 +284,134 @@ fn a_shadow_channel_must_be_a_conversation_id() {
         panic!("a bad shadow channel was accepted");
     };
     assert!(err.to_string().contains("workspace.shadow"), "{err}");
+}
+
+fn with_filter(agent: &mut Agent, answer: &str) {
+    let profile = harness_providers::Profiles::from_toml(PROFILES)
+        .unwrap()
+        .get("main")
+        .unwrap()
+        .clone();
+    agent.filter = Some(
+        WakeFilter::new(
+            Box::new(ScriptedProvider::new().then_text(answer)),
+            "main",
+            profile,
+            FilterAgent {
+                name: "Tamsin".into(),
+                owner: "Mischa".into(),
+                responsibilities: vec![],
+            },
+        )
+        .unwrap(),
+    );
+}
+
+fn optional_news() -> harness_daemon::agent::WakeEvent {
+    polling::event(harness_workspace::NewRequests {
+        count: 1,
+        pressing: 0,
+    })
+}
+
+#[tokio::test]
+async fn the_filter_passes_an_optional_reply_without_waking_the_agent() {
+    let (fake, addr) = workspace().await;
+    fake.inbox.lock().unwrap().extend([
+        request("r-1", "pending", true, 1),
+        request("r-3", "pending", false, 1),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = Agent::from_config(&config(dir.path(), addr), clock).unwrap();
+    agent.provider = Box::new(ScriptedProvider::new());
+    with_filter(
+        &mut agent,
+        r#"{"decision": "drop", "reason": "routine chat",
+            "replies": [{"request_id": "r-3", "decision": "pass", "reason": "not mine"},
+                        {"request_id": "r-1", "decision": "pass"}]}"#,
+    );
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(optional_news()).await.unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    let calls = fake.calls.lock().unwrap().clone();
+    let passes: Vec<&Value> = calls
+        .iter()
+        .filter(|(name, _)| name == "reply_pass")
+        .map(|(_, arguments)| arguments)
+        .collect();
+    // Only the optional one: a required request never reaches the filter.
+    assert_eq!(passes.len(), 1, "{calls:?}");
+    assert_eq!(passes[0]["requestId"], "r-3");
+    assert!(agent.waiting.is_empty(), "the news was dropped");
+    assert!(agent.store.wakes_since(start).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_filter_can_wake_the_agent_early() {
+    let (fake, addr) = workspace().await;
+    fake.inbox
+        .lock()
+        .unwrap()
+        .push(request("r-3", "pending", false, 1));
+    let dir = tempfile::tempdir().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = Agent::from_config(&config(dir.path(), addr), clock).unwrap();
+    agent.provider =
+        Box::new(ScriptedProvider::new().then_calls("", vec![("sleep", json!({"minutes": 60}))]));
+    with_filter(
+        &mut agent,
+        r#"{"decision": "keep", "reason": "a CI question in their area",
+            "replies": [{"request_id": "r-3", "decision": "wake"}]}"#,
+    );
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(optional_news()).await.unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(2)))
+        .await
+        .unwrap();
+
+    let wakes = agent.store.wakes_since(start).unwrap();
+    assert_eq!(wakes.len(), 1);
+    assert!(
+        wakes[0].reason.contains("a CI question in their area"),
+        "{}",
+        wakes[0].reason
+    );
+    assert!(
+        !fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| name == "reply_pass"),
+        "a reply worth waking for isn't passed"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_filter_answer_leaves_the_news_waiting() {
+    let (_fake, addr) = workspace().await;
+    let dir = tempfile::tempdir().unwrap();
+    let start = datetime!(2026-01-05 09:00 UTC);
+    let clock = Arc::new(FakeClock::new(start));
+    let mut agent = Agent::from_config(&config(dir.path(), addr), clock).unwrap();
+    agent.provider = Box::new(ScriptedProvider::new());
+    with_filter(&mut agent, "WAKE THEM UP NOW");
+    let (send, mut events) = tokio::sync::mpsc::channel(8);
+    send.send(optional_news()).await.unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    assert_eq!(agent.waiting.len(), 1);
+    assert!(agent.store.wakes_since(start).unwrap().is_empty());
+    // It looked once, and won't look again until something new arrives.
+    assert!(!agent.unjudged);
 }

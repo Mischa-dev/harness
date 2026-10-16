@@ -122,6 +122,13 @@ fn wakes_record_usage_cost_and_the_days_context_size() {
     assert_eq!(all[0], wake(day.id, start, 0.05));
     assert!((store.spend_since(start).unwrap() - 0.12).abs() < 1e-9);
     assert!((store.spend_since(start + Duration::hours(1)).unwrap() - 0.07).abs() < 1e-9);
+
+    // The wake filter's calls count too.
+    store
+        .record_helper_call(start + Duration::hours(2), "wake_filter", 0.002)
+        .unwrap();
+    assert!((store.spend_since(start).unwrap() - 0.122).abs() < 1e-9);
+    assert!((store.spend_since(start + Duration::hours(3)).unwrap() - 0.07).abs() < 1e-9);
 }
 
 #[test]

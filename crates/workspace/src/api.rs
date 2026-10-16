@@ -31,6 +31,12 @@ pub struct InboxEntry {
     /// `pending` until someone claims it, then `claimed`.
     pub status: String,
     pub generation: i32,
+    /// For the wake filter, which decides whether an optional reply is
+    /// worth the agent's attention.
+    #[serde(default)]
+    pub conversation_name: Option<String>,
+    #[serde(default)]
+    pub message_excerpt: Option<String>,
 }
 
 /// How much the briefing lists, for the state view. Counts only: what the

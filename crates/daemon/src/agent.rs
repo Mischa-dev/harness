@@ -93,6 +93,10 @@ pub struct AgentConfig {
     /// The sandboxed `run_command` tool. Without it, the agent has no shell.
     #[serde(default)]
     pub shell: Option<ShellConfig>,
+    /// The wake filter, on a cheap helper model. Without it, news that can
+    /// wait always waits for the agent's next look.
+    #[serde(default)]
+    pub filter: Option<crate::filter::FilterConfig>,
 }
 
 /// Who the agent is and who it works for, for the charter.
@@ -191,6 +195,10 @@ pub struct Agent {
     /// Events not yet in a wake: optional news held for the next look, and
     /// whatever arrived too late to join the last wake.
     pub waiting: Vec<WakeEvent>,
+    /// The wake filter, if there's a helper model for it.
+    pub filter: Option<crate::filter::WakeFilter>,
+    /// Whether something in `waiting` arrived since the filter last looked.
+    pub unjudged: bool,
 }
 
 impl Agent {
@@ -408,6 +416,13 @@ impl Agent {
             ..WorkdayPolicy::default()
         };
         let rhythm = restore_rhythm(&store, policy, clock.now())?;
+        let filter = config
+            .filter
+            .as_ref()
+            .map(|settings| {
+                crate::filter::WakeFilter::from_config(config, settings, &profiles, MODEL_TIMEOUT)
+            })
+            .transpose()?;
         Ok(Self {
             store,
             provider,
@@ -430,6 +445,8 @@ impl Agent {
             schedule,
             memory_settled: false,
             waiting: Vec::new(),
+            filter,
+            unjudged: false,
         })
     }
 
@@ -462,6 +479,9 @@ impl Agent {
                 continue;
             }
             self.collect_due()?;
+            if self.filter_due(self.clock.now()) {
+                self.filter_waiting().await?;
+            }
             // Optional news waits for the look the agent chose; anything
             // else wakes it now.
             let due = self
@@ -478,7 +498,10 @@ impl Agent {
                 tokio::select! {
                     () = &mut shutdown => return Ok(()),
                     event = events.recv(), if events_open => match event {
-                        Some(event) => self.waiting.push(event),
+                        Some(event) => {
+                            self.waiting.push(event);
+                            self.unjudged = true;
+                        }
                         None => events_open = false,
                     },
                     () = tokio::time::sleep(nap) => {}
@@ -501,6 +524,7 @@ impl Agent {
             // after its last safe point, and everything that could wait.
             self.waiting = inbox.urgent;
             self.waiting.append(&mut inbox.queued);
+            self.unjudged = !self.waiting.is_empty();
         }
     }
 
@@ -553,9 +577,12 @@ impl Agent {
         // than wake straight away, so a crash can't become a loop of paid
         // wakes.
         self.store.set_next_look(at + FALLBACK_NEXT_LOOK)?;
+        // Why it woke: something urgent, else whatever couldn't wait for
+        // the next look, else the first of the news.
         let reason = batch
             .iter()
             .find(|e| e.reason.urgency() == Urgency::Now)
+            .or_else(|| batch.iter().find(|e| !e.reason.can_wait_for_next_look()))
             .or(batch.first())
             .map_or(WakeReason::NextLook, |e| e.reason.clone());
         let state = self.state_view(at).await?;
