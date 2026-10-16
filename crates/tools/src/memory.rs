@@ -54,8 +54,15 @@ impl MemoryFiles {
     pub fn open(dir: impl Into<PathBuf>, offset: UtcOffset) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(dir.join("journal"))?;
-        let history =
-            dir.join(".git").is_dir() || git(&dir, &["init", "--quiet"]).is_ok_and(|ok| ok);
+        // History only in the folder's own repo: a `.git` that is a link or
+        // a pointer file could aim git at some other repository.
+        let history = match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                git(&dir, &["init", "--quiet"]).is_ok_and(|ok| ok)
+            }
+            Err(_) => false,
+        };
         Ok(Self {
             dir,
             offset,
@@ -79,11 +86,11 @@ impl MemoryFiles {
         FILES
             .iter()
             .map(|(_, name, cap)| {
-                let text = read_file(&self.dir.join(name)).unwrap_or_default();
-                let text = cut(text.trim(), *cap);
+                let text = read_capped(&self.dir.join(name), *cap).unwrap_or_default();
+                let text = text.trim();
                 format!(
                     "## {name}\n{}",
-                    if text.is_empty() { "(empty)" } else { &text }
+                    if text.is_empty() { "(empty)" } else { text }
                 )
             })
             .collect::<Vec<_>>()
@@ -157,22 +164,23 @@ fn open_file(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// The file's text, or empty if it doesn't exist yet.
-fn read_file(path: &Path) -> std::io::Result<String> {
-    let mut text = String::new();
+/// The file's text within `limit` characters, saying so if it was cut, or
+/// empty if it doesn't exist yet. Only what can be shown is read, however
+/// big the file has grown.
+fn read_capped(path: &Path, limit: usize) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
     match open_file(path, OpenOptions::new().read(true)) {
-        Ok(mut file) => file.read_to_string(&mut text).map(|_| text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(text),
-        Err(e) => Err(e),
-    }
-}
-
-/// `text` within `limit` characters, saying so if it was cut.
-fn cut(text: &str, limit: usize) -> String {
-    match text.char_indices().nth(limit) {
-        None => text.to_string(),
+        // A character is at most 4 bytes, so one more byte than that shows
+        // whether there is more.
+        Ok(file) => file.take(limit as u64 * 4 + 1).read_to_end(&mut bytes)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(match text.char_indices().nth(limit) {
+        None => text.into_owned(),
         Some((at, _)) => format!("{}\n[cut at {limit} characters]", &text[..at]),
-    }
+    })
 }
 
 /// Runs git in `dir` with an argument array; whether it succeeded. Hooks and
@@ -188,6 +196,9 @@ fn git(dir: &Path, args: &[&str]) -> std::io::Result<bool> {
             "commit.gpgSign=false",
         ])
         .args(args)
+        // The folder's own repo, never one git finds by searching upward.
+        .env("GIT_DIR", dir.join(".git"))
+        .env("GIT_WORK_TREE", dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -264,12 +275,12 @@ impl Tool for MemoryRead {
 
     async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         let path = self.path(args, Some(ctx.clock.now()))?;
-        let text = read_file(&path)
+        let text = read_capped(&path, MAX_READ_CHARS)
             .map_err(|e| ToolError::Failed(format!("couldn't read it: {}", e.kind())))?;
         if text.trim().is_empty() {
             return Ok(ToolOutput::text("(empty)"));
         }
-        Ok(ToolOutput::text(cut(&text, MAX_READ_CHARS)))
+        Ok(ToolOutput::text(text))
     }
 }
 
@@ -600,6 +611,40 @@ mod tests {
         );
         assert!(!files.snapshot().contains("outside"));
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "outside");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn history_stays_in_the_folders_own_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&other)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let dir = tmp.path().join("memory");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(other.join(".git"), dir.join(".git")).unwrap();
+
+        let files = Arc::new(MemoryFiles::open(&dir, offset!(-7)).unwrap());
+        assert!(!files.has_history());
+        let clock = FakeClock::new(datetime!(2026-01-05 19:00 UTC));
+        let write = tools(files).remove(1);
+        run(
+            write.as_ref(),
+            json!({"file": "memory", "content": "kept here"}),
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(commits(&other), 0, "the other repo is untouched");
+        assert!(!other.join(".git/index").exists());
     }
 
     #[test]
