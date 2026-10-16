@@ -123,8 +123,8 @@ impl Policy {
                 Some(rel) => match self
                     .protected_paths
                     .iter()
-                    .chain(self.secret_paths.iter())
-                    .find(|p| rel.starts_with(p) || env_variant(&rel, p))
+                    .find(|p| rel.starts_with(p))
+                    .or_else(|| self.secret_path(&rel))
                 {
                     Some(p) => Decision::deny(format!("{} is protected", p.display())),
                     None => Decision::Allow,
@@ -163,10 +163,12 @@ impl Policy {
         }
     }
 
+    /// Secrets match at any depth, not just at the root: a monorepo keeps
+    /// `services/api/.env` and `packages/web/.npmrc` too.
     fn secret_path<'a>(&'a self, path: &Path) -> Option<&'a PathBuf> {
         self.secret_paths
             .iter()
-            .find(|protected| path.starts_with(protected) || env_variant(path, protected))
+            .find(|secret| contains_path(path, secret) || env_variant(path, secret))
     }
 
     /// Resolves `path` to a path relative to `root`, or `None` if it falls
@@ -195,13 +197,21 @@ impl Policy {
     }
 }
 
+/// True when `needle`'s components appear consecutively anywhere in `path`, so
+/// `.config/gcloud` matches `home/.config/gcloud/credentials.db`.
+fn contains_path(path: &Path, needle: &Path) -> bool {
+    let parts: Vec<_> = path.components().collect();
+    let wanted: Vec<_> = needle.components().collect();
+    !wanted.is_empty() && parts.windows(wanted.len()).any(|w| w == wanted.as_slice())
+}
+
 fn env_variant(path: &Path, protected: &Path) -> bool {
     protected == Path::new(".env")
-        && path
-            .components()
-            .next()
-            .and_then(|part| part.as_os_str().to_str())
-            .is_some_and(|name| name.starts_with(".env."))
+        && path.components().any(|part| {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".env."))
+        })
 }
 
 /// Git accepts long options with `=`, combined short flags, options before
