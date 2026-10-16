@@ -293,14 +293,12 @@ async fn forward(
     (status, response_headers, body).into_response()
 }
 
-/// The upstream URL for a call, or `None` if the path would climb out of the
-/// route's base (`..`, encoded or not) or reach another server.
+/// The upstream URL for a call, or `None` if the path could climb out of the
+/// route's base or reach another server. Model API paths need no escapes, so
+/// any `%` or `\\` is refused: an upstream that decodes `%2e%2e%2f` or
+/// `..\\` before routing can't be led outside the route.
 fn upstream_url(route: &Route, rest: &str, query: Option<&str>) -> Option<reqwest::Url> {
-    let dot_segment = |segment: &str| {
-        let lower = segment.to_ascii_lowercase().replace("%2e", ".");
-        lower == "." || lower == ".."
-    };
-    if rest.split('/').any(dot_segment) {
+    if rest.contains(['%', '\\']) || rest.split('/').any(|s| s == "." || s == "..") {
         return None;
     }
     let base = reqwest::Url::parse(&route.upstream).ok()?;
@@ -406,7 +404,14 @@ mod tests {
                 "{bad}"
             );
         }
-        assert!(upstream_url(&route, "v1/%2e%2E/x", None).is_none());
+        for refused in [
+            "v1/%2e%2E/x",
+            "%2e%2e%2fadmin",
+            "v1/..%5cadmin",
+            "v1\\..\\admin",
+        ] {
+            assert!(upstream_url(&route, refused, None).is_none(), "{refused}");
+        }
     }
 
     #[test]

@@ -57,7 +57,8 @@ impl ReqwestTransport {
     }
 }
 
-/// Whether `url` names this machine: `localhost`, `127.0.0.0/8` or `::1`.
+/// Whether `url` names this machine: `localhost`, `127.0.0.0/8` (also as
+/// an IPv4-mapped IPv6 address) or `::1`.
 #[cfg(feature = "http")]
 pub fn is_loopback(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
@@ -66,7 +67,10 @@ pub fn is_loopback(url: &str) -> bool {
     match url.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        // `::1`, or a 127.x address written as `::ffff:127.0.0.1`.
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
         None => false,
     }
 }
@@ -118,6 +122,7 @@ mod tests {
             "http://LOCALHOST/x",
             "http://127.1.2.3/x",
             "http://[::1]:8787/x",
+            "http://[::ffff:127.0.0.1]:8787/x",
         ] {
             assert!(is_loopback(yes), "{yes}");
         }
@@ -125,6 +130,7 @@ mod tests {
             "https://api.anthropic.com/v1/messages",
             "http://localhost.evil.com/x",
             "http://10.0.0.1/x",
+            "http://[::ffff:10.0.0.1]/x",
             "not a url",
         ] {
             assert!(!is_loopback(no), "{no}");
