@@ -89,6 +89,8 @@ mod tests {
             mentioned: false,
             status: status.into(),
             generation,
+            conversation_name: None,
+            message_excerpt: None,
         }
     }
 

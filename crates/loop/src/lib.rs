@@ -5,6 +5,7 @@
 pub mod charter;
 pub mod context;
 pub mod day;
+pub mod filter;
 pub mod rhythm;
 pub mod wake;
 

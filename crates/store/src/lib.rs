@@ -394,13 +394,29 @@ impl Store {
         .collect()
     }
 
-    /// Model spend for wakes that started at or after `since`.
+    /// Model spend since `since`: wakes that started then or later, and
+    /// helper calls made then or later.
     pub fn spend_since(&self, since: OffsetDateTime) -> Result<f64> {
         Ok(self.conn.query_row(
-            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM wakes WHERE started_at >= ?1",
+            "SELECT (SELECT COALESCE(SUM(cost_usd), 0.0) FROM wakes WHERE started_at >= ?1)
+                  + (SELECT COALESCE(SUM(cost_usd), 0.0) FROM helper_calls WHERE at >= ?1)",
             params![since.unix_timestamp()],
             |row| row.get(0),
         )?)
+    }
+
+    /// Records a model call made outside a wake, such as the wake filter's.
+    pub fn record_helper_call(
+        &self,
+        at: OffsetDateTime,
+        purpose: &str,
+        cost_usd: f64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO helper_calls (at, purpose, cost_usd) VALUES (?1, ?2, ?3)",
+            params![at.unix_timestamp(), purpose, cost_usd],
+        )?;
+        Ok(())
     }
 }
 

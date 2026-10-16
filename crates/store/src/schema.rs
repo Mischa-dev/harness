@@ -53,6 +53,15 @@ const MIGRATIONS: &[&str] = &[
          created_at INTEGER NOT NULL
      );
      CREATE INDEX schedules_due_at ON schedules(due_at);",
+    // 5: model calls outside wakes, such as the wake filter's, so the
+    // day's spend counts them.
+    "CREATE TABLE helper_calls (
+         id INTEGER PRIMARY KEY,
+         at INTEGER NOT NULL,
+         purpose TEXT NOT NULL,
+         cost_usd REAL NOT NULL
+     );
+     CREATE INDEX helper_calls_at ON helper_calls(at);",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {

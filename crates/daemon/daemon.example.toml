@@ -89,3 +89,12 @@ live = ["00000000-0000-0000-0000-000000000002"]
 # the runtime's own files out of them. Leave this table out for no shell.
 [agent.shell]
 bwrap = "/run/current-system/sw/bin/bwrap"
+
+# The wake filter: while the agent sleeps, a cheap helper model looks at news
+# that could wait for its next look and the open optional group replies. It
+# can wake the agent early, drop noise, and pass replies the agent wouldn't
+# add to. Leave this table out and such news always waits for the next look.
+[agent.filter]
+# A profile name from profiles_file, and the proxy route for its provider.
+profile = "helper"
+model_url = "http://127.0.0.1:8787/anthropic"

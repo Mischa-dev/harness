@@ -3,10 +3,12 @@
 //! separate services, so the process running the agent's tools never holds a
 //! provider key. `wakeup` is the signed webhook receiver that wakes it when
 //! Workspace has a reply request waiting, and `polling` looks at the inbox
-//! in case a wakeup was missed.
+//! in case a wakeup was missed. `filter` is the wake filter, which decides
+//! on the helper model whether news can wait for the agent's next look.
 
 pub mod agent;
 pub mod config;
+pub mod filter;
 pub mod polling;
 pub mod proxy;
 pub mod state;
