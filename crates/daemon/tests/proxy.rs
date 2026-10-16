@@ -348,14 +348,28 @@ async fn redirects_go_back_to_the_caller_without_the_key() {
 
 #[tokio::test]
 async fn an_unreachable_provider_is_a_bad_gateway() {
-    let routes = vec![Route::new("dead", "http://127.0.0.1:1", Auth::Bearer, "k").unwrap()];
+    // A route whose name and path hold something that must not leak.
+    let routes = vec![
+        Route::new(
+            "sk-name-secret",
+            "http://127.0.0.1:1/sk-path-secret",
+            Auth::Bearer,
+            "k",
+        )
+        .unwrap(),
+    ];
     let proxy = serve(router(routes, Duration::from_secs(5)).unwrap()).await;
     let response = local_client()
-        .post(format!("http://{proxy}/dead/v1/x"))
+        .post(format!("http://{proxy}/sk-name-secret/v1/x"))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 502);
+    let body = response.text().await.unwrap();
+    assert!(
+        !body.contains("secret") && !body.contains("127.0.0.1"),
+        "{body}"
+    );
 }
 
 #[test]

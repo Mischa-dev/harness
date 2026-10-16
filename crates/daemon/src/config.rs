@@ -14,10 +14,7 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let text = std::fs::read_to_string(path).map_err(ConfigError::Read)?;
         toml::from_str(&text).map_err(|e| ConfigError::Invalid(where_it_fails(&text, &e)))
     }
 }
@@ -62,6 +59,12 @@ mod tests {
             assert!(!err.contains("sk-super"), "{err}");
             assert!(err.contains("line"), "{err}");
         }
+    }
+
+    #[test]
+    fn read_errors_never_echo_the_path() {
+        let err = Config::load(Path::new("sk-super-secret")).unwrap_err();
+        assert!(!err.to_string().contains("sk-super"), "{err}");
     }
 
     #[test]

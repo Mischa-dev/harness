@@ -25,11 +25,10 @@ const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("couldn't read {path}: {source}")]
-    Read {
-        path: String,
-        source: std::io::Error,
-    },
+    /// Without the path, which comes from the command line and could be
+    /// a key passed in the wrong place.
+    #[error("couldn't read the config file: {0}")]
+    Read(std::io::Error),
     #[error("invalid proxy config: {0}")]
     Invalid(String),
     /// Routes are named by position: a name, path or URL from the config
@@ -315,12 +314,16 @@ async fn forward(
     let upstream = match sent {
         Ok(upstream) => upstream,
         Err(err) => {
-            // reqwest's message names the URL, which holds no key.
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("couldn't reach {:?}: {err}\n", route.name),
-            )
-                .into_response();
+            // Only the kind of failure: reqwest's message quotes the URL,
+            // and the caller may pass this text on to the agent.
+            let what = if err.is_timeout() {
+                "the provider took too long"
+            } else if err.is_connect() {
+                "couldn't connect to the provider"
+            } else {
+                "the call to the provider failed"
+            };
+            return (StatusCode::BAD_GATEWAY, format!("{what}\n")).into_response();
         }
     };
     let status = upstream.status();
