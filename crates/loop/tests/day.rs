@@ -456,3 +456,59 @@ async fn the_trip_and_the_pause_are_one_save() {
     };
     assert!(result.content.starts_with("blocked: breaker"));
 }
+
+/// A clock that plays the owner: whenever it's read and the agent is
+/// paused, it lifts the pause through its own handle on the store.
+struct ResumingOwner {
+    clock: FakeClock,
+    store: std::sync::Mutex<Store>,
+    resumed: std::sync::atomic::AtomicBool,
+}
+
+impl Clock for ResumingOwner {
+    fn now(&self) -> time::OffsetDateTime {
+        let store = self.store.lock().unwrap();
+        if store.rhythm_state().unwrap().paused.is_some() {
+            store.set_paused(None).unwrap();
+            self.resumed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.clock.now()
+    }
+}
+
+#[tokio::test]
+async fn an_owner_resume_during_the_wake_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    let mut store = Store::open(&path).unwrap();
+    let owner = Arc::new(ResumingOwner {
+        clock: FakeClock::at_default_start(),
+        store: std::sync::Mutex::new(Store::open(&path).unwrap()),
+        resumed: Default::default(),
+    });
+    let mut policy = Policy::conservative(dir.path());
+    policy.breakers.messages_per_hour = 0;
+    let mut executor = PolicyExecutor::new(policy, owner.clone()).with_tool(Say);
+    let provider = ScriptedProvider::new().then_calls("", vec![("say", json!({}))]);
+    let (profile, assembler) = (profile(), assembler());
+
+    let outcome = Workday {
+        store: &mut store,
+        provider: &provider,
+        executor: &mut executor,
+        assembler: &assembler,
+        profile: &profile,
+        clock: owner.as_ref(),
+        limits: WakeLimits::default(),
+    }
+    .wake(&WakeReason::NextLook, Message::user_text("wake"))
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome.end, WakeEnd::Paused { .. }));
+    assert!(owner.resumed.load(std::sync::atomic::Ordering::SeqCst));
+    // The trip's save paused it, the owner lifted it, and the wake's last
+    // save left that alone.
+    assert_eq!(store.rhythm_state().unwrap().paused, None);
+}

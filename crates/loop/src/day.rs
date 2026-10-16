@@ -9,8 +9,8 @@ use harness_tools::PolicyExecutor;
 
 use crate::context::ContextAssembler;
 use crate::wake::{
-    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeEnd,
-    WakeLimits, WakeOutcome, run_wake_interruptible,
+    Checkpoint, CheckpointError, Interrupts, LoopError, NoInterrupts, Progress, WakeLimits,
+    WakeOutcome, run_wake_interruptible,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -111,14 +111,9 @@ impl Workday<'_> {
             Err(err) => ("error", *err.progress()),
         };
         saver.record.end = end.into();
-        let paused = match &result {
-            Ok(WakeOutcome {
-                end: WakeEnd::Paused { breaker },
-                ..
-            }) => Some(breaker.as_str()),
-            _ => None,
-        };
-        saver.write(&transcript, None, &progress, paused)?;
+        // A pause was saved with the trip itself. Saving it again here could
+        // undo an owner's resume that landed in between.
+        saver.write(&transcript, None, &progress, None)?;
         Ok(result?)
     }
 }
