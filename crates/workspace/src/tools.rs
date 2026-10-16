@@ -252,15 +252,50 @@ fn failed(err: McpError) -> ToolError {
     ToolError::Failed(err.to_string())
 }
 
-/// The result as JSON, cut to [`MAX_RESULT_CHARS`].
+const SHORTENED: &str =
+    "\n(Long values and lists were shortened to fit; the rest is in Workspace.)";
+
+/// The result as JSON within [`MAX_RESULT_CHARS`]. A long result is shrunk
+/// value by value, so what the model sees is always whole, valid JSON.
 fn render(value: &Value) -> String {
+    let fits = |text: &String| text.chars().count() <= MAX_RESULT_CHARS;
     let text = serde_json::to_string_pretty(value).unwrap_or_default();
-    match text.char_indices().nth(MAX_RESULT_CHARS) {
-        None => text,
-        Some((cut, _)) => format!(
-            "{}\n[cut at {MAX_RESULT_CHARS} characters; the rest is in Workspace]",
-            &text[..cut]
+    if fits(&text) {
+        return text;
+    }
+    for (chars, items) in [(4000, 200), (1000, 50), (300, 20), (100, 5), (40, 2)] {
+        let text = serde_json::to_string_pretty(&shrink(value, chars, items)).unwrap_or_default();
+        if fits(&text) {
+            return text + SHORTENED;
+        }
+    }
+    "{\"note\": \"The result was too large to show; open it in Workspace.\"}".to_string()
+}
+
+/// `value` with strings cut to `chars` characters and lists to `items`.
+fn shrink(value: &Value, chars: usize, items: usize) -> Value {
+    match value {
+        Value::String(text) if text.chars().count() > chars => {
+            Value::String(text.chars().take(chars).collect::<String>() + "…")
+        }
+        Value::Array(list) => {
+            let mut kept: Vec<Value> = list
+                .iter()
+                .take(items)
+                .map(|v| shrink(v, chars, items))
+                .collect();
+            if list.len() > items {
+                kept.push(Value::String(format!("[{} more]", list.len() - items)));
+            }
+            Value::Array(kept)
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), shrink(v, chars, items)))
+                .collect(),
         ),
+        other => other.clone(),
     }
 }
 
@@ -305,10 +340,33 @@ mod tests {
     }
 
     #[test]
-    fn long_results_are_cut_on_a_character() {
-        let value = json!({"text": "é".repeat(MAX_RESULT_CHARS)});
+    fn long_results_stay_valid_json() {
+        let shown_json = |shown: &str| -> Value {
+            let json = shown.strip_suffix(SHORTENED).unwrap_or(shown);
+            serde_json::from_str(json).expect("still JSON")
+        };
+        // One long value.
+        let value = json!({"text": format!("\"}}{}", "é\\\n".repeat(MAX_RESULT_CHARS))});
         let shown = render(&value);
-        assert!(shown.ends_with("the rest is in Workspace]"));
-        assert!(shown.chars().count() < MAX_RESULT_CHARS + 100);
+        assert!(shown.ends_with(SHORTENED));
+        assert!(shown.chars().count() <= MAX_RESULT_CHARS + SHORTENED.len());
+        assert!(shown_json(&shown)["text"].as_str().unwrap().ends_with('…'));
+        // Many short values.
+        let many: Vec<Value> = (0..5000)
+            .map(|i| json!({"author": "Mischa", "text": format!("message {i}")}))
+            .collect();
+        let shown = render(&json!({"recentMessages": many}));
+        assert!(
+            shown_json(&shown)["recentMessages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .ends_with("more]")
+        );
+        // Small results are shown whole.
+        assert_eq!(render(&json!({"a": 1})), "{\n  \"a\": 1\n}");
     }
 }
