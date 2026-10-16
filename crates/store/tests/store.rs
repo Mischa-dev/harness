@@ -129,6 +129,17 @@ fn wakes_record_usage_cost_and_the_days_context_size() {
         .unwrap();
     assert!((store.spend_since(start).unwrap() - 0.122).abs() < 1e-9);
     assert!((store.spend_since(start + Duration::hours(3)).unwrap() - 0.07).abs() < 1e-9);
+    let roles = store.spend_by_role(start).unwrap();
+    assert_eq!(roles.len(), 2);
+    assert_eq!((roles[0].role.as_str(), roles[0].calls), ("main", 2));
+    assert!((roles[0].cost_usd - 0.12).abs() < 1e-9);
+    assert_eq!((roles[1].role.as_str(), roles[1].calls), ("wake_filter", 1));
+    assert!(
+        store
+            .spend_by_role(start + Duration::days(1))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

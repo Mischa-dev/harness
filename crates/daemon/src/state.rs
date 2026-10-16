@@ -5,6 +5,7 @@
 //! Every line is built from counts and the runtime's own records, never from
 //! what teammates wrote, so nothing in it can pose as an instruction.
 
+use harness_store::RoleSpend;
 use harness_workspace::BriefingCounts;
 use time::format_description::FormatItem;
 use time::macros::format_description;
@@ -23,12 +24,78 @@ pub struct StateFacts {
     /// `None` without a Workspace connection; an error says why the
     /// briefing couldn't be read.
     pub workspace: Option<Result<BriefingCounts, String>>,
-    /// Earlier wakes today, and what they cost.
+    /// Earlier wakes in today's workday.
     pub wakes_today: usize,
-    pub spend_today: f64,
+    pub budget: Budget,
     /// Its follow-ups and routines, soonest first, one line each.
     pub schedule: Vec<String>,
     pub shadow: bool,
+}
+
+/// Model spend in the owner's day, against the spend breaker's limit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Budget {
+    pub limit_usd: f64,
+    pub roles: Vec<RoleSpend>,
+}
+
+impl Budget {
+    fn line(&self) -> String {
+        let spent = self.roles.iter().fold(0.0, |sum, r| sum + r.cost_usd);
+        let mut line = format!(
+            "- Budget: ${spent:.2} of today's ${:.2} model spend",
+            self.limit_usd
+        );
+        if self.roles.len() > 1 {
+            let parts: Vec<String> = self
+                .roles
+                .iter()
+                .map(|r| format!("{} ${:.2}", role_name(&r.role), r.cost_usd))
+                .collect();
+            line.push_str(&format!(" ({})", parts.join(" · ")));
+        }
+        line
+    }
+}
+
+/// The owner's spend report, for `harness-daemon spend`: today, in their
+/// day, and the last seven days, each by role.
+pub fn spend_report(
+    store: &harness_store::Store,
+    now: OffsetDateTime,
+    offset: UtcOffset,
+    limit_usd: f64,
+) -> Result<String, harness_store::StoreError> {
+    let midnight = now.to_offset(offset).replace_time(time::Time::MIDNIGHT);
+    let mut lines = vec![];
+    for (heading, since) in [
+        (format!("Today, of your ${limit_usd:.2} limit"), midnight),
+        ("The last 7 days".to_string(), now - time::Duration::days(7)),
+    ] {
+        let roles = store.spend_by_role(since)?;
+        let total = roles.iter().fold(0.0, |sum, r| sum + r.cost_usd);
+        lines.push(format!("{heading}: ${total:.2}"));
+        for role in &roles {
+            let calls = if role.role == "main" {
+                plural(role.calls, "wake", "wakes")
+            } else {
+                plural(role.calls, "call", "calls")
+            };
+            lines.push(format!(
+                "  {}: ${:.2} over {calls}",
+                role_name(&role.role),
+                role.cost_usd
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn role_name(role: &str) -> String {
+    match role {
+        "main" => "main thread".into(),
+        other => other.replace('_', " "),
+    }
 }
 
 /// How much of the schedule the view lists.
@@ -53,10 +120,8 @@ impl StateFacts {
             Some(Ok(counts)) => lines.push(format!("- Workspace: {}", workspace_line(counts))),
         }
         let wakes = plural(self.wakes_today, "earlier wake", "earlier wakes");
-        lines.push(format!(
-            "- Today so far: {wakes} · ${:.2} of model spend",
-            self.spend_today
-        ));
+        lines.push(format!("- Today so far: {wakes}"));
+        lines.push(self.budget.line());
         match self.schedule.len() {
             0 => lines.push("- Your schedule: nothing set".into()),
             n => {
@@ -139,7 +204,14 @@ mod tests {
                 thread_updates: 1,
             })),
             wakes_today: 4,
-            spend_today: 0.4234,
+            budget: Budget {
+                limit_usd: 15.0,
+                roles: vec![RoleSpend {
+                    role: "main".into(),
+                    calls: 4,
+                    cost_usd: 0.4234,
+                }],
+            },
             schedule: vec![],
             shadow: false,
         }
@@ -152,8 +224,46 @@ mod tests {
             "State, Sat 2026-10-17 00:24 (Mischa's time)\n\
              - Workspace: 2 reply requests (1 needing an answer) · 1 @mention · 3 tasks · \
              1 thread that changed lately\n\
-             - Today so far: 4 earlier wakes · $0.42 of model spend\n\
+             - Today so far: 4 earlier wakes\n\
+             - Budget: $0.42 of today's $15.00 model spend\n\
              - Your schedule: nothing set"
+        );
+    }
+
+    #[test]
+    fn the_budget_shows_each_role_once_there_are_several() {
+        let role = |role: &str, cost_usd| RoleSpend {
+            role: role.into(),
+            calls: 1,
+            cost_usd,
+        };
+        let budget = Budget {
+            limit_usd: 15.0,
+            roles: vec![role("main", 3.05), role("wake_filter", 0.051)],
+        };
+        assert_eq!(
+            budget.line(),
+            "- Budget: $3.10 of today's $15.00 model spend (main thread $3.05 · wake filter $0.05)"
+        );
+    }
+
+    #[test]
+    fn the_spend_report_counts_the_owners_day_and_the_week() {
+        let store = harness_store::Store::open_in_memory().unwrap();
+        let now = datetime!(2026-10-16 22:24 UTC);
+        // 23:00 the day before at +2, so yesterday for the owner.
+        store
+            .record_helper_call(datetime!(2026-10-16 21:00 UTC), "wake_filter", 1.0)
+            .unwrap();
+        store
+            .record_helper_call(datetime!(2026-10-16 22:10 UTC), "wake_filter", 0.25)
+            .unwrap();
+        assert_eq!(
+            spend_report(&store, now, offset!(+2), 15.0).unwrap(),
+            "Today, of your $15.00 limit: $0.25\n\
+             \x20 wake filter: $0.25 over 1 call\n\
+             The last 7 days: $1.25\n\
+             \x20 wake filter: $1.25 over 2 calls"
         );
     }
 
@@ -176,11 +286,19 @@ mod tests {
         let quiet = StateFacts {
             workspace: Some(Ok(BriefingCounts::default())),
             wakes_today: 1,
-            spend_today: 0.0,
+            budget: Budget {
+                limit_usd: 15.0,
+                roles: vec![],
+            },
             ..facts()
         };
         assert!(quiet.render().contains("- Workspace: nothing waiting\n"));
-        assert!(quiet.render().contains("1 earlier wake ·"));
+        assert!(quiet.render().contains("- Today so far: 1 earlier wake\n"));
+        assert!(
+            quiet
+                .render()
+                .contains("- Budget: $0.00 of today's $15.00 model spend\n")
+        );
 
         let broken = StateFacts {
             workspace: Some(Err("timed out".into())),

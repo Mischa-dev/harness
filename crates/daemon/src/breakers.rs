@@ -131,7 +131,7 @@ impl Agent {
         }
     }
 
-    fn local_midnight(&self, now: OffsetDateTime) -> OffsetDateTime {
+    pub(crate) fn local_midnight(&self, now: OffsetDateTime) -> OffsetDateTime {
         now.to_offset(self.offset).replace_time(Time::MIDNIGHT)
     }
 }

@@ -14,7 +14,8 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(600);
 
 const USAGE: &str = "usage: harness-daemon proxy --config <path>
        harness-daemon run --config <path>
-       harness-daemon resume --config <path>";
+       harness-daemon resume --config <path>
+       harness-daemon spend --config <path>";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -27,6 +28,7 @@ async fn main() -> ExitCode {
         "proxy" => run_proxy(&config).await,
         "run" => run_agent(&config).await,
         "resume" => resume_agent(&config),
+        "spend" => spend_report(&config),
         _ => return usage(),
     };
     match result {
@@ -118,6 +120,16 @@ fn resume_agent(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
         None => eprintln!("the agent wasn't paused"),
     }
+    Ok(())
+}
+
+/// What the agent's model calls have cost, by role.
+fn spend_report(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::load(path)?
+        .agent
+        .ok_or("the config has no [agent] section")?;
+    let now = harness_core::Clock::now(&SystemClock);
+    println!("{}", harness_daemon::agent::spend(&config, now)?);
     Ok(())
 }
 
