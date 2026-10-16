@@ -53,10 +53,22 @@ const SNIFF_BYTES: usize = 8192;
 const MATCH_CHARS: usize = 300;
 
 /// The work-area tools, judged by `policy`, which should be the executor's.
+/// The root's real path is found on first use; prefer [`tools_at`] when it
+/// is already known.
 pub fn tools(policy: Policy) -> Vec<Box<dyn Tool>> {
+    make(policy, OnceLock::new())
+}
+
+/// The work-area tools with the root's real path fixed to `real_root`, as
+/// checked at startup, so nothing that changes after can move it.
+pub fn tools_at(policy: Policy, real_root: PathBuf) -> Vec<Box<dyn Tool>> {
+    make(policy, OnceLock::from(real_root))
+}
+
+fn make(policy: Policy, real_root: OnceLock<PathBuf>) -> Vec<Box<dyn Tool>> {
     let area = Arc::new(Area {
         named: policy,
-        real_root: OnceLock::new(),
+        real_root,
     });
     vec![
         Box::new(ReadFile(area.clone())),
@@ -548,6 +560,8 @@ struct Search {
     large: usize,
     /// Folder entries met so far, files or not.
     entries: usize,
+    /// Files and folders that couldn't be opened or read through.
+    unreadable: usize,
     stopped: Option<&'static str>,
 }
 
@@ -566,6 +580,13 @@ fn search(
     let mut found = Search::default();
     let meta = std::fs::symlink_metadata(&real)
         .map_err(|e| ToolError::Failed(format!("couldn't open it: {}", e.kind())))?;
+    // What was asked for by name has to open, or there's no answer to give.
+    let opened = if meta.is_dir() {
+        open_dir(&real).map(drop)
+    } else {
+        open_regular(&real).map(drop)
+    };
+    opened.map_err(|e| ToolError::Failed(format!("couldn't open it: {e}")))?;
     if meta.is_dir() {
         walk(policy, real, &wanted, case_sensitive, &mut found);
     } else {
@@ -579,6 +600,17 @@ fn search(
     if let Some(why) = found.stopped {
         out.push_str(&format!(
             "(Stopped early: {why}. Search a smaller folder to see more.)\n"
+        ));
+    }
+    if found.unreadable > 0 {
+        out.push_str(&format!(
+            "({} {} couldn't be read, so this may be missing matches.)\n",
+            found.unreadable,
+            if found.unreadable == 1 {
+                "file or folder"
+            } else {
+                "files or folders"
+            }
         ));
     }
     if found.large > 0 {
@@ -605,9 +637,11 @@ fn walk(policy: &Policy, start: PathBuf, wanted: &str, case_sensitive: bool, fou
     let mut folders = vec![start];
     while let Some(dir) = folders.pop() {
         let Ok((_open, listing)) = open_dir(&dir) else {
+            found.unreadable += 1;
             continue;
         };
         let Ok(entries) = std::fs::read_dir(listing) else {
+            found.unreadable += 1;
             continue;
         };
         // No more than the walk has left, so one enormous folder
@@ -667,9 +701,11 @@ fn search_file(
     }
     found.files += 1;
     let Ok(file) = open_regular(path) else {
+        found.unreadable += 1;
         return;
     };
     let Ok(size) = file.metadata().map(|m| m.len()) else {
+        found.unreadable += 1;
         return;
     };
     if size > MAX_SEARCH_FILE_BYTES {
@@ -681,15 +717,29 @@ fn search_file(
         return;
     }
     found.bytes += size;
-    let Ok(Some(reader)) = text_reader(file) else {
-        return;
+    let reader = match text_reader(file) {
+        Ok(Some(reader)) => reader,
+        // Binary, so not searched, by design.
+        Ok(None) => return,
+        Err(_) => {
+            found.unreadable += 1;
+            return;
+        }
     };
     let name = shown(policy, path);
     // Whole lines are read (the file is small), so a match late in a long
     // line is still found.
     let mut reader = reader.take(MAX_SEARCH_FILE_BYTES);
     let mut number = 0;
-    while let Ok(Some((line, _))) = next_line(&mut reader, MAX_SEARCH_FILE_BYTES as usize) {
+    loop {
+        let line = match next_line(&mut reader, MAX_SEARCH_FILE_BYTES as usize) {
+            Ok(Some((line, _))) => line,
+            Ok(None) => break,
+            Err(_) => {
+                found.unreadable += 1;
+                break;
+            }
+        };
         number += 1;
         let hit = if case_sensitive {
             line.contains(wanted)
@@ -1013,8 +1063,21 @@ mod tests {
             matches!(&outcome, ExecOutcome::Failed(why) if why.contains("regular file")),
             "{outcome:?}"
         );
+        // A search says what it couldn't read (the linked file; the pipe
+        // isn't a file to search) rather than passing it over.
         let found = f.text("search_files", json!({"text": "token"})).await;
-        assert_eq!(found, "No lines contain \"token\".\n");
+        assert_eq!(
+            found,
+            "No lines contain \"token\".\n\
+             (1 file or folder couldn't be read, so this may be missing matches.)\n"
+        );
+        let outcome = f
+            .call("search_files", json!({"text": "token", "path": "pipe"}))
+            .await;
+        assert!(
+            matches!(&outcome, ExecOutcome::Failed(why) if why.contains("couldn't open it")),
+            "{outcome:?}"
+        );
     }
 
     #[tokio::test]

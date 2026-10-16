@@ -721,6 +721,48 @@ fn the_state_folder_stays_out_of_the_agents_reach() {
     assert!(err.to_string().contains("outside workdir"), "{err}");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn the_file_tools_stay_where_workdir_was_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("notes.txt"), "not yours\n").unwrap();
+    let work = dir.path().join("work");
+    std::os::unix::fs::symlink(&first, &work).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: work.clone(),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: None,
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut agent = Agent::from_config(&config, clock).unwrap();
+    // Before the agent's first read, the link is pointed elsewhere.
+    std::fs::remove_file(&work).unwrap();
+    std::os::unix::fs::symlink(&second, &work).unwrap();
+    let call = harness_providers::ToolCall {
+        id: "1".into(),
+        name: "read_file".into(),
+        arguments: json!({"path": "notes.txt"}),
+    };
+    let outcome = agent.executor.execute(&call).await;
+    assert!(
+        matches!(&outcome, harness_tools::ExecOutcome::Failed(why) if why.contains("outside")),
+        "{outcome:?}"
+    );
+}
+
 #[test]
 fn credentials_stay_out_of_the_work_area() {
     let dir = tempfile::tempdir().unwrap();

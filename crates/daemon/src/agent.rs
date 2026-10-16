@@ -172,9 +172,6 @@ impl Agent {
         })?;
         let mut executor =
             PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
-        for tool in harness_tools::files::tools(Policy::conservative(&workdir)) {
-            executor.register(tool);
-        }
         let memory_dir = config
             .memory_dir
             .clone()
@@ -205,6 +202,13 @@ impl Agent {
             })?;
         if !inside(&workdir, &memory_dir) {
             return Err(outside());
+        }
+        // Fixed to where workdir was found now, so a link retargeted later
+        // can't move the file tools elsewhere.
+        for tool in
+            harness_tools::files::tools_at(Policy::conservative(&workdir), real_workdir.clone())
+        {
+            executor.register(tool);
         }
         // The file tools read anything in the work area the walls don't
         // name, so no credential the runtime is given may live there.
