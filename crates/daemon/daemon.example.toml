@@ -33,6 +33,9 @@ profile = "main"
 # The proxy route for that profile's provider. Must be on loopback.
 model_url = "http://127.0.0.1:8787/anthropic"
 caller_token_file = "/run/credentials/harness-agent.service/caller-token"
+# prompts/teammate-charter.md, followed by the agent's SOUL. Its
+# {{agent_name}}, {{owner_name}} and {{responsibilities}} come from
+# [agent.identity] below.
 charter_file = "/etc/harness/charter.md"
 # The owner's local hour when the day ends, and their offset from UTC.
 quiet_hour = 2
@@ -41,6 +44,16 @@ utc_offset_hours = 0
 # with its history in git under state_dir. Leave it out for `memory` inside
 # workdir; it must be a real folder, not a symlink.
 memory_dir = "/home/agent/memory"
+
+# Who the agent is, for the charter. Responsibilities say what it owns, not
+# what to do; give it two to five.
+[agent.identity]
+name = "Mara"
+owner = "Mischa"
+responsibilities = [
+  "Keep the harness repo healthy: CI green, dependencies current, advisories handled",
+  "Make the docs match the code",
+]
 
 # Workspace's signed wakeups (inbox.available). Set the webhook URL on the
 # agent's Workspace connection to http://<listen>/wake; Workspace shows the
