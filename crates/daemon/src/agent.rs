@@ -672,12 +672,13 @@ impl Agent {
                 },
             ),
         };
-        let (wakes_today, spend_today) = match self.store.current_day()? {
-            Some(day) => (
-                self.store.wakes_since(day.started_at)?.len(),
-                self.store.spend_since(day.started_at)?,
-            ),
-            None => (0, 0.0),
+        let wakes_today = match self.store.current_day()? {
+            Some(day) => self.store.wakes_since(day.started_at)?.len(),
+            None => 0,
+        };
+        let budget = crate::state::Budget {
+            limit_usd: self.breakers.spend_per_day_usd,
+            roles: self.store.spend_by_role(self.local_midnight(at))?,
         };
         Ok(StateFacts {
             at,
@@ -685,7 +686,7 @@ impl Agent {
             owner: self.owner.clone(),
             workspace,
             wakes_today,
-            spend_today,
+            budget,
             schedule: self
                 .schedule
                 .book
@@ -708,6 +709,19 @@ pub fn restore_rhythm(
     let saved = store.rhythm_state()?;
     let first_look = saved.next_look.map_or(now + MIN_SLEEP, |at| at.max(now));
     Ok(Rhythm::new(policy, first_look).with_pause(saved.paused))
+}
+
+/// What the agent's model calls have cost, for `harness-daemon spend`.
+pub fn spend(config: &AgentConfig, now: OffsetDateTime) -> Result<String, AgentError> {
+    let offset = UtcOffset::from_hms(config.utc_offset_hours, 0, 0)
+        .map_err(|_| AgentError::Invalid("utc_offset_hours is out of range".into()))?;
+    let store = Store::open(&config.state_dir.join(STORE_FILE))?;
+    Ok(crate::state::spend_report(
+        &store,
+        now,
+        offset,
+        config.breakers.spend_per_day_usd,
+    )?)
 }
 
 /// Lifts a breaker's pause: the owner's call, made with

@@ -405,6 +405,42 @@ impl Store {
         )?)
     }
 
+    /// Model spend since `since` by role: the main thread's wakes as
+    /// `main`, then each kind of helper call by its purpose. Each comes with
+    /// how many calls (or wakes) it was, and roles with no calls are left
+    /// out.
+    pub fn spend_by_role(&self, since: OffsetDateTime) -> Result<Vec<RoleSpend>> {
+        let at = since.unix_timestamp();
+        let mut roles = vec![];
+        let (calls, cost): (i64, f64) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0.0) FROM wakes WHERE started_at >= ?1",
+            params![at],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if calls > 0 {
+            roles.push(RoleSpend {
+                role: "main".into(),
+                calls: calls as usize,
+                cost_usd: cost,
+            });
+        }
+        let mut select = self.conn.prepare(
+            "SELECT purpose, COUNT(*), SUM(cost_usd) FROM helper_calls WHERE at >= ?1
+             GROUP BY purpose ORDER BY purpose",
+        )?;
+        let helpers = select.query_map(params![at], |row| {
+            Ok(RoleSpend {
+                role: row.get(0)?,
+                calls: row.get::<_, i64>(1)? as usize,
+                cost_usd: row.get(2)?,
+            })
+        })?;
+        for helper in helpers {
+            roles.push(helper?);
+        }
+        Ok(roles)
+    }
+
     /// Records a model call made outside a wake, such as the wake filter's.
     pub fn record_helper_call(
         &self,
@@ -418,6 +454,15 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// What one role's model calls cost over a period.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleSpend {
+    /// `main` for the main thread; a helper call's purpose otherwise.
+    pub role: String,
+    pub calls: usize,
+    pub cost_usd: f64,
 }
 
 /// The wake loop's state between wakes, as last saved.
