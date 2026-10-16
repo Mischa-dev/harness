@@ -239,17 +239,24 @@ impl McpClient {
         {
             return Err(McpError::Protocol("the answer was too big"));
         }
+        let event_stream = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| McpError::Unreachable)? {
             if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
                 return Err(McpError::Protocol("the answer was too big"));
             }
             bytes.extend_from_slice(&chunk);
+            // A stream may stay open after the answer; stop at the answer.
+            if event_stream
+                && let Some(reply) =
+                    complete_events(&bytes).and_then(|events| from_event_stream(events, id).ok())
+            {
+                return Ok((Some(rpc_result(reply, id)?), session));
+            }
         }
-        let event_stream = headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("text/event-stream"));
         let reply = if event_stream {
             from_event_stream(&bytes, id)?
         } else {
@@ -287,6 +294,21 @@ fn retry_after(headers: &HeaderMap) -> u64 {
         .and_then(|v| v.to_str().ok()?.trim().parse::<u64>().ok())
         .unwrap_or(60)
         .clamp(1, 3600)
+}
+
+/// The events in `bytes` that have ended (with a blank line), if any.
+fn complete_events(bytes: &[u8]) -> Option<&[u8]> {
+    let end = bytes
+        .windows(2)
+        .rposition(|pair| pair == b"\n\n")
+        .map(|at| at + 2)
+        .or_else(|| {
+            bytes
+                .windows(4)
+                .rposition(|w| w == b"\r\n\r\n")
+                .map(|at| at + 4)
+        })?;
+    Some(&bytes[..end])
 }
 
 /// The JSON-RPC response with `id` from an event stream's `data:` lines.

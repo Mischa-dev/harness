@@ -12,6 +12,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use futures_util::StreamExt;
 use harness_core::FakeClock;
 use harness_providers::ToolCall;
 use harness_tools::{BreakerLimits, Decision, ExecOutcome, Policy, PolicyExecutor};
@@ -34,6 +35,8 @@ struct Fake {
     stateless: AtomicBool,
     /// Answer initialize with another protocol version.
     other_version: AtomicBool,
+    /// Keep event streams open after the answer.
+    hold_open: AtomicBool,
     /// Where to redirect tool calls, if anywhere.
     redirect_to: Mutex<Option<String>>,
 }
@@ -129,6 +132,17 @@ async fn mcp(State(fake): State<Arc<Fake>>, headers: HeaderMap, body: String) ->
                     "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{}}}}\n\n\
                      event: message\ndata: {reply}\n\n"
                 );
+                if fake.hold_open.load(Ordering::SeqCst) {
+                    let stream = futures_util::stream::once(async move {
+                        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(body))
+                    })
+                    .chain(futures_util::stream::pending());
+                    return (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(stream),
+                    )
+                        .into_response();
+                }
                 ([("content-type", "text/event-stream")], body).into_response()
             } else {
                 axum::Json(reply).into_response()
@@ -455,4 +469,16 @@ async fn another_protocol_version_is_refused() {
         McpError::Protocol(_)
     ));
     assert!(fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn an_open_event_stream_is_read_up_to_the_answer() {
+    let (fake, workspace) = workspace_with(TOKEN).await;
+    fake.stream.store(true, Ordering::SeqCst);
+    fake.hold_open.store(true, Ordering::SeqCst);
+    let entries = tokio::time::timeout(Duration::from_secs(2), workspace.inbox(50))
+        .await
+        .expect("answered without waiting for the stream to close")
+        .unwrap();
+    assert_eq!(entries.len(), 3);
 }
