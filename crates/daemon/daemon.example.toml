@@ -4,6 +4,9 @@
 [proxy]
 # Loopback only: the proxy adds a key to anything it is sent.
 listen = "127.0.0.1:8787"
+# Callers send this file's contents in x-harness-proxy-token. Give it to the
+# runtime only, never to workers. Make one with `openssl rand -hex 32`.
+caller_token_file = "/run/credentials/harness-daemon.service/caller-token"
 
 # Adapters call http://127.0.0.1:8787/anthropic/v1/messages and so on.
 [[proxy.route]]

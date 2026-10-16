@@ -10,7 +10,7 @@ use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::any;
-use harness_daemon::proxy::{Auth, Route, router};
+use harness_daemon::proxy::{Auth, CALLER_TOKEN_HEADER, CallerToken, Route, router};
 
 #[derive(Debug, Clone, Default)]
 struct Seen {
@@ -79,7 +79,7 @@ async fn setup() -> (SocketAddr, Log) {
         )
         .unwrap(),
     ];
-    let proxy = serve(router(routes, Duration::from_secs(5)).unwrap()).await;
+    let proxy = serve(router(routes, token(), Duration::from_secs(5)).unwrap()).await;
     (proxy, log)
 }
 
@@ -147,8 +147,9 @@ async fn raw_get(proxy: SocketAddr, path: &str) -> String {
 async fn raw_get_as(proxy: SocketAddr, path: &str, host: &str, extra: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
-    let request =
-        format!("GET {path} HTTP/1.1\r\nhost: {host}\r\n{extra}connection: close\r\n\r\n");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nhost: {host}\r\n{CALLER_TOKEN_HEADER}: {TOKEN}\r\n{extra}connection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).await.unwrap();
@@ -180,6 +181,38 @@ async fn unknown_routes_and_dot_dot_go_nowhere() {
         );
     }
     assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn callers_without_the_token_cannot_spend_the_key() {
+    let (proxy, log) = setup().await;
+    let bare = reqwest::Client::builder().no_proxy().build().unwrap();
+    for sent in [None, Some("wrong"), Some(&TOKEN[..TOKEN.len() - 1])] {
+        let mut request = bare.post(format!("http://{proxy}/anthropic/v1/messages"));
+        if let Some(sent) = sent {
+            request = request.header(CALLER_TOKEN_HEADER, sent);
+        }
+        let response = request.body("{}").send().await.unwrap();
+        assert_eq!(response.status(), 401, "{sent:?}");
+    }
+    assert!(log.lock().unwrap().is_empty());
+
+    // With it, the call goes through, and the token stays here.
+    local_client()
+        .post(format!("http://{proxy}/anthropic/v1/messages"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let seen = log.lock().unwrap()[0].clone();
+    assert!(header(&seen, CALLER_TOKEN_HEADER).is_empty());
+}
+
+#[test]
+fn caller_tokens_must_be_long() {
+    assert!(CallerToken::new("short").is_err());
+    assert!(CallerToken::new(&"x".repeat(31)).is_err());
+    assert!(CallerToken::new(TOKEN).is_ok());
 }
 
 #[tokio::test]
@@ -229,7 +262,7 @@ async fn head_only(proxy: SocketAddr, extra: &str, length: usize) -> Option<Stri
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
     let request = format!(
-        "POST /anthropic/v1/messages HTTP/1.1\r\nhost: {proxy}\r\n{extra}content-length: {length}\r\n\r\n"
+        "POST /anthropic/v1/messages HTTP/1.1\r\nhost: {proxy}\r\n{CALLER_TOKEN_HEADER}: {TOKEN}\r\n{extra}content-length: {length}\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut buf = [0u8; 256];
@@ -288,7 +321,7 @@ async fn answers_stream_through_instead_of_being_held() {
     .await;
     let base = format!("http://127.0.0.1:{}", upstream.port());
     let routes = vec![Route::new("slow", &base, Auth::Bearer, "k").unwrap()];
-    let proxy = serve(router(routes, Duration::from_secs(30)).unwrap()).await;
+    let proxy = serve(router(routes, token(), Duration::from_secs(30)).unwrap()).await;
     let mut response = local_client()
         .post(format!("http://{proxy}/slow/v1/chat/completions"))
         .send()
@@ -362,6 +395,7 @@ async fn local_upstreams_skip_the_system_proxy_inner() {
         .build()
         .unwrap()
         .post(format!("http://{proxy}/anthropic/v1/messages"))
+        .header(CALLER_TOKEN_HEADER, TOKEN)
         .body("{}")
         .send()
         .await
@@ -380,6 +414,7 @@ async fn redirects_go_back_to_the_caller_without_the_key() {
         .unwrap();
     let response = client
         .post(format!("http://{proxy}/anthropic/redirect"))
+        .header(CALLER_TOKEN_HEADER, TOKEN)
         .send()
         .await
         .unwrap();
@@ -399,7 +434,7 @@ async fn an_unreachable_provider_is_a_bad_gateway() {
         )
         .unwrap(),
     ];
-    let proxy = serve(router(routes, Duration::from_secs(5)).unwrap()).await;
+    let proxy = serve(router(routes, token(), Duration::from_secs(5)).unwrap()).await;
     let response = local_client()
         .post(format!("http://{proxy}/sk-name-secret/v1/x"))
         .send()
@@ -418,6 +453,8 @@ fn config_names_key_files_and_never_holds_keys() {
     let dir = tempfile::tempdir().unwrap();
     let key = dir.path().join("anthropic.key");
     std::fs::write(&key, "sk-ant-from-file\n").unwrap();
+    let caller_token = dir.path().join("caller-token");
+    std::fs::write(&caller_token, format!("{TOKEN}\n")).unwrap();
     let config = dir.path().join("daemon.toml");
     std::fs::write(
         &config,
@@ -425,6 +462,7 @@ fn config_names_key_files_and_never_holds_keys() {
             r#"
             [proxy]
             listen = "127.0.0.1:8787"
+            caller_token_file = "{}"
 
             [[proxy.route]]
             name = "anthropic"
@@ -432,6 +470,7 @@ fn config_names_key_files_and_never_holds_keys() {
             auth = "x-api-key"
             key_file = "{}"
             "#,
+            caller_token.display(),
             key.display()
         ),
     )
@@ -441,6 +480,8 @@ fn config_names_key_files_and_never_holds_keys() {
     let routes = config.proxy.load_routes().unwrap();
     assert_eq!(routes[0].name, "anthropic");
     assert!(!format!("{routes:?}").contains("sk-ant-from-file"));
+    let loaded = config.proxy.load_caller_token().unwrap();
+    assert!(!format!("{loaded:?}").contains(TOKEN));
 
     std::fs::remove_file(&key).unwrap();
     assert!(
@@ -449,8 +490,20 @@ fn config_names_key_files_and_never_holds_keys() {
     );
 }
 
-/// A client for calling the proxy under test directly, whatever system proxy
-/// the environment names.
+const TOKEN: &str = "test-caller-token-0123456789abcdef";
+
+fn token() -> CallerToken {
+    CallerToken::new(TOKEN).unwrap()
+}
+
+/// A client for calling the proxy under test as the runtime would: directly,
+/// whatever system proxy the environment names, and with the caller token.
 fn local_client() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(CALLER_TOKEN_HEADER, TOKEN.parse().unwrap());
+    reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(headers)
+        .build()
+        .unwrap()
 }

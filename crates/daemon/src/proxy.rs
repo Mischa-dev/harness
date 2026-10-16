@@ -40,6 +40,8 @@ pub enum ConfigError {
         index: usize,
         source: std::io::Error,
     },
+    #[error("invalid proxy config: couldn't read the caller token file: {0}")]
+    CallerTokenFile(std::io::Error),
 }
 
 /// `[proxy]` in the daemon's config.
@@ -49,6 +51,11 @@ pub struct ProxyConfig {
     /// Must be a loopback address: the proxy adds keys to anything it is
     /// sent, so nothing off the machine may reach it.
     pub listen: SocketAddr,
+    /// A file holding the token callers must send in `x-harness-proxy-token`.
+    /// Loopback alone admits every process on the machine; the token admits
+    /// only those given the file, so workers, which never are, can't spend
+    /// the keys.
+    pub caller_token_file: PathBuf,
     #[serde(rename = "route")]
     pub routes: Vec<RouteConfig>,
 }
@@ -82,6 +89,32 @@ pub struct Secret(String);
 impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret([redacted])")
+    }
+}
+
+/// The header a caller proves itself with.
+pub const CALLER_TOKEN_HEADER: &str = "x-harness-proxy-token";
+
+/// What a caller must send in [`CALLER_TOKEN_HEADER`]. Never printed.
+#[derive(Debug, Clone)]
+pub struct CallerToken(Secret);
+
+impl CallerToken {
+    /// At least 32 characters, e.g. from `openssl rand -hex 32`.
+    pub fn new(token: &str) -> Result<Self, ConfigError> {
+        let token = token.trim();
+        if token.len() < 32 || HeaderValue::from_str(token).is_err() {
+            return Err(ConfigError::Invalid(
+                "the caller token must be at least 32 characters and a valid header value".into(),
+            ));
+        }
+        Ok(Self(Secret(token.into())))
+    }
+
+    /// Compares in time that doesn't depend on where the two differ.
+    fn matches(&self, sent: &[u8]) -> bool {
+        let want = self.0.0.as_bytes();
+        want.len() == sent.len() && want.iter().zip(sent).fold(0, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 }
 
@@ -125,6 +158,13 @@ impl Route {
 }
 
 impl ProxyConfig {
+    /// Reads the token callers must send.
+    pub fn load_caller_token(&self) -> Result<CallerToken, ConfigError> {
+        let token = std::fs::read_to_string(&self.caller_token_file)
+            .map_err(ConfigError::CallerTokenFile)?;
+        CallerToken::new(&token)
+    }
+
     /// Checks the config and reads every key file.
     pub fn load_routes(&self) -> Result<Vec<Route>, ConfigError> {
         if !is_loopback_ip(self.listen.ip()) {
@@ -195,6 +235,7 @@ fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
 
 struct Proxy {
     routes: Vec<Route>,
+    caller_token: CallerToken,
     /// For HTTPS upstreams elsewhere. It may go through the system's proxy,
     /// which sees only an encrypted tunnel.
     remote: reqwest::Client,
@@ -206,7 +247,11 @@ struct Proxy {
 
 /// The proxy's HTTP routes. `timeout` bounds one upstream call, and should
 /// allow for a slow model's whole answer.
-pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::Error> {
+pub fn router(
+    routes: Vec<Route>,
+    caller_token: CallerToken,
+    timeout: Duration,
+) -> Result<Router, reqwest::Error> {
     let builder = || {
         reqwest::Client::builder()
             .timeout(timeout)
@@ -215,6 +260,7 @@ pub fn router(routes: Vec<Route>, timeout: Duration) -> Result<Router, reqwest::
     };
     let proxy = Proxy {
         routes,
+        caller_token,
         remote: builder().build()?,
         local: builder().no_proxy().build()?,
     };
@@ -277,6 +323,10 @@ async fn forward(State(proxy): State<Arc<Proxy>>, request: Request) -> Response 
     let (uri, method, headers) = (parts.uri, parts.method, parts.headers);
     if !from_a_local_program(&headers) {
         return (StatusCode::FORBIDDEN, "only local programs may call\n").into_response();
+    }
+    let sent = headers.get(CALLER_TOKEN_HEADER).map(HeaderValue::as_bytes);
+    if !sent.is_some_and(|sent| proxy.caller_token.matches(sent)) {
+        return (StatusCode::UNAUTHORIZED, "missing or wrong caller token\n").into_response();
     }
     // The raw path, still percent-encoded, so nothing is decoded into a
     // different meaning on the way through.
@@ -382,6 +432,7 @@ fn forwards_request_header(name: &HeaderName) -> bool {
         && name.as_str() != "x-api-key"
         && name.as_str() != "api-key"
         && name.as_str() != "x-goog-api-key"
+        && name.as_str() != CALLER_TOKEN_HEADER
 }
 
 fn forwards_response_header(name: &HeaderName) -> bool {
@@ -512,7 +563,7 @@ mod tests {
     #[test]
     fn the_listen_address_must_be_loopback() {
         let load = |listen: &str| {
-            let text = format!("listen = \"{listen}\"\nroute = []\n");
+            let text = format!("listen = \"{listen}\"\ncaller_token_file = \"t\"\nroute = []\n");
             toml::from_str::<ProxyConfig>(&text).unwrap().load_routes()
         };
         for ok in [
@@ -563,7 +614,7 @@ mod tests {
             valid.replace(r#"name = "ok""#, r#"name = "sk-super-secret""#),
         ] {
             let text = format!(
-                "listen = \"127.0.0.1:8787\"\n[[route]]\n{valid}\n[[route]]\n{bad}\n[[route]]\n{bad}\n"
+                "listen = \"127.0.0.1:8787\"\ncaller_token_file = \"t\"\n[[route]]\n{valid}\n[[route]]\n{bad}\n[[route]]\n{bad}\n"
             );
             let config: ProxyConfig = toml::from_str(&text).unwrap();
             let err = config.load_routes().unwrap_err().to_string();

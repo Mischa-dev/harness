@@ -32,18 +32,40 @@ async fn main() -> ExitCode {
 async fn run_proxy(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(path)?;
     let routes = config.proxy.load_routes()?;
+    let caller_token = config.proxy.load_caller_token()?;
     // A count, not the names: whatever the config holds stays out of logs.
     let count = routes.len();
-    let router = proxy::router(routes, UPSTREAM_TIMEOUT)?;
+    let router = proxy::router(routes, caller_token, UPSTREAM_TIMEOUT)?;
     let listener = tokio::net::TcpListener::bind(config.proxy.listen).await?;
     eprintln!(
         "forwarding proxy on {} with {count} route(s)",
         listener.local_addr()?
     );
     axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM from systemd or Agent OS stopping the service. In-flight
+/// calls finish before the process exits.
+async fn shutdown() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
