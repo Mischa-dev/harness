@@ -462,8 +462,8 @@ impl Store {
             .flatten())
     }
 
-    /// Saves the memory snapshot a new day starts from.
-    pub fn set_memory_snapshot(&self, snapshot: &str) -> Result<()> {
+    /// Saves the memory snapshot a new day starts from, or clears it.
+    pub fn set_memory_snapshot(&self, snapshot: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO rhythm (id, memory_snapshot) VALUES (1, ?1)
              ON CONFLICT(id) DO UPDATE SET memory_snapshot = excluded.memory_snapshot",

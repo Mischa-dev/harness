@@ -125,6 +125,9 @@ pub struct Agent {
     pub workspace: Option<Arc<Workspace>>,
     /// The memory files; the snapshot of them starts each day.
     pub memory: Option<Arc<MemoryFiles>>,
+    /// Whether today's memory snapshot is in the prompt. Until it is, each
+    /// wake tries again.
+    pub memory_settled: bool,
     /// Events not yet in a wake: optional news held for the next look, and
     /// whatever arrived too late to join the last wake.
     pub waiting: Vec<WakeEvent>,
@@ -271,6 +274,7 @@ impl Agent {
             limits: WakeLimits::default(),
             workspace,
             memory: Some(memory),
+            memory_settled: false,
             waiting: Vec::new(),
         })
     }
@@ -357,20 +361,33 @@ impl Agent {
         // A new day starts from what the agent remembers now; the snapshot
         // then stays fixed all day, so the prompt cache keeps hitting. It's
         // saved, so a restart mid-day picks up the same one.
+        // If the files can't be read, the wake goes ahead with a note saying
+        // so, nothing is saved, and the next wake tries again.
         if let Some(memory) = &self.memory {
-            if self.store.current_day()?.is_none() {
-                self.assembler.memory_snapshot = memory.snapshot();
-                self.store
-                    .set_memory_snapshot(&self.assembler.memory_snapshot)?;
-            } else if self.assembler.memory_snapshot.is_empty() {
-                self.assembler.memory_snapshot = match self.store.memory_snapshot()? {
-                    Some(saved) => saved,
-                    None => {
-                        let snapshot = memory.snapshot();
-                        self.store.set_memory_snapshot(&snapshot)?;
-                        snapshot
-                    }
+            let new_day = self.store.current_day()?.is_none();
+            if new_day {
+                self.store.set_memory_snapshot(None)?;
+                self.memory_settled = false;
+            }
+            if !self.memory_settled {
+                let snapshot = match self.store.memory_snapshot()? {
+                    Some(saved) => Ok(saved),
+                    None => memory.snapshot(),
                 };
+                match snapshot {
+                    Ok(snapshot) => {
+                        self.store.set_memory_snapshot(Some(&snapshot))?;
+                        self.assembler.memory_snapshot = snapshot;
+                        self.memory_settled = true;
+                    }
+                    Err(e) => {
+                        eprintln!("harness-daemon: memory snapshot failed: {e}");
+                        self.assembler.memory_snapshot = format!(
+                            "(Your memory files couldn't be read at the start of this wake: {e}. \
+                             They'll be read again next wake.)"
+                        );
+                    }
+                }
             }
         }
         // If the process dies mid-wake, the restart waits this long rather

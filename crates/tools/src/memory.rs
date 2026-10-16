@@ -154,22 +154,24 @@ impl MemoryFiles {
 
     /// `MEMORY.md`, `USER.md` and the handoff note, for the start of a day.
     /// Each is held to its cap, even if it was edited outside the tools.
-    pub fn snapshot(&self) -> String {
-        let root = self.root().ok();
-        FILES
+    /// A missing file shows as empty; one that can't be read is an error,
+    /// so the day doesn't start as if the agent remembered nothing.
+    pub fn snapshot(&self) -> std::io::Result<String> {
+        let root = self.root()?;
+        let parts = FILES
             .iter()
             .map(|(_, name, cap)| {
-                let text = root
-                    .and_then(|root| read_capped(&root.join(name), *cap).ok())
-                    .unwrap_or_default();
+                let text = read_capped(&root.join(name), *cap).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("couldn't read {name}: {}", e.kind()))
+                })?;
                 let text = text.trim();
-                format!(
+                Ok(format!(
                     "## {name}\n{}",
                     if text.is_empty() { "(empty)" } else { text }
-                )
+                ))
             })
-            .collect::<Vec<_>>()
-            .join("\n\n")
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(parts.join("\n\n"))
     }
 
     fn journal_day(&self, at: OffsetDateTime) -> String {
@@ -713,7 +715,7 @@ mod tests {
         .unwrap();
         assert_eq!(by_date.content, today.content);
 
-        let snapshot = files.snapshot();
+        let snapshot = files.snapshot().unwrap();
         assert!(snapshot.contains("## MEMORY.md\n- Mischa likes short PRs."));
         assert!(snapshot.contains("## USER.md\nMischa, UTC-7."));
         assert!(snapshot.contains("## HANDOFF.md\n(empty)"));
@@ -792,7 +794,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(files.snapshot().matches("(empty)").count() == 3);
+        assert!(files.snapshot().unwrap().matches("(empty)").count() == 3);
+
+        // A file that's there but can't be read isn't shown as empty.
+        std::fs::create_dir(files.dir().join("USER.md")).unwrap();
+        assert!(files.snapshot().is_err());
     }
 
     #[cfg(unix)]
@@ -820,7 +826,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(!files.snapshot().contains("outside"));
+        assert!(files.snapshot().is_err());
 
         // A rewrite replaces the link itself, as does a link left where the
         // new text is first written.
@@ -968,7 +974,7 @@ mod tests {
             MemoryFiles::open(&dir, None, offset!(-7), datetime!(2026-01-05 00:00 UTC)).unwrap();
         std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &dir).unwrap();
-        assert!(!files.snapshot().contains("outside"));
+        assert!(files.snapshot().is_err());
         assert!(
             files
                 .save("USER.md", "x", false, "x", datetime!(2026-01-05 19:00 UTC))
@@ -1013,7 +1019,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let snapshot = files.snapshot();
+        let snapshot = files.snapshot().unwrap();
         assert!(snapshot.contains(&full));
         assert!(!snapshot.contains("[cut at"));
     }
@@ -1022,7 +1028,7 @@ mod tests {
     fn the_snapshot_keeps_to_the_caps() {
         let (_tmp, files) = open();
         std::fs::write(files.dir().join("MEMORY.md"), "x".repeat(50_000)).unwrap();
-        let snapshot = files.snapshot();
+        let snapshot = files.snapshot().unwrap();
         assert!(snapshot.contains("[cut at 6000 characters]"));
         assert!(snapshot.chars().count() < 6_200);
     }

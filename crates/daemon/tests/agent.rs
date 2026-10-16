@@ -194,6 +194,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         limits: WakeLimits::default(),
         workspace: None,
         memory: None,
+        memory_settled: false,
         waiting: Vec::new(),
     }
 }
@@ -566,6 +567,58 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         "{}",
         agent.assembler.memory_snapshot
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn memory_that_cant_be_read_is_tried_again_next_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir: dir.path().join("work"),
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(dir.path().join("work/mind")),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
+    agent.provider = Box::new(
+        ScriptedProvider::new()
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))])
+            .then_calls("", vec![("sleep", json!({"minutes": 60}))]),
+    );
+    // Something that exists but can't be read as a file.
+    let memory = dir.path().join("work/mind/MEMORY.md");
+    std::fs::create_dir(&memory).unwrap();
+
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent.assembler.memory_snapshot.contains("couldn't be read"),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
+    assert_eq!(agent.store.memory_snapshot().unwrap(), None);
+
+    std::fs::remove_dir(&memory).unwrap();
+    std::fs::write(&memory, "- Remember me.\n").unwrap();
+    clock.advance(time::Duration::hours(1));
+    agent.wake(Vec::new()).await.unwrap();
+    assert!(
+        agent
+            .assembler
+            .memory_snapshot
+            .contains("## MEMORY.md\n- Remember me."),
+        "{}",
+        agent.assembler.memory_snapshot
+    );
+    assert!(agent.store.memory_snapshot().unwrap().is_some());
 }
 
 #[test]
