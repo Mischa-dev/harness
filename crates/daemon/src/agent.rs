@@ -24,6 +24,8 @@ use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
 use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, SleepTool};
 use harness_workspace::{Shadow, Workspace};
+
+use crate::state::StateFacts;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
@@ -35,6 +37,10 @@ const MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// How often a sleeping loop rereads the clock, so a suspended host or a
 /// clock jump delays a look by at most this much.
 const TICK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The state view waits this long for the briefing, so a slow Workspace
+/// doesn't hold up an urgent wake.
+const BRIEFING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The store's file inside `state_dir`.
 const STORE_FILE: &str = "harness.sqlite3";
@@ -172,6 +178,9 @@ pub struct Agent {
     pub workspace: Option<Arc<Workspace>>,
     /// Shadow mode, shared by the reply tools and the inbox poller.
     pub shadow: Option<Arc<Shadow>>,
+    /// Whose time the state view shows.
+    pub owner: Option<String>,
+    pub offset: UtcOffset,
     /// The memory files; the snapshot of them starts each day.
     pub memory: Option<Arc<MemoryFiles>>,
     /// Whether today's memory snapshot is in the prompt. Until it is, each
@@ -406,6 +415,8 @@ impl Agent {
             limits: WakeLimits::default(),
             workspace,
             shadow,
+            owner: config.identity.owner.clone(),
+            offset,
             memory: Some(memory),
             memory_settled: false,
             waiting: Vec::new(),
@@ -532,7 +543,12 @@ impl Agent {
             .find(|e| e.reason.urgency() == Urgency::Now)
             .or(batch.first())
             .map_or(WakeReason::NextLook, |e| e.reason.clone());
-        let message = Message::user_text(wake_message(at, &reason, &batch));
+        let state = self.state_view(at).await?;
+        let message = Message::user_text(format!(
+            "{}\n\n{}",
+            wake_message(at, &reason, &batch),
+            state.render()
+        ));
         let result = Workday {
             store: &mut self.store,
             provider: self.provider.as_ref(),
@@ -558,6 +574,46 @@ impl Agent {
             ),
         }
         Ok(())
+    }
+}
+
+impl Agent {
+    /// What the state view shows at the start of a wake at `at`.
+    async fn state_view(
+        &self,
+        at: OffsetDateTime,
+    ) -> Result<StateFacts, harness_store::StoreError> {
+        let workspace = match &self.workspace {
+            None => None,
+            Some(workspace) => Some(
+                match tokio::time::timeout(
+                    BRIEFING_TIMEOUT,
+                    workspace.briefing_counts(self.shadow.as_deref()),
+                )
+                .await
+                {
+                    Ok(Ok(counts)) => Ok(counts),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("it took too long".into()),
+                },
+            ),
+        };
+        let (wakes_today, spend_today) = match self.store.current_day()? {
+            Some(day) => (
+                self.store.wakes_since(day.started_at)?.len(),
+                self.store.spend_since(day.started_at)?,
+            ),
+            None => (0, 0.0),
+        };
+        Ok(StateFacts {
+            at,
+            offset: self.offset,
+            owner: self.owner.clone(),
+            workspace,
+            wakes_today,
+            spend_today,
+            shadow: self.shadow.is_some(),
+        })
     }
 }
 

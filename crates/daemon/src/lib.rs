@@ -9,4 +9,5 @@ pub mod agent;
 pub mod config;
 pub mod polling;
 pub mod proxy;
+pub mod state;
 pub mod wakeup;

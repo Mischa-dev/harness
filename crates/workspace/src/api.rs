@@ -33,6 +33,42 @@ pub struct InboxEntry {
     pub generation: i32,
 }
 
+/// How much the briefing lists, for the state view. Counts only: what the
+/// items say, the agent reads through its tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BriefingCounts {
+    pub reply_requests: usize,
+    /// Of those, the ones that need an answer rather than allow a pass.
+    pub required: usize,
+    pub mentions: usize,
+    /// Conversations with unread messages.
+    pub unread: usize,
+    pub tasks: usize,
+    pub claims: usize,
+    /// Threads whose status or outcome changed lately.
+    pub thread_updates: usize,
+}
+
+impl BriefingCounts {
+    /// Counts the lists in a briefing's value. A missing list counts as
+    /// empty, as Workspace leaves some out when there's nothing in them.
+    pub fn from_briefing(value: &Value) -> Self {
+        let list = |key: &str| value[key].as_array().map_or(&[][..], Vec::as_slice);
+        Self {
+            reply_requests: list("replyRequests").len(),
+            required: list("replyRequests")
+                .iter()
+                .filter(|r| r["required"].as_bool() != Some(false))
+                .count(),
+            mentions: list("mentions").len(),
+            unread: list("unread").len(),
+            tasks: list("tasks").len(),
+            claims: list("claims").len(),
+            thread_updates: list("threadUpdates").len(),
+        }
+    }
+}
+
 /// The agent's side of Workspace.
 pub struct Workspace {
     client: McpClient,
@@ -47,6 +83,23 @@ impl Workspace {
     /// tasks and settled threads.
     pub async fn briefing(&self) -> Result<Outcome, McpError> {
         self.call("briefing", json!({})).await
+    }
+
+    /// The briefing's counts, without requests already answered in the
+    /// shadow channel.
+    pub async fn briefing_counts(
+        &self,
+        shadow: Option<&crate::shadow::Shadow>,
+    ) -> Result<BriefingCounts, McpError> {
+        match self.briefing().await? {
+            Outcome::Ok(mut value) => {
+                if let Some(shadow) = shadow {
+                    shadow.hide_answered(&mut value);
+                }
+                Ok(BriefingCounts::from_briefing(&value))
+            }
+            Outcome::Declined { .. } => Err(McpError::Protocol("Workspace declined the briefing")),
+        }
     }
 
     /// Open reply requests, required first.
@@ -169,5 +222,34 @@ mod tests {
         ));
         assert!(outcome(&mut json!({"value": {}})).is_err());
         assert!(outcome(&mut json!({"outcome": "ok"})).is_err());
+    }
+
+    #[test]
+    fn briefings_are_counted() {
+        let briefing = json!({
+            "you": {"name": "Mara"},
+            "replyRequests": [{"required": true}, {"required": false}, {}],
+            "mentions": [{}],
+            "unread": [{}, {}],
+            "tasks": [{}, {}, {}],
+            "threadUpdates": [],
+            "nextSteps": "…"
+        });
+        assert_eq!(
+            BriefingCounts::from_briefing(&briefing),
+            BriefingCounts {
+                reply_requests: 3,
+                required: 2,
+                mentions: 1,
+                unread: 2,
+                tasks: 3,
+                claims: 0,
+                thread_updates: 0
+            }
+        );
+        assert_eq!(
+            BriefingCounts::from_briefing(&json!({})),
+            BriefingCounts::default()
+        );
     }
 }

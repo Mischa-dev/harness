@@ -198,6 +198,8 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         limits: WakeLimits::default(),
         workspace: None,
         shadow: None,
+        owner: None,
+        offset: time::UtcOffset::UTC,
         memory: None,
         memory_settled: false,
         waiting: Vec::new(),
