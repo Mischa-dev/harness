@@ -127,7 +127,7 @@ impl Route {
 impl ProxyConfig {
     /// Checks the config and reads every key file.
     pub fn load_routes(&self) -> Result<Vec<Route>, ConfigError> {
-        if !self.listen.ip().is_loopback() {
+        if !is_loopback_ip(self.listen.ip()) {
             return Err(ConfigError::Invalid(format!(
                 "listen {} is not a loopback address",
                 self.listen
@@ -232,11 +232,19 @@ fn is_loopback(url: &reqwest::Url) -> bool {
             .strip_suffix('.')
             .unwrap_or(domain)
             .eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
+        Some(url::Host::Ipv4(ip)) => is_loopback_ip(ip.into()),
+        Some(url::Host::Ipv6(ip)) => is_loopback_ip(ip.into()),
         None => false,
+    }
+}
+
+/// 127.0.0.0/8, `::1`, or a 127.x address written as `::ffff:127.0.0.1`.
+fn is_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
     }
 }
 
@@ -503,15 +511,22 @@ mod tests {
 
     #[test]
     fn the_listen_address_must_be_loopback() {
-        let config: ProxyConfig = toml::from_str(
-            r#"
-            listen = "0.0.0.0:8787"
-            route = []
-            "#,
-        )
-        .unwrap();
-        let err = config.load_routes().unwrap_err();
-        assert!(err.to_string().contains("not a loopback address"));
+        let load = |listen: &str| {
+            let text = format!("listen = \"{listen}\"\nroute = []\n");
+            toml::from_str::<ProxyConfig>(&text).unwrap().load_routes()
+        };
+        for ok in [
+            "127.0.0.1:8787",
+            "127.0.0.2:8787",
+            "[::1]:8787",
+            "[::ffff:127.0.0.1]:8787",
+        ] {
+            assert!(load(ok).is_ok(), "{ok}");
+        }
+        for bad in ["0.0.0.0:8787", "[::]:8787", "[::ffff:10.0.0.1]:8787"] {
+            let err = load(bad).unwrap_err();
+            assert!(err.to_string().contains("not a loopback address"), "{bad}");
+        }
     }
 
     #[test]
