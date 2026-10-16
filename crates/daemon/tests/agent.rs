@@ -184,6 +184,7 @@ fn scripted(clock: Arc<FakeClock>, model: ScriptedProvider) -> Agent {
         clock,
         limits: WakeLimits::default(),
         workspace: None,
+        waiting: Vec::new(),
     }
 }
 
@@ -317,9 +318,7 @@ async fn an_urgent_event_interrupts_a_slow_model_call() {
     });
     let mut agent = scripted(clock.clone(), ScriptedProvider::new());
     agent.provider = Box::new(Shared(model.clone()));
-    send.send(mention("[#general] Ari: @Tamsin standup notes?"))
-        .await
-        .unwrap();
+    send.send(dm("[dm] Mischa: standup notes?")).await.unwrap();
 
     agent
         .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
@@ -356,16 +355,32 @@ async fn events_that_can_wait_get_the_next_wake() {
         .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
         .await
         .unwrap();
+    // The mention that came in during the DM's wake doesn't start a wake
+    // of its own.
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+    assert_eq!(agent.waiting.len(), 1);
 
+    // An optional request found by the poller waits too.
+    send.send(mention("[#general] Bo: @Tamsin anyone?"))
+        .await
+        .unwrap();
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
+    assert_eq!(agent.store.wakes_since(start).unwrap().len(), 1);
+
+    // At the look it chose, it reads both.
+    clock.advance(time::Duration::hours(1));
+    agent
+        .run(&mut events, tokio::time::sleep(Duration::from_secs(600)))
+        .await
+        .unwrap();
     let wakes = agent.store.wakes_since(start).unwrap();
     assert_eq!(wakes.len(), 2);
-    assert!(
-        wakes[1].reason.contains("an @mention"),
-        "{}",
-        wakes[1].reason
-    );
     let seen = model.seen.lock().unwrap();
     assert!(seen[1].contains("- [#general] Ari: @Tamsin lunch?"));
+    assert!(seen[1].contains("- [#general] Bo: @Tamsin anyone?"));
 }
 
 /// Lets a test keep a handle on the model it gives the agent.

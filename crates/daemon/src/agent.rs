@@ -115,6 +115,8 @@ pub struct Agent {
     pub limits: WakeLimits,
     /// Shared by the agent's Workspace tools and the inbox poller.
     pub workspace: Option<Arc<Workspace>>,
+    /// Events that can wait, held for the agent's next look.
+    pub waiting: Vec<WakeEvent>,
 }
 
 impl Agent {
@@ -184,12 +186,13 @@ impl Agent {
             rhythm,
             limits: WakeLimits::default(),
             workspace,
+            waiting: Vec::new(),
         })
     }
 
-    /// Wakes at each chosen look and on each event, until `shutdown`
-    /// resolves. Urgent events that arrive mid-wake join it at its next safe
-    /// point; the rest wait for it to end. A wake in progress finishes
+    /// Wakes at each chosen look and on each urgent event, until `shutdown`
+    /// resolves. Events that can wait are held for the next look. Urgent
+    /// events that arrive mid-wake join it at its next safe point. A wake in progress finishes
     /// before shutdown; it saves as it goes, so a hard stop loses at most the
     /// turn in flight.
     pub async fn run(
@@ -199,7 +202,6 @@ impl Agent {
     ) -> Result<(), harness_store::StoreError> {
         let mut shutdown = std::pin::pin!(shutdown);
         let mut events_open = true;
-        let mut held = Vec::new();
         loop {
             if let Some(breaker) = self.rhythm.paused() {
                 eprintln!(
@@ -216,26 +218,30 @@ impl Agent {
                 }
                 continue;
             }
-            let mut batch = std::mem::take(&mut held);
+            // Urgent news wakes the agent now; everything else waits for
+            // the look it chose.
+            let urgent = self
+                .waiting
+                .iter()
+                .any(|e| e.reason.urgency() == Urgency::Now);
             let wait = self.rhythm.next_look() - self.clock.now();
-            if batch.is_empty() && wait.is_positive() {
+            if !urgent && wait.is_positive() {
                 let nap = wait.unsigned_abs().min(TICK);
                 tokio::select! {
                     () = &mut shutdown => return Ok(()),
                     event = events.recv(), if events_open => match event {
-                        Some(event) => batch.push(event),
+                        Some(event) => self.waiting.push(event),
                         None => events_open = false,
                     },
                     () = tokio::time::sleep(nap) => {}
                 }
-                if batch.is_empty() {
-                    // A tick, or the channel closed: check the clock again.
-                    continue;
-                }
+                // An event, a tick, or the channel closed: look again.
+                continue;
             }
             while let Ok(event) = events.try_recv() {
-                batch.push(event);
+                self.waiting.push(event);
             }
+            let batch = std::mem::take(&mut self.waiting);
             let mut inbox = Inbox {
                 events,
                 clock: self.clock.clone(),
@@ -245,8 +251,8 @@ impl Agent {
             self.wake_with(batch, &mut inbox).await?;
             // What arrived during the wake and wasn't taken in: urgent news
             // after its last safe point, and everything that could wait.
-            held = inbox.urgent;
-            held.append(&mut inbox.queued);
+            self.waiting = inbox.urgent;
+            self.waiting.append(&mut inbox.queued);
         }
     }
 
