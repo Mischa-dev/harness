@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +32,15 @@ pub enum ConfigError {
     },
     #[error("invalid proxy config: {0}")]
     Invalid(String),
+    /// Routes are named by position: a name, path or URL from the config
+    /// could be a key pasted in the wrong place, and errors reach logs.
+    #[error("invalid proxy config: route {index}: {reason}")]
+    Route { index: usize, reason: String },
+    #[error("invalid proxy config: route {index}: couldn't read its key file: {source}")]
+    KeyFile {
+        index: usize,
+        source: std::io::Error,
+    },
 }
 
 /// `[proxy]` in the daemon's config.
@@ -90,12 +99,12 @@ impl Route {
     /// `key` is used as given; for tests and for keys from other sources.
     pub fn new(name: &str, upstream: &str, auth: Auth, key: &str) -> Result<Self, ConfigError> {
         validate_name(name)?;
-        validate_upstream(name, upstream)?;
+        validate_upstream(upstream)?;
         let key = key.trim();
         if key.is_empty() || HeaderValue::from_str(key).is_err() {
-            return Err(ConfigError::Invalid(format!(
-                "route {name:?}: the key is empty or not a valid header value"
-            )));
+            return Err(ConfigError::Invalid(
+                "the key is empty or not a valid header value".into(),
+            ));
         }
         Ok(Self {
             name: name.into(),
@@ -126,29 +135,24 @@ impl ProxyConfig {
             )));
         }
         let mut routes: Vec<Route> = Vec::new();
-        for r in &self.routes {
+        for (i, r) in self.routes.iter().enumerate() {
+            let index = i + 1;
+            let in_route = |err| match err {
+                ConfigError::Invalid(reason) => ConfigError::Route { index, reason },
+                other => other,
+            };
             if routes.iter().any(|seen| seen.name == r.name) {
-                return Err(ConfigError::Invalid(format!(
-                    "route {:?} appears twice",
-                    r.name
-                )));
+                return Err(ConfigError::Route {
+                    index,
+                    reason: "its name is already taken".into(),
+                });
             }
-            routes.push(Route::new(
-                &r.name,
-                &r.upstream,
-                r.auth,
-                &read_key(&r.key_file)?,
-            )?);
+            let key = std::fs::read_to_string(&r.key_file)
+                .map_err(|source| ConfigError::KeyFile { index, source })?;
+            routes.push(Route::new(&r.name, &r.upstream, r.auth, &key).map_err(in_route)?);
         }
         Ok(routes)
     }
-}
-
-fn read_key(path: &Path) -> Result<String, ConfigError> {
-    std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.display().to_string(),
-        source,
-    })
 }
 
 fn validate_name(name: &str) -> Result<(), ConfigError> {
@@ -159,20 +163,21 @@ fn validate_name(name: &str) -> Result<(), ConfigError> {
     if ok {
         Ok(())
     } else {
-        Err(ConfigError::Invalid(format!(
-            "route name {name:?}: use letters, digits, '-' and '_'"
-        )))
+        Err(ConfigError::Invalid(
+            "its name may use only letters, digits, '-' and '_'".into(),
+        ))
     }
 }
 
 /// Keys only travel over HTTPS, except to a server on this machine. The
-/// error names the route, not the URL, which may hold a credential.
-fn validate_upstream(name: &str, upstream: &str) -> Result<(), ConfigError> {
+/// error never quotes the URL, which may hold a credential.
+fn validate_upstream(upstream: &str) -> Result<(), ConfigError> {
     let invalid = || {
-        ConfigError::Invalid(format!(
-            "route {name:?}: the upstream must be https://, or http:// only for localhost, \
+        ConfigError::Invalid(
+            "the upstream must be https://, or http:// only for localhost, \
              with no credentials, query or fragment"
-        ))
+                .into(),
+        )
     };
     let url = reqwest::Url::parse(upstream).map_err(|_| invalid())?;
     if url.query().is_some()
@@ -414,7 +419,7 @@ mod tests {
             "http://localhost:9000/v1",
             "http://[::1]:9000",
         ] {
-            assert!(validate_upstream("r", ok).is_ok(), "{ok}");
+            assert!(validate_upstream(ok).is_ok(), "{ok}");
         }
         for bad in [
             "http://api.anthropic.com",
@@ -425,7 +430,7 @@ mod tests {
             "https://example.com/?a=b",
             "not a url",
         ] {
-            let err = validate_upstream("r", bad).unwrap_err().to_string();
+            let err = validate_upstream(bad).unwrap_err().to_string();
             assert!(!err.contains("secret") && !err.contains("user@"), "{err}");
         }
     }
@@ -495,6 +500,49 @@ mod tests {
         .unwrap();
         let err = config.load_routes().unwrap_err();
         assert!(err.to_string().contains("not a loopback address"));
+    }
+
+    #[test]
+    fn config_errors_name_routes_by_position_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("key");
+        std::fs::write(&key_file, "sk-real").unwrap();
+        let key_file = key_file.display();
+        let valid = format!(
+            r#"name = "ok"
+            upstream = "https://api.example.com"
+            auth = "bearer"
+            key_file = "{key_file}""#
+        );
+        // A key pasted into each field, in a way that fails.
+        for bad in [
+            r#"name = "sk-super-secret"
+                upstream = "https://api.example.com"
+                auth = "bearer"
+                key_file = "sk-super-secret""#
+                .to_string(),
+            format!(
+                r#"name = "sk.super-secret"
+                upstream = "https://api.example.com"
+                auth = "bearer"
+                key_file = "{key_file}""#
+            ),
+            format!(
+                r#"name = "two"
+                upstream = "sk-super-secret"
+                auth = "bearer"
+                key_file = "{key_file}""#
+            ),
+            valid.replace(r#"name = "ok""#, r#"name = "sk-super-secret""#),
+        ] {
+            let text = format!(
+                "listen = \"127.0.0.1:8787\"\n[[route]]\n{valid}\n[[route]]\n{bad}\n[[route]]\n{bad}\n"
+            );
+            let config: ProxyConfig = toml::from_str(&text).unwrap();
+            let err = config.load_routes().unwrap_err().to_string();
+            assert!(!err.contains("sk-super"), "{err}");
+            assert!(err.contains("route 2") || err.contains("route 3"), "{err}");
+        }
     }
 
     #[test]
