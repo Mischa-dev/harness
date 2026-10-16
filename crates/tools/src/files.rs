@@ -35,6 +35,10 @@ pub const MAX_FILES: usize = 20_000;
 pub const MAX_SEARCH_BYTES: u64 = 64 << 20;
 /// A search skips files bigger than this; a read can still open them.
 pub const MAX_SEARCH_FILE_BYTES: u64 = 1 << 20;
+/// A search stops after meeting this many folder entries, files or not.
+pub const MAX_WALK_ENTRIES: usize = 100_000;
+/// A listing looks at no more than this many entries.
+pub const MAX_LIST_SCAN: usize = 10_000;
 /// The longest text a search looks for.
 pub const MAX_PATTERN_CHARS: usize = 200;
 /// Build output a search doesn't walk into unless it starts there.
@@ -470,7 +474,10 @@ fn list(policy: &Policy, dir: &Path, name: &str) -> Result<ToolOutput, ToolError
     let entries = std::fs::read_dir(listing).map_err(failed)?;
     let mut names = Vec::new();
     let mut hidden = 0;
-    for entry in entries.flatten() {
+    let mut entries = entries.flatten();
+    // Taken a bounded number at a time, so a folder of millions can't
+    // take all the memory before the caps below apply.
+    for entry in entries.by_ref().take(MAX_LIST_SCAN) {
         let path = dir.join(entry.file_name());
         if readable(policy, &path).is_err() {
             hidden += 1;
@@ -496,8 +503,14 @@ fn list(policy: &Policy, dir: &Path, name: &str) -> Result<ToolOutput, ToolError
         out.push('\n');
         listed += 1;
     }
-    if total > listed {
-        out.push_str(&format!("(and {} more)\n", total - listed));
+    let unseen = entries.next().is_some();
+    if total > listed || unseen {
+        let more = total - listed;
+        out.push_str(&if unseen {
+            format!("(and {more} more, plus others not looked at)\n")
+        } else {
+            format!("(and {more} more)\n")
+        });
     }
     if total == 0 {
         out.push_str("(empty)\n");
@@ -517,6 +530,8 @@ struct Search {
     files: usize,
     bytes: u64,
     large: usize,
+    /// Folder entries met so far, files or not.
+    entries: usize,
     stopped: Option<&'static str>,
 }
 
@@ -536,47 +551,7 @@ fn search(
     let meta = std::fs::symlink_metadata(&real)
         .map_err(|e| ToolError::Failed(format!("couldn't open it: {}", e.kind())))?;
     if meta.is_dir() {
-        let mut folders = vec![real];
-        while let Some(dir) = folders.pop() {
-            let Ok((_open, listing)) = open_dir(&dir) else {
-                continue;
-            };
-            let Ok(entries) = std::fs::read_dir(listing) else {
-                continue;
-            };
-            let mut entries: Vec<_> = entries.flatten().collect();
-            entries.sort_by_key(|entry| entry.file_name());
-            let mut inner = Vec::new();
-            for entry in entries {
-                let path = dir.join(entry.file_name());
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                // Links aren't followed: what they point at is searched
-                // where it really is, if the walls allow it.
-                if kind.is_symlink() || readable(policy, &path).is_err() {
-                    continue;
-                }
-                if kind.is_dir() {
-                    let skipped = SKIPPED_FOLDERS
-                        .iter()
-                        .any(|folder| entry.file_name() == **folder);
-                    if !skipped {
-                        inner.push(path);
-                    }
-                } else if kind.is_file() {
-                    search_file(policy, &path, &wanted, case_sensitive, &mut found);
-                    if found.stopped.is_some() {
-                        break;
-                    }
-                }
-            }
-            if found.stopped.is_some() {
-                break;
-            }
-            // Popped from the end, so put them back in reverse to walk in order.
-            folders.extend(inner.into_iter().rev());
-        }
+        walk(policy, real, &wanted, case_sensitive, &mut found);
     } else {
         search_file(policy, &real, &wanted, case_sensitive, &mut found);
     }
@@ -606,6 +581,61 @@ fn search(
         ));
     }
     Ok(ToolOutput::text(out))
+}
+
+/// Searches the files under `start`, a real folder the walls allow, in
+/// name order, until a cap stops it.
+fn walk(policy: &Policy, start: PathBuf, wanted: &str, case_sensitive: bool, found: &mut Search) {
+    let mut folders = vec![start];
+    while let Some(dir) = folders.pop() {
+        let Ok((_open, listing)) = open_dir(&dir) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(listing) else {
+            continue;
+        };
+        // No more than the walk has left, so one enormous folder
+        // can't take all the memory before the caps apply.
+        let room = MAX_WALK_ENTRIES - found.entries;
+        let mut entries: Vec<_> = entries.flatten().take(room + 1).collect();
+        let full = entries.len() > room;
+        entries.truncate(room);
+        found.entries += entries.len();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut inner = Vec::new();
+        for entry in entries {
+            let path = dir.join(entry.file_name());
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            // Links aren't followed: what they point at is searched
+            // where it really is, if the walls allow it.
+            if kind.is_symlink() || readable(policy, &path).is_err() {
+                continue;
+            }
+            if kind.is_dir() {
+                let skipped = SKIPPED_FOLDERS
+                    .iter()
+                    .any(|folder| entry.file_name() == **folder);
+                if !skipped {
+                    inner.push(path);
+                }
+            } else if kind.is_file() {
+                search_file(policy, &path, wanted, case_sensitive, found);
+                if found.stopped.is_some() {
+                    break;
+                }
+            }
+        }
+        if full && found.stopped.is_none() {
+            found.stopped = Some("too many files");
+        }
+        if found.stopped.is_some() {
+            break;
+        }
+        // Popped from the end, so put them back in reverse to walk in order.
+        folders.extend(inner.into_iter().rev());
+    }
 }
 
 fn search_file(
@@ -1010,6 +1040,26 @@ mod tests {
             f.call("search_files", json!({"text": ""})).await,
             ExecOutcome::Malformed(_)
         ));
+    }
+
+    #[test]
+    fn folders_are_read_only_as_far_as_the_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for i in 0..MAX_LIST_SCAN + 5 {
+            std::fs::write(root.join(format!("{i:05}")), "").unwrap();
+        }
+        let policy = Policy::conservative(&root);
+        let listing = list(&policy, &root, ".").unwrap().content;
+        assert!(listing.contains("plus others not looked at"), "{listing}");
+        let mut found = Search {
+            entries: MAX_WALK_ENTRIES - 10,
+            ..Search::default()
+        };
+        walk(&policy, root.clone(), "x", false, &mut found);
+        assert_eq!(found.entries, MAX_WALK_ENTRIES);
+        assert_eq!(found.files, 10);
+        assert_eq!(found.stopped, Some("too many files"));
     }
 
     #[tokio::test]
