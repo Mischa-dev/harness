@@ -22,7 +22,7 @@ use harness_providers::{
 };
 use harness_store::{Store, WorkdayPolicy};
 use harness_tools::sleep::MIN_SLEEP;
-use harness_tools::{MemoryFiles, Policy, PolicyExecutor, SleepTool};
+use harness_tools::{Decision, Effect, MemoryFiles, Policy, PolicyExecutor, SleepTool};
 use harness_workspace::Workspace;
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -169,9 +169,27 @@ impl Agent {
             .memory_dir
             .clone()
             .unwrap_or_else(|| config.workdir.join("memory"));
+        // The snapshot goes straight into every request, so the folder has
+        // to be one the walls let the agent use anyway.
+        let walls = Policy::conservative(&config.workdir);
+        let inside = |dir: &Path| {
+            matches!(
+                walls.check(&Effect::WritePath(dir.to_path_buf())),
+                Decision::Allow
+            )
+        };
+        let outside = || {
+            AgentError::Invalid(format!(
+                "memory_dir {} must be inside workdir, where the agent's walls allow it",
+                memory_dir.display()
+            ))
+        };
+        if !inside(&memory_dir) {
+            return Err(outside());
+        }
         let memory = Arc::new(
             MemoryFiles::open(
-                memory_dir,
+                memory_dir.clone(),
                 Some(config.state_dir.join(MEMORY_HISTORY)),
                 offset,
             )
@@ -180,6 +198,9 @@ impl Agent {
                 source,
             })?,
         );
+        if !inside(memory.location()) {
+            return Err(outside());
+        }
         if !memory.has_history() {
             eprintln!("harness-daemon: git isn't available, so memory changes have no history");
         }

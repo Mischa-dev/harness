@@ -567,3 +567,32 @@ async fn each_day_starts_from_what_the_agent_remembers() {
         agent.assembler.memory_snapshot
     );
 }
+
+#[test]
+fn memory_must_live_inside_the_work_area() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("MEMORY.md"), "not the agent's").unwrap();
+    let workdir = dir.path().join("work");
+    std::fs::create_dir(&workdir).unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        workdir,
+        profiles_file: write(dir.path(), "profiles.toml", PROFILES),
+        profile: "main".into(),
+        model_url: "http://127.0.0.1:8787/anthropic".into(),
+        caller_token_file: write(dir.path(), "caller-token", TOKEN),
+        charter_file: write(dir.path(), "charter.md", CHARTER),
+        quiet_hour: 2,
+        utc_offset_hours: 0,
+        max_output_tokens: 1024,
+        wakeups: None,
+        workspace: None,
+        memory_dir: Some(elsewhere.path().to_path_buf()),
+    };
+    let clock = Arc::new(FakeClock::new(datetime!(2026-01-05 09:00 UTC)));
+    let Err(err) = Agent::from_config(&config, clock) else {
+        panic!("a memory folder outside workdir was accepted");
+    };
+    assert!(err.to_string().contains("inside workdir"), "{err}");
+}

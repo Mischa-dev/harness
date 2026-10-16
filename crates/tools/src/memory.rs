@@ -65,7 +65,8 @@ impl MemoryFiles {
         history: Option<PathBuf>,
         offset: UtcOffset,
     ) -> std::io::Result<Self> {
-        let dir = dir.into();
+        let dir = std::path::absolute(dir.into())?;
+        let history = history.map(std::path::absolute).transpose()?;
         if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(std::io::Error::other("the memory folder is a symlink"));
         }
@@ -99,6 +100,11 @@ impl MemoryFiles {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Where the folder really is, with any links resolved.
+    pub fn location(&self) -> &Path {
+        &self.real
     }
 
     /// Whether changes are kept in git.
@@ -136,13 +142,15 @@ impl MemoryFiles {
         )
     }
 
-    /// Writes `text` to `relative` and commits it, one change at a time.
+    /// Writes `text` to `relative` and commits it as of `at`, one change at
+    /// a time.
     fn save(
         &self,
         relative: &str,
         text: &str,
         append: bool,
         message: &str,
+        at: OffsetDateTime,
     ) -> Result<(), ToolError> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let failed = |e: std::io::Error| {
@@ -164,7 +172,9 @@ impl MemoryFiles {
         if let Some(git_dir) = &self.history
             && git(git_dir, root, &["add", "--", relative]).is_ok_and(|ok| ok)
         {
-            let _ = git(
+            // Dated by the runtime's clock, like everything else.
+            let date = format!("@{} +0000", at.unix_timestamp());
+            let _ = git_dated(
                 git_dir,
                 root,
                 &[
@@ -180,6 +190,7 @@ impl MemoryFiles {
                     "--",
                     relative,
                 ],
+                Some(&date),
             );
         }
         Ok(())
@@ -254,7 +265,23 @@ fn read_tail(path: &Path, limit: usize) -> std::io::Result<String> {
 /// an argument array; whether it succeeded. Hooks, fsmonitor and the
 /// machine's global config stay out of it.
 fn git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> std::io::Result<bool> {
-    Command::new("git")
+    git_dated(git_dir, work_tree, args, None)
+}
+
+/// [`git`], with the commit dated `date` (git's `@<seconds> <zone>`).
+fn git_dated(
+    git_dir: &Path,
+    work_tree: &Path,
+    args: &[&str],
+    date: Option<&str>,
+) -> std::io::Result<bool> {
+    let mut command = Command::new("git");
+    if let Some(date) = date {
+        command
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date);
+    }
+    command
         .arg("-C")
         .arg(work_tree)
         .args([
@@ -416,7 +443,7 @@ impl Tool for MemoryWrite {
         Ok(vec![Effect::WritePath(self.0.dir.join(name))])
     }
 
-    async fn run(&self, args: &Value, _ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
+    async fn run(&self, args: &Value, ctx: &ToolContext<'_>) -> Result<ToolOutput, ToolError> {
         self.effects(args)?;
         let (name, _) = file(args)?;
         let content = args
@@ -425,7 +452,13 @@ impl Tool for MemoryWrite {
             .unwrap_or_default();
         let mut text = content.trim_end().to_string();
         text.push('\n');
-        self.0.save(name, &text, false, &format!("Update {name}"))?;
+        self.0.save(
+            name,
+            &text,
+            false,
+            &format!("Update {name}"),
+            ctx.clock.now(),
+        )?;
         Ok(ToolOutput::text(format!("Saved {name}.")))
     }
 }
@@ -482,7 +515,7 @@ impl Tool for JournalWrite {
             entry.trim()
         );
         self.0
-            .save(&relative, &text, true, &format!("Journal {day}"))?;
+            .save(&relative, &text, true, &format!("Journal {day}"), now)?;
         Ok(ToolOutput::text(format!("Added to the journal for {day}.")))
     }
 }
@@ -589,6 +622,18 @@ mod tests {
         assert!(snapshot.contains("## USER.md\nMischa, UTC-7."));
         assert!(snapshot.contains("## HANDOFF.md\n(empty)"));
         assert!(files.has_history(), "git keeps the history");
+        let last = Command::new("git")
+            .arg("--git-dir")
+            .arg(files.dir().with_extension("git"))
+            .args(["log", "-1", "--format=%at %ct"])
+            .output()
+            .unwrap();
+        let at = harness_core::Clock::now(&clock).unix_timestamp();
+        assert_eq!(
+            String::from_utf8(last.stdout).unwrap().trim(),
+            format!("{at} {at}"),
+            "commits are dated by the runtime's clock"
+        );
         assert_eq!(commits(&files.dir().with_extension("git")), 3);
     }
 
@@ -757,7 +802,11 @@ mod tests {
         std::fs::rename(&dir, tmp.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(&outside, &dir).unwrap();
         assert!(!files.snapshot().contains("outside"));
-        assert!(files.save("USER.md", "x", false, "x").is_err());
+        assert!(
+            files
+                .save("USER.md", "x", false, "x", datetime!(2026-01-05 19:00 UTC))
+                .is_err()
+        );
         assert!(!outside.join("USER.md").exists());
     }
 
