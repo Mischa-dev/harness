@@ -466,7 +466,12 @@ async fn workers_from_the_config_bring_their_tools() {
     config.workers = Some(workers.clone());
     let mut agent = Agent::from_config(&config, clock.clone()).unwrap();
     let names: Vec<String> = agent.executor.specs().into_iter().map(|s| s.name).collect();
-    for tool in ["spawn_worker", "worker_status", "stop_worker"] {
+    for tool in [
+        "spawn_worker",
+        "worker_status",
+        "steer_worker",
+        "stop_worker",
+    ] {
         assert!(names.contains(&tool.to_string()), "{names:?}");
     }
     assert!(agent.worker_reports.take().is_some());

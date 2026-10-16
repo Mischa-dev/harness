@@ -4,7 +4,8 @@
 //! the owner's login, so no Workspace token or model key reaches it.
 //!
 //! When a worker ends, for whatever reason, the runtime records what it said
-//! and what it changed, gives its paths back and tells the agent.
+//! and what it changed, gives its paths back and tells the agent. The agent
+//! can then steer it: run it again in the same worktree, with feedback.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use harness_core::Clock;
-use harness_store::{LockPath, NewWorker, WorkerBook, WorkerRecord, WorkerState};
+use harness_store::{LockPath, NewWorker, ResumeRefusal, WorkerBook, WorkerRecord, WorkerState};
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -23,6 +24,8 @@ use crate::worktree::{Worktree, deleted_tests, outside_locks, protected_changes}
 
 /// The brief around the agent's words; product code, like the charter.
 const PROMPT: &str = include_str!("../../../prompts/worker.md");
+/// What a worker gets when it's steered.
+const STEER: &str = include_str!("../../../prompts/worker-steer.md");
 
 /// The concurrent workers circuit breaker (ARCHITECTURE.md), enforced as a
 /// refusal.
@@ -182,6 +185,8 @@ impl Workers {
         config.check()?;
         harness_loop::charter::render(PROMPT, &prompt_values(agent_name, "x", "x", "x"))
             .map_err(|e| format!("prompts/worker.md: {e}"))?;
+        harness_loop::charter::render(STEER, &steer_values(agent_name, "x", "x"))
+            .map_err(|e| format!("prompts/worker-steer.md: {e}"))?;
         Ok(Self {
             book,
             clock,
@@ -307,8 +312,99 @@ impl Workers {
                 return Err(e.to_string());
             }
         };
-        let paths = record
-            .paths
+        let text = self.brief(&record.paths, brief)?;
+        self.launch(request.kind, config, record.clone(), tree, text, None);
+        Ok(record)
+    }
+
+    /// Runs an ended worker again in its worktree, holding the same paths,
+    /// with the agent's feedback. A kind that can continue its session does;
+    /// any other starts afresh with its first brief and the feedback.
+    pub async fn steer(self: &Arc<Self>, id: i64, message: &str) -> Result<WorkerRecord, String> {
+        let message = message.trim();
+        if message.is_empty() || message.chars().count() > MAX_BRIEF_CHARS {
+            return Err(format!(
+                "the message must be 1 to {MAX_BRIEF_CHARS} characters"
+            ));
+        }
+        let worker = self
+            .book
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("there's no worker #{id}"))?;
+        if worker.state == WorkerState::Running {
+            return Err(format!(
+                "worker #{id} is still running; wait for it to end, or stop it first"
+            ));
+        }
+        let kind = Kind::parse(&worker.kind)
+            .ok_or_else(|| format!("worker #{id} is of an unknown kind, {}", worker.kind))?;
+        let config = self
+            .config
+            .kind(kind)
+            .ok_or_else(|| format!("no {} workers are set up any more", kind.as_str()))?
+            .clone();
+        let repo = self
+            .config
+            .repos
+            .get(&worker.repo)
+            .ok_or_else(|| {
+                format!(
+                    "{} isn't a repository workers can use any more",
+                    worker.repo
+                )
+            })?
+            .clone();
+        let tree = Worktree {
+            repo,
+            dir: worker.worktree.clone().into(),
+            branch: worker.branch.clone(),
+            base: worker.base.clone(),
+        };
+        if !tree.dir.is_dir() {
+            return Err(format!(
+                "worker #{id}'s worktree is gone; spawn a new worker"
+            ));
+        }
+        let running = self.book.running().map_err(|e| e.to_string())?;
+        if running.len() >= self.config.max_running {
+            return Err(format!(
+                "{} workers are running already, the most at once; wait for one or stop one",
+                running.len()
+            ));
+        }
+        let report = worker.summary.as_deref().unwrap_or("(none)");
+        let steer =
+            harness_loop::charter::render(STEER, &steer_values(&self.agent_name, report, message))
+                .map_err(|e| format!("prompts/worker-steer.md: {e}"))?;
+        let session = worker
+            .session
+            .as_deref()
+            .filter(|_| kind::resumes(kind))
+            .and_then(kind::session_id)
+            .map(str::to_string);
+        let text = match session {
+            Some(_) => steer,
+            None => format!(
+                "{}\n\n---\n\n{steer}",
+                self.brief(&worker.paths, &worker.brief)?
+            ),
+        };
+        let record = match self.book.resume(id, LEASE, self.clock.now()) {
+            Ok(Ok(record)) => record,
+            Ok(Err(ResumeRefusal::Conflict(conflict))) => {
+                return Err(format!("{conflict}; wait for it, or stop it"));
+            }
+            Ok(Err(refusal)) => return Err(format!("worker #{id} can't be steered: {refusal}")),
+            Err(e) => return Err(e.to_string()),
+        };
+        self.launch(kind, config, record.clone(), tree, text, session);
+        Ok(record)
+    }
+
+    /// The first brief for a worker that may change `paths`.
+    fn brief(&self, paths: &[LockPath], brief: &str) -> Result<String, String> {
+        let paths = paths
             .iter()
             .map(|p| {
                 format!(
@@ -329,20 +425,33 @@ impl Workers {
             .map(|p| format!("- {p}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let text = harness_loop::charter::render(
+        harness_loop::charter::render(
             PROMPT,
             &prompt_values(&self.agent_name, &paths, &protected, brief),
         )
-        .map_err(|e| format!("prompts/worker.md: {e}"))?;
+        .map_err(|e| format!("prompts/worker.md: {e}"))
+    }
+
+    /// Runs a worker the book has as running, in the background.
+    fn launch(
+        self: &Arc<Self>,
+        kind: Kind,
+        config: KindConfig,
+        worker: WorkerRecord,
+        tree: Worktree,
+        text: String,
+        session: Option<String>,
+    ) {
         let (stop_tx, stop_rx) = oneshot::channel();
         self.stops
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(record.id, stop_tx);
+            .insert(worker.id, stop_tx);
         let this = self.clone();
-        let (kind, worker) = (request.kind, record.clone());
-        tokio::spawn(async move { this.run(kind, config, worker, tree, text, stop_rx).await });
-        Ok(record)
+        tokio::spawn(async move {
+            this.run(kind, config, worker, tree, text, session, stop_rx)
+                .await
+        });
     }
 
     /// Asks a running worker to stop. A worker the book has as running
@@ -374,6 +483,7 @@ impl Workers {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         self: Arc<Self>,
         kind: Kind,
@@ -381,16 +491,34 @@ impl Workers {
         worker: WorkerRecord,
         tree: Worktree,
         brief: String,
+        resume: Option<String>,
         stop: oneshot::Receiver<()>,
     ) {
         let last_message = self
             .worktrees
             .join(format!("{}.last-message.txt", worker.id));
-        let (mut state, summary) = match self
-            .supervise(kind, &config, &worker, &tree, &brief, &last_message, stop)
-            .await
-        {
-            Ok(outcome) => outcome,
+        let _ = std::fs::remove_file(&last_message);
+        let run = Run {
+            kind,
+            config: &config,
+            worker: &worker,
+            tree: &tree,
+            brief: &brief,
+            last_message: &last_message,
+            resume: resume.as_deref(),
+        };
+        let (mut state, summary) = match self.supervise(run, stop).await {
+            Ok((state, summary, session)) => {
+                if let Some(session) = session.as_deref().and_then(kind::session_id)
+                    && let Err(e) = self.book.set_session(worker.id, session)
+                {
+                    eprintln!(
+                        "harness: couldn't record worker #{}'s session: {e}",
+                        worker.id
+                    );
+                }
+                (state, summary)
+            }
             Err(problem) => (WorkerState::Failed, problem),
         };
         let _ = std::fs::remove_file(&last_message);
@@ -458,18 +586,21 @@ impl Workers {
     }
 
     /// Runs the worker's process to its end, renewing its locks, and says
-    /// how it ended.
-    #[allow(clippy::too_many_arguments)]
+    /// how it ended, and the CLI's session if it said.
     async fn supervise(
         &self,
-        kind: Kind,
-        config: &KindConfig,
-        worker: &WorkerRecord,
-        tree: &Worktree,
-        brief: &str,
-        last_message: &Path,
+        run: Run<'_>,
         mut stop: oneshot::Receiver<()>,
-    ) -> Result<(WorkerState, String), String> {
+    ) -> Result<(WorkerState, String, Option<String>), String> {
+        let Run {
+            kind,
+            config,
+            worker,
+            tree,
+            brief,
+            last_message,
+            resume,
+        } = run;
         let mut command = tokio::process::Command::new(&config.program);
         command
             .args(kind::args(
@@ -478,6 +609,7 @@ impl Workers {
                 &tree.dir,
                 last_message,
                 &self.config.protected_paths(),
+                resume,
             ))
             .current_dir(&tree.dir)
             .env_clear()
@@ -537,7 +669,7 @@ impl Workers {
             Err(why) => {
                 kill_group(pid);
                 let _ = child.kill().await;
-                return Ok((WorkerState::Stopped, why));
+                return Ok((WorkerState::Stopped, why, None));
             }
         };
         let stdout = match stdout {
@@ -561,14 +693,38 @@ impl Workers {
             text.push_str(&format!("\n\n(It cost ${cost:.2}.)"));
         }
         if status.success() && !answer.is_error {
-            Ok((WorkerState::Finished, text))
+            Ok((WorkerState::Finished, text, answer.session))
         } else {
             Ok((
                 WorkerState::Failed,
                 format!("It exited with {status}.\n\n{text}"),
+                answer.session,
             ))
         }
     }
+}
+
+/// One run of a worker's process.
+struct Run<'a> {
+    kind: Kind,
+    config: &'a KindConfig,
+    worker: &'a WorkerRecord,
+    tree: &'a Worktree,
+    brief: &'a str,
+    last_message: &'a Path,
+    resume: Option<&'a str>,
+}
+
+fn steer_values<'a>(
+    agent: &'a str,
+    report: &'a str,
+    message: &'a str,
+) -> [(&'static str, &'a str); 3] {
+    [
+        ("agent_name", agent),
+        ("report", report),
+        ("message", message),
+    ]
 }
 
 fn prompt_values<'a>(

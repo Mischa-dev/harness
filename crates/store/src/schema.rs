@@ -3,7 +3,7 @@
 
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[
+pub(crate) const MIGRATIONS: &[&str] = &[
     // 1: workdays, transcripts and wakes.
     "CREATE TABLE days (
          id INTEGER PRIMARY KEY,
@@ -86,6 +86,15 @@ const MIGRATIONS: &[&str] = &[
          PRIMARY KEY (worker_id, path)
      );
      CREATE INDEX path_locks_repo ON path_locks(repo, lease_until);",
+    // 7: what a worker may change, kept after it ends so it can be steered
+    // and take the same paths again; its CLI session; how many turns it has
+    // had.
+    "ALTER TABLE workers ADD COLUMN paths TEXT NOT NULL DEFAULT '[]';
+     ALTER TABLE workers ADD COLUMN session TEXT;
+     ALTER TABLE workers ADD COLUMN turns INTEGER NOT NULL DEFAULT 1;
+     UPDATE workers SET paths = (
+         SELECT json_group_array(path) FROM path_locks WHERE worker_id = workers.id
+     ) WHERE EXISTS (SELECT 1 FROM path_locks WHERE worker_id = workers.id);",
 ];
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
