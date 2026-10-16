@@ -3,6 +3,7 @@
 //! way to run a tool. Walls are checked here, in code, before anything runs.
 
 pub mod executor;
+pub mod files;
 pub mod memory;
 pub mod policy;
 pub mod schema;

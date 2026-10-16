@@ -172,6 +172,9 @@ impl Agent {
         })?;
         let mut executor =
             PolicyExecutor::new(Policy::conservative(&workdir), clock.clone()).with_tool(SleepTool);
+        for tool in harness_tools::files::tools(Policy::conservative(&workdir)) {
+            executor.register(tool);
+        }
         let memory_dir = config
             .memory_dir
             .clone()
