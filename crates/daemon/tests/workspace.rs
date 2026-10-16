@@ -161,9 +161,16 @@ async fn the_agent_answers_a_reply_request_through_its_tools() {
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
-    assert_eq!(calls, ["briefing", "reply_claim", "reply_send"]);
+    // The first briefing is the runtime's own, for the state view.
+    assert_eq!(calls, ["briefing", "briefing", "reply_claim", "reply_send"]);
+    let day = agent.store.current_day().unwrap().unwrap();
+    let opening = format!("{:?}", agent.store.transcript(day.id).unwrap()[0]);
+    assert!(
+        opening.contains("- Workspace: 1 reply request (1 needing an answer)"),
+        "{opening}"
+    );
     assert_eq!(
-        fake.calls.lock().unwrap()[2].1,
+        fake.calls.lock().unwrap()[3].1,
         json!({"requestId": "r-1", "generation": 2, "text": "Yes, this morning."})
     );
 }

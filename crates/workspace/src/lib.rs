@@ -8,7 +8,7 @@ pub mod shadow;
 pub mod tools;
 pub mod watch;
 
-pub use api::{InboxEntry, Outcome, Workspace};
+pub use api::{BriefingCounts, InboxEntry, Outcome, Workspace};
 pub use client::{AccessToken, McpClient, McpError};
 pub use shadow::Shadow;
 pub use tools::{tools, tools_with};
