@@ -371,3 +371,53 @@ async fn malformed_calls_never_run() {
     assert!(matches!(not_object, ExecOutcome::Malformed(_)));
     assert_eq!(h.runs.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn dot_root_still_enforces_absolute_path_walls() {
+    let mut h = harness(Path::new("."));
+    let inside = std::env::current_dir().unwrap().join("ordinary-notes.md");
+    assert!(matches!(
+        h.exec
+            .execute(&call("write", json!({"path": inside})))
+            .await,
+        ExecOutcome::Ran(_)
+    ));
+    for tool in ["read", "write"] {
+        let out = h
+            .exec
+            .execute(&call(tool, json!({"path": "/outside-dot-root"})))
+            .await;
+        assert!(is_deny(&out), "{tool}: {out:?}");
+    }
+    assert_eq!(h.runs.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unresolved_symlinks_never_reach_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".github")).unwrap();
+    for (name, target) in [
+        ("outside", outside.path().join("not-created")),
+        ("protected", dir.path().join(".github/not-created")),
+        ("dangling-dir", outside.path().join("missing-dir")),
+        ("cycle", dir.path().join("cycle")),
+    ] {
+        std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
+    }
+    let mut h = harness(dir.path());
+    for path in ["outside", "protected", "dangling-dir/new.txt", "cycle"] {
+        for tool in ["read", "write"] {
+            let out = h.exec.execute(&call(tool, json!({"path": path}))).await;
+            assert!(is_deny(&out), "{tool} {path}: {out:?}");
+        }
+    }
+    assert_eq!(h.runs.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        h.exec
+            .execute(&call("write", json!({"path": "new/ordinary.txt"})))
+            .await,
+        ExecOutcome::Ran(_)
+    ));
+}

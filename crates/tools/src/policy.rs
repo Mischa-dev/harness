@@ -181,25 +181,22 @@ impl Policy {
     /// outside. Checked lexically first, then again after following symlinks
     /// through the deepest part of the path that exists.
     fn resolve(&self, path: &Path) -> Option<PathBuf> {
+        // A dot root must not normalize to an empty prefix, which would
+        // admit every absolute path and skip the real-path check.
+        let root = normalize(&std::path::absolute(&self.root).ok()?)?;
         let joined = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            self.root.join(path)
+            root.join(path)
         };
         let lexical = normalize(&joined)?;
-        let root = normalize(&self.root)?;
-        let rel = lexical.strip_prefix(&root).ok()?.to_path_buf();
+        lexical.strip_prefix(&root).ok()?;
 
-        // A symlink inside the root can point outside it, or into a protected
-        // path under another name. Resolve what exists and check again.
-        if let (Ok(real_root), Some(real)) = (root.canonicalize(), canonicalize_existing(&lexical))
-        {
-            let real_rel = real.strip_prefix(&real_root).ok()?.to_path_buf();
-            if real_rel != rel {
-                return Some(real_rel);
-            }
-        }
-        Some(rel)
+        // Fail closed on unresolved links and filesystem errors. Only a
+        // genuinely missing suffix can be appended to an existing ancestor.
+        let real_root = root.canonicalize().ok()?;
+        let real = canonicalize_existing(&lexical)?;
+        Some(real.strip_prefix(&real_root).ok()?.to_path_buf())
     }
 }
 
@@ -298,6 +295,13 @@ fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
                 out.push(part);
             }
             return Some(out);
+        }
+        match std::fs::symlink_metadata(&existing) {
+            // It exists but couldn't be resolved, such as a dangling or
+            // cyclic symlink. Don't reinterpret it as a missing filename.
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
         rest.push(existing.file_name()?.to_os_string());
         if !existing.pop() {
