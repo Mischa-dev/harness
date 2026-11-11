@@ -533,3 +533,69 @@ async fn urgent_news_between_calls_stops_the_rest_of_the_batch() {
     assert!(matches!(outcome.end, WakeEnd::Slept { .. }));
     assert_eq!(provider.remaining(), 0);
 }
+
+async fn parsed_bad_arguments_can_recover(response: harness_providers::ModelResponse) {
+    let mut w = world();
+    let provider = ScriptedProvider::new()
+        .then(response)
+        .then_calls("", vec![("sleep", json!({"minutes": 30}))]);
+    let out = w
+        .wake(&provider, ToolCallStyle::Parallel, WakeLimits::default())
+        .await;
+    assert!(matches!(out.end, WakeEnd::Slept { .. }));
+    assert_eq!(out.turns, 2, "the invalid sleep must not execute");
+    let result = results(&w.transcript[2])[0];
+    assert!(result.is_error && result.content.contains("malformed"));
+    assert_eq!(provider.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn openai_missing_and_wrong_type_arguments_can_recover() {
+    use harness_providers::adapters::openai_compat::OpenAiCompatAdapter;
+    for raw in [
+        None,
+        Some(json!(null)),
+        Some(json!(42)),
+        Some(json!([])),
+        Some(json!({"minutes": 60})),
+    ] {
+        let mut function = json!({"name": "sleep"});
+        if let Some(raw) = raw {
+            function["arguments"] = raw;
+        }
+        let body = json!({"choices": [{"message": {"tool_calls": [{"id": "bad", "function": function}]}, "finish_reason": "tool_calls"}]});
+        let response = OpenAiCompatAdapter::parse_response(&body.to_string()).unwrap();
+        assert!(
+            !response
+                .message
+                .tool_calls()
+                .next()
+                .unwrap()
+                .arguments
+                .is_object()
+        );
+        parsed_bad_arguments_can_recover(response).await;
+    }
+}
+
+#[tokio::test]
+async fn anthropic_missing_and_wrong_type_inputs_can_recover() {
+    use harness_providers::adapters::anthropic::AnthropicAdapter;
+    for input in [
+        None,
+        Some(json!(null)),
+        Some(json!(42)),
+        Some(json!([])),
+        Some(json!("bad")),
+    ] {
+        let mut block = json!({"type": "tool_use", "id": "bad", "name": "sleep"});
+        if let Some(input) = input {
+            block["input"] = input;
+        }
+        let body = json!({"content": [block], "stop_reason": "tool_use"});
+        parsed_bad_arguments_can_recover(
+            AnthropicAdapter::parse_response(&body.to_string()).unwrap(),
+        )
+        .await;
+    }
+}

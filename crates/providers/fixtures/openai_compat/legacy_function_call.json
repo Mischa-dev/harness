@@ -1,0 +1,16 @@
+{
+  "id": "fixture-legacy-call",
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "function_call": {
+          "name": "sleep",
+          "arguments": "{\"minutes\":60}"
+        }
+      },
+      "finish_reason": "function_call"
+    }
+  ]
+}

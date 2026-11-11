@@ -1,0 +1,13 @@
+{
+  "id": "fixture-stop-null-tools",
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "All quiet.",
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}

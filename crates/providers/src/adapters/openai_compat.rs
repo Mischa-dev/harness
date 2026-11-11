@@ -4,7 +4,9 @@
 //! These providers cache prefixes automatically, so the loop's breakpoints
 //! are ignored. Tool arguments arrive as a JSON string; a string that doesn't
 //! parse is passed through as-is, so the policy executor rejects it as a
-//! malformed call and the model gets the error back.
+//! malformed call and the model gets the error back. Provider reasoning details
+//! are kept opaque and replayed on later turns. The legacy `function_call`
+//! protocol is rejected because requests and tool results use `tool_calls`.
 
 use std::sync::Arc;
 
@@ -82,6 +84,16 @@ impl OpenAiCompatAdapter {
             .get("message")
             .ok_or_else(|| ProviderError::Parse("choice has no message".into()))?;
 
+        if message
+            .get("function_call")
+            .is_some_and(|call| !call.is_null())
+            || choice.get("finish_reason").and_then(Value::as_str) == Some("function_call")
+        {
+            return Err(ProviderError::Parse(
+                "legacy `function_call` responses are unsupported; use `tool_calls`".into(),
+            ));
+        }
+
         let mut content = Vec::new();
         if let Some(raw_content) = message.get("content")
             && !raw_content.is_null()
@@ -93,9 +105,17 @@ impl OpenAiCompatAdapter {
                 content.push(ContentBlock::Text { text: text.into() });
             }
         }
-        if let Some(raw_calls) = message.get("tool_calls") {
+        if let Some(details) = message.get("reasoning_details").filter(|v| !v.is_null()) {
+            // Some providers require these blocks, including encrypted data and
+            // signatures, unchanged when continuing after a tool result.
+            content.push(ContentBlock::Opaque {
+                provider: "openai_compat".into(),
+                data: json!({"reasoning_details": details}),
+            });
+        }
+        if let Some(raw_calls) = message.get("tool_calls").filter(|v| !v.is_null()) {
             let calls = raw_calls.as_array().ok_or_else(|| {
-                ProviderError::Parse("choice message `tool_calls` must be an array".into())
+                ProviderError::Parse("choice message `tool_calls` must be an array or null".into())
             })?;
             for call in calls {
                 let id = call.get("id").and_then(Value::as_str);
@@ -108,16 +128,15 @@ impl OpenAiCompatAdapter {
                         "tool call id and name must not be empty".into(),
                     ));
                 }
-                let raw = call
-                    .pointer("/function/arguments")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        ProviderError::Parse("tool call without string arguments".into())
-                    })?;
-                let arguments = if raw.trim().is_empty() {
-                    json!({})
-                } else {
-                    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
+                let arguments = match call.pointer("/function/arguments").and_then(Value::as_str) {
+                    Some(raw) if raw.trim().is_empty() => json!({}),
+                    Some(raw) => {
+                        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()))
+                    }
+                    // Never turn a wrong-type wire object into executable
+                    // arguments. Null fails schema validation and lets the
+                    // loop return malformed-call feedback for a retry.
+                    None => Value::Null,
                 };
                 content.push(ContentBlock::ToolCall(ToolCall {
                     id: id.into(),
@@ -129,7 +148,7 @@ impl OpenAiCompatAdapter {
 
         let stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
             Some("stop") => StopReason::EndTurn,
-            Some("tool_calls" | "function_call") => StopReason::ToolUse,
+            Some("tool_calls") => StopReason::ToolUse,
             Some("length") => StopReason::MaxTokens,
             Some("content_filter") => StopReason::Refusal,
             _ => StopReason::Other,
@@ -215,7 +234,13 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
                     })
                 })
                 .collect();
-            if text.is_empty() && calls.is_empty() {
+            let reasoning_details = message.content.iter().find_map(|block| match block {
+                ContentBlock::Opaque { provider, data } if provider == "openai_compat" => {
+                    data.get("reasoning_details").filter(|v| !v.is_null())
+                }
+                _ => None,
+            });
+            if text.is_empty() && calls.is_empty() && reasoning_details.is_none() {
                 return;
             }
             let mut wire = json!({
@@ -224,6 +249,9 @@ fn push_message(out: &mut Vec<Value>, message: &Message) {
             });
             if !calls.is_empty() {
                 wire["tool_calls"] = json!(calls);
+            }
+            if let Some(details) = reasoning_details {
+                wire["reasoning_details"] = details.clone();
             }
             out.push(wire);
         }
@@ -397,12 +425,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tool_calls_without_arguments() {
+    fn keeps_missing_arguments_invalid_for_the_executor() {
         let missing = r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"sleep"}}]},"finish_reason":"tool_calls"}]}"#;
-        assert!(matches!(
-            OpenAiCompatAdapter::parse_response(missing),
-            Err(ProviderError::Parse(problem)) if problem.contains("arguments")
-        ));
+        let response = OpenAiCompatAdapter::parse_response(missing).unwrap();
+        let call = response.message.tool_calls().next().unwrap();
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.arguments, Value::Null);
     }
 
     #[test]
@@ -429,6 +457,150 @@ mod tests {
                 "accepted malformed response: {body}"
             );
         }
+    }
+
+    #[test]
+    fn accepts_null_tool_calls() {
+        let response = OpenAiCompatAdapter::parse_response(include_str!(
+            "../../fixtures/openai_compat/null_tool_calls.json"
+        ))
+        .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.message, Message::assistant_text("All quiet."));
+        assert_eq!(response.message.tool_calls().count(), 0);
+    }
+
+    #[test]
+    fn reasoning_details_survive_storage_and_a_tool_round_trip() {
+        let fixture = include_str!("../../fixtures/openai_compat/reasoning_tool_calls.json");
+        let original: Value = serde_json::from_str(fixture).unwrap();
+        let response = OpenAiCompatAdapter::parse_response(fixture).unwrap();
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        let calls: Vec<_> = response.message.tool_calls().collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "sleep");
+        assert_eq!(calls[0].arguments, json!({"minutes": 60}));
+
+        // The transcript stores the internal message, not the provider response.
+        let stored = serde_json::to_string(&response.message).unwrap();
+        let mut assistant: Message = serde_json::from_str(&stored).unwrap();
+        assistant.content.push(ContentBlock::Opaque {
+            provider: "anthropic".into(),
+            data: json!({"reasoning_details": ["foreign-provider-data"]}),
+        });
+        let result = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(ToolResult {
+                call_id: "call_fixture_reasoning".into(),
+                content: "scheduled".into(),
+                is_error: false,
+            })],
+        };
+        let a = adapter(ToolCallStyle::Parallel, Arc::new(Replay::new(200, STOP)));
+        let body = a.request_body(&request(vec![assistant, result]));
+        assert_eq!(
+            body["messages"][1]["reasoning_details"],
+            original["choices"][0]["message"]["reasoning_details"]
+        );
+        assert_eq!(body["messages"][1]["content"], "Sleeping.");
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["id"],
+            "call_fixture_reasoning"
+        );
+        assert_eq!(
+            body["messages"][2],
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_fixture_reasoning",
+                "content": "scheduled",
+            })
+        );
+        assert!(!body.to_string().contains("foreign-provider-data"));
+    }
+
+    #[test]
+    fn keeps_reasoning_only_messages() {
+        let details = json!([{
+            "type": "reasoning.encrypted",
+            "data": "scrubbed-encrypted-reasoning",
+            "index": 0,
+        }]);
+        let response = OpenAiCompatAdapter::parse_response(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": null,
+                        "reasoning_details": details,
+                    },
+                    "finish_reason": "length",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        let a = adapter(ToolCallStyle::Parallel, Arc::new(Replay::new(200, STOP)));
+        let body = a.request_body(&request(vec![response.message]));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["messages"][1],
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_details": details,
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_absent_null_and_foreign_reasoning_details() {
+        let response = OpenAiCompatAdapter::parse_response(
+            r#"{"choices":[{"message":{"content":"hi","reasoning_details":null}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(response.message, Message::assistant_text("hi"));
+        let a = adapter(ToolCallStyle::Parallel, Arc::new(Replay::new(200, STOP)));
+        let body = a.request_body(&request(vec![
+            response.message,
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Opaque {
+                    provider: "anthropic".into(),
+                    data: json!({"reasoning_details": ["not-for-this-adapter"]}),
+                }],
+            },
+        ]));
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert!(body["messages"][1].get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn rejects_legacy_function_calls_instead_of_silently_dropping_them() {
+        for body in [
+            include_str!("../../fixtures/openai_compat/legacy_function_call.json"),
+            r#"{"choices":[{"message":{"content":null},"finish_reason":"function_call"}]}"#,
+            r#"{"choices":[{"message":{"function_call":{"name":"sleep","arguments":"{}"}},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"message":{"tool_calls":[{"id":"call_1","function":{"name":"sleep","arguments":"{}"}}],"function_call":{"name":"sleep","arguments":"{}"}},"finish_reason":"tool_calls"}]}"#,
+        ] {
+            assert!(
+                matches!(
+                    OpenAiCompatAdapter::parse_response(body),
+                    Err(ProviderError::Parse(problem)) if problem.contains("legacy `function_call`")
+                ),
+                "accepted an unsupported legacy response: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_null_legacy_function_call_field() {
+        let response = OpenAiCompatAdapter::parse_response(
+            r#"{"choices":[{"message":{"content":"hi","function_call":null},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(response.stop_reason, StopReason::EndTurn);
+        assert_eq!(response.message, Message::assistant_text("hi"));
     }
 
     #[tokio::test]

@@ -1,0 +1,37 @@
+{
+  "id": "fixture-reasoning-tools",
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Sleeping.",
+        "reasoning_details": [
+          {
+            "type": "reasoning.text",
+            "text": "The work is complete.",
+            "signature": "scrubbed-signature",
+            "index": 0
+          },
+          {
+            "type": "reasoning.encrypted",
+            "data": "scrubbed-encrypted-reasoning",
+            "id": "reasoning-fixture",
+            "format": "fixture-format",
+            "index": 1
+          }
+        ],
+        "tool_calls": [
+          {
+            "id": "call_fixture_reasoning",
+            "type": "function",
+            "function": {
+              "name": "sleep",
+              "arguments": "{\"minutes\":60}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}

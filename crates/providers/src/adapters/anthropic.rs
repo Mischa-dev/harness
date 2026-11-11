@@ -125,18 +125,13 @@ impl AnthropicAdapter {
                 Some("tool_use") => {
                     let id = nonempty_str_field(block, "id")?;
                     let name = nonempty_str_field(block, "name")?;
-                    let arguments = block.get("input").ok_or_else(|| {
-                        ProviderError::Parse("tool_use block is missing `input`".into())
-                    })?;
-                    if !arguments.is_object() {
-                        return Err(ProviderError::Parse(
-                            "tool_use block `input` must be an object".into(),
-                        ));
-                    }
+                    // Keep invalid inputs invalid, so schema validation can
+                    // reject the call and return feedback without executing it.
+                    let arguments = block.get("input").cloned().unwrap_or(Value::Null);
                     content.push(ContentBlock::ToolCall(ToolCall {
                         id: id.to_string(),
                         name: name.to_string(),
-                        arguments: arguments.clone(),
+                        arguments,
                     }));
                 }
                 _ => content.push(ContentBlock::Opaque {
@@ -481,25 +476,20 @@ mod tests {
             AnthropicAdapter::parse_response(r#"{"content":[{"type":"tool_use","name":"x"}]}"#),
             Err(ProviderError::Parse(_))
         ));
+        let response = AnthropicAdapter::parse_response(
+            r#"{"content":[{"type":"tool_use","id":"1","name":"x","input":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            response.message.tool_calls().next().unwrap().arguments,
+            Value::Null
+        );
         assert!(matches!(
             AnthropicAdapter::parse_response(
-                r#"{"content":[{"type":"tool_use","id":"1","name":"x","input":null}]}"#
+                r#"{"content":[{"type":"tool_use","id":"","name":"x","input":{}}]}"#
             ),
-            Err(ProviderError::Parse(problem)) if problem.contains("input")
+            Err(ProviderError::Parse(_))
         ));
-        for body in [
-            r#"{"content":[{"type":"tool_use","id":"","name":"x","input":{}}]}"#,
-            r#"{"content":[{"type":"tool_use","id":"1","name":"x"}]}"#,
-            r#"{"content":[{"type":"tool_use","id":"1","name":"x","input":[]}]}"#,
-        ] {
-            assert!(
-                matches!(
-                    AnthropicAdapter::parse_response(body),
-                    Err(ProviderError::Parse(_))
-                ),
-                "accepted malformed response: {body}"
-            );
-        }
     }
 
     #[tokio::test]
