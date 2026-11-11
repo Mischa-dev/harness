@@ -579,7 +579,7 @@ fn secure_state_file(path: &Path) -> Result<()> {
         {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+                if !std::fs::symlink_metadata(path)?.is_file() {
                     return Err(error.into());
                 }
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

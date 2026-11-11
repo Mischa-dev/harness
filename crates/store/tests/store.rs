@@ -292,3 +292,32 @@ fn a_later_save_replaces_a_pending_message() {
         Err(StoreError::Corrupt(_))
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn invalid_state_objects_keep_their_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().join("directory");
+    std::fs::create_dir(&directory).unwrap();
+    let fifo = temp.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for path in [&directory, &fifo] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(Store::open(path).is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+    }
+}

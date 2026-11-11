@@ -139,7 +139,7 @@ impl Scenario {
                 // Names appear in the wake message's line headers, which the
                 // fake teammate reads; a ',' could forge the ", to you" marker.
                 for name in [&e.conversation, &e.from] {
-                    if name.is_empty() || name.contains([':', ']', ',', '\n']) {
+                    if name.trim().is_empty() || name.contains([':', ']', ',', '\n']) {
                         return Err(ScenarioError::Invalid(format!(
                             "{name:?}: names can't be empty or contain ':', ']', ',' or a newline"
                         )));
@@ -350,6 +350,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("names can't"));
+    }
+
+    #[test]
+    fn blank_event_names_are_rejected_at_load_time() {
+        for (conversation, from) in [("   ", "Sam"), ("dm", "   ")] {
+            let text = format!(
+                r#"
+                name = "t"
+                summary = "t"
+                agent = "Mara"
+                start = "2026-01-05T09:00:00Z"
+                length = "1d"
+                [[event]]
+                at = "1h"
+                conversation = {conversation:?}
+                from = {from:?}
+                text = "@Mara status"
+            "#
+            );
+            assert!(
+                Scenario::from_toml(&text)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("names can't")
+            );
+        }
     }
 
     #[test]
